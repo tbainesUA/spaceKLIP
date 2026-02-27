@@ -237,6 +237,7 @@ environment-dev.yml
 
 notebook_tests_dev/*.ipynb
 notebook_tests_dev/*.py
+notebook_tests_dev/database_dev.py
 
 test_suite_audit
 spaceKLIP/tests/test_analysistools.py
