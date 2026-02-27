@@ -229,4 +229,14 @@ tests/species_*
 
 spaceKLIP/_version.py
 
+GEMINI.md
+analysis_tool_audit.md
+database.md
+architecture.txt
+environment-dev.yml
 
+notebook_tests_dev/*.ipynb
+notebook_tests_dev/*.py
+
+test_suite_audit
+spaceKLIP/tests/test_analysistools.py
