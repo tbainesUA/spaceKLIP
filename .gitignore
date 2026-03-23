@@ -230,3 +230,4 @@ tests/species_*
 spaceKLIP/_version.py
 
 
+environment-dev.yml
