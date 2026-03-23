@@ -233,3 +233,8 @@ spaceKLIP/_version.py
 /spaceKLIP/resources/PCEs/figures/
 /spaceKLIP/resources/PCEs/nircam_throughputs/
 /spaceKLIP/resources/PCEs/pce_correction_factors.pkl
+environment-dev.yml
+
+code_tmp/
+misc_calspec/
+spaceKLIP/io.py
