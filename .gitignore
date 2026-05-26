@@ -232,3 +232,7 @@ spaceKLIP/_version.py
 
 environment-dev.yml
 
+code_tmp/
+misc_calspec
+spaceKLIP/io.py
+
