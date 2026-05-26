@@ -236,6 +236,7 @@ database.md
 architecture.txt
 environment-dev.yml
 
+<<<<<<< HEAD
 /spaceKLIP/resources/PCEs/figures/
 /spaceKLIP/resources/PCEs/nircam_throughputs/
 /spaceKLIP/resources/PCEs/pce_correction_factors.pkl
@@ -250,3 +251,9 @@ notebook_tests_dev/database_dev.py
 
 test_suite_audit
 spaceKLIP/tests/test_analysistools.py
+=======
+code_tmp/
+misc_calspec
+spaceKLIP/io.py
+
+>>>>>>> b9e34a5 (updated gitignore and auto format of files)

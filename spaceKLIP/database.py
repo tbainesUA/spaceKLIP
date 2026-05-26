@@ -1,14 +1,15 @@
 from __future__ import division
 
+import copy
+import glob
+import logging
+
 # =============================================================================
 # IMPORTS
 # =============================================================================
-
 # general imports
 import os
-import glob
-import copy
-import logging
+
 import numpy as np
 
 # astropy imports
@@ -22,11 +23,19 @@ from stdatamodels.jwst import datamodels
 
 # webbpsf_ext imports
 from webbpsf_ext.logging_utils import setup_logging
-from webbpsf_ext.imreg_tools import get_files
-from webbpsf_ext.imreg_tools import get_coron_apname as nircam_apname
+
+from .io import get_coron_apname as nircam_apname
+
+# from webbpsf_ext.imreg_tools import get_files
+# from webbpsf_ext.imreg_tools import get_coron_apname as nircam_apname
+from .io import get_files
 
 # helper functions
+<<<<<<< HEAD
 from .utils import get_nrcmask_from_apname, get_filter_info, get_pce_info, config_stpipe_log
+=======
+from .utils import config_stpipe_log, get_filter_info, get_nrcmask_from_apname
+>>>>>>> b9e34a5 (updated gitignore and auto format of files)
 
 #  Set up log.
 log = logging.getLogger(__name__)
@@ -37,19 +46,28 @@ log.setLevel(logging.INFO)
 # =============================================================================
 
 # Initialize SIAF instruments.
-siaf_nrc = pysiaf.Siaf('NIRCam')
-siaf_nis = pysiaf.Siaf('NIRISS')
-siaf_mir = pysiaf.Siaf('MIRI')
+siaf_nrc = pysiaf.Siaf("NIRCam")
+siaf_nis = pysiaf.Siaf("NIRISS")
+siaf_mir = pysiaf.Siaf("MIRI")
 
-setup_logging('WARN', verbose=False)
+setup_logging("WARN", verbose=False)
 
+<<<<<<< HEAD
 class Database():
+=======
+# Load NIRCam, NIRISS, and MIRI filters.
+wave_nircam, weff_nircam, do_svo = get_filter_info("NIRCAM", return_more=True)
+wave_niriss, weff_niriss = get_filter_info("NIRISS", do_svo=do_svo)
+wave_miri, weff_miri = get_filter_info("MIRI", do_svo=False)
+
+
+class Database:
+>>>>>>> b9e34a5 (updated gitignore and auto format of files)
     """
     The central spaceKLIP database class.
     """
 
-    def __init__(self,
-                 output_dir):
+    def __init__(self, output_dir):
         """
         Initialize the central spaceKLIP database class. It stores the
         observational metadata and keeps track of the reduction steps.
@@ -79,7 +97,7 @@ class Database():
 
         # Check if output directory exists
         if not os.path.isdir(self.output_dir):
-            log.warning(f'Output directory does not exist. Creating {self.output_dir}.')
+            log.warning(f"Output directory does not exist. Creating {self.output_dir}.")
             os.makedirs(self.output_dir)
 
         # Initialize observations dictionary which contains the individual
@@ -99,12 +117,14 @@ class Database():
 
         pass
 
-    def read_jwst_s012_data(self,
-                            datapaths,
-                            psflibpaths=None,
-                            bgpaths=None,
-                            cr_from_siaf=False,
-                            assoc_using_targname=True):
+    def read_jwst_s012_data(
+        self,
+        datapaths,
+        psflibpaths=None,
+        bgpaths=None,
+        cr_from_siaf=False,
+        assoc_using_targname=True,
+    ):
         """
         Read JWST stage 0 (uncal), 1 (rate or rateints), or 2 (cal or
         calints) data into the Database.obs dictionary. It contains a table of
@@ -144,7 +164,7 @@ class Database():
         if isinstance(datapaths, str):
             datapaths = [datapaths]
         if len(datapaths) == 0:
-            raise UserWarning('Could not find any data paths')
+            raise UserWarning("Could not find any data paths")
         if isinstance(psflibpaths, str):
             psflibpaths = [psflibpaths]
         if isinstance(bgpaths, str):
@@ -153,10 +173,18 @@ class Database():
             for i in range(len(bgpaths)):
                 if psflibpaths is not None:
                     if bgpaths[i] not in datapaths and bgpaths[i] not in psflibpaths:
-                        raise UserWarning('Background path ' + bgpaths[i] + ' does not occur in data or PSF library paths')
+                        raise UserWarning(
+                            "Background path "
+                            + bgpaths[i]
+                            + " does not occur in data or PSF library paths"
+                        )
                 else:
                     if bgpaths[i] not in datapaths:
-                        raise UserWarning('Background path ' + bgpaths[i] + ' does not occur in data paths')
+                        raise UserWarning(
+                            "Background path "
+                            + bgpaths[i]
+                            + " does not occur in data paths"
+                        )
 
         # Read FITS headers.
         DATAMODL = []
@@ -217,14 +245,14 @@ class Database():
             hdul = fits.open(allpaths[i])
             head = hdul[0].header
             # Only read in the data if needed.
-            data = hdul['SCI'].data if not head.get('NINTS') else None
+            data = hdul["SCI"].data if not head.get("NINTS") else None
 
-            if 'uncal' in allpaths[i]:
-                DATAMODL += ['STAGE0']
-            elif 'rate' in allpaths[i] or 'rateints' in allpaths[i]:
-                DATAMODL += ['STAGE1']
-            elif 'cal' in allpaths[i] or 'calints' in allpaths[i]:
-                DATAMODL += ['STAGE2']
+            if "uncal" in allpaths[i]:
+                DATAMODL += ["STAGE0"]
+            elif "rate" in allpaths[i] or "rateints" in allpaths[i]:
+                DATAMODL += ["STAGE1"]
+            elif "cal" in allpaths[i] or "calints" in allpaths[i]:
+                DATAMODL += ["STAGE2"]
             else:
                 raise UserWarning('File name must contain one of the following: uncal, rate, rateints, cal, calints')
             TELESCOP += [head.get('TELESCOP', 'JWST')]
@@ -252,48 +280,58 @@ class Database():
                     CWAVEL += [np.nan]
                     DWAVEL += [np.nan]
                 else:
-                    raise UserWarning('Data originates from unknown JWST instrument')
+                    raise UserWarning("Data originates from unknown JWST instrument")
             else:
-                raise UserWarning('Data originates from unknown telescope')
-            EXP_TYPE += [head.get('EXP_TYPE', 'UNKNOWN')]
-            EXPSTART += [head.get('EXPSTART', np.nan)]
-            nintegrations = head.get('NINTS', data.shape[0] if data is not None and data.ndim == 3 else 1)
+                raise UserWarning("Data originates from unknown telescope")
+            EXP_TYPE += [head.get("EXP_TYPE", "UNKNOWN")]
+            EXPSTART += [head.get("EXPSTART", np.nan)]
+            nintegrations = head.get(
+                "NINTS", data.shape[0] if data is not None and data.ndim == 3 else 1
+            )
             NINTS += [nintegrations]
-            EFFINTTM += [head.get('EFFINTTM', np.nan)]
-            IS_PSF += [head.get('IS_PSF', 'NONE')]
-            SELFREF += [head.get('SELFREF', 'NONE')]
-            SUBARRAY += [head.get('SUBARRAY', 'UNKNOWN')]
-            NUMDTHPT += [head.get('NUMDTHPT', 1)]
-            XOFFSET += [head.get('XOFFSET', 0.)]
-            YOFFSET += [head.get('YOFFSET', 0.)]
-            apname = nircam_apname(head) if INSTRUME[-1] == 'NIRCAM' else head.get('APERNAME', 'UNKNOWN')
+            EFFINTTM += [head.get("EFFINTTM", np.nan)]
+            IS_PSF += [head.get("IS_PSF", "NONE")]
+            SELFREF += [head.get("SELFREF", "NONE")]
+            SUBARRAY += [head.get("SUBARRAY", "UNKNOWN")]
+            NUMDTHPT += [head.get("NUMDTHPT", 1)]
+            XOFFSET += [head.get("XOFFSET", 0.0)]
+            YOFFSET += [head.get("YOFFSET", 0.0)]
+            apname = (
+                nircam_apname(head)
+                if INSTRUME[-1] == "NIRCAM"
+                else head.get("APERNAME", "UNKNOWN")
+            )
             APERNAME += [apname]
-            PPS_APER += [head.get('PPS_APER', 'UNKNOWN')]
-            coronmask = get_nrcmask_from_apname(PPS_APER[-1]) if INSTRUME[-1] == 'NIRCAM' else head.get('CORONMSK', 'NONE')
+            PPS_APER += [head.get("PPS_APER", "UNKNOWN")]
+            coronmask = (
+                get_nrcmask_from_apname(PPS_APER[-1])
+                if INSTRUME[-1] == "NIRCAM"
+                else head.get("CORONMSK", "NONE")
+            )
             CORONMSK += [coronmask]
-            if TELESCOP[-1] == 'JWST':
-                if INSTRUME[-1] == 'NIRCAM':
+            if TELESCOP[-1] == "JWST":
+                if INSTRUME[-1] == "NIRCAM":
                     ap = siaf_nrc[apname]
-                elif INSTRUME[-1] == 'NIRISS':
+                elif INSTRUME[-1] == "NIRISS":
                     ap = siaf_nis[apname]
-                elif INSTRUME[-1] == 'MIRI':
+                elif INSTRUME[-1] == "MIRI":
                     ap = siaf_mir[apname]
                 else:
-                    raise UserWarning('Data originates from unknown JWST instrument')
+                    raise UserWarning("Data originates from unknown JWST instrument")
                 # Save the average of the X and Y pixel scales.
-                PIXSCALE += [(ap.XSciScale + ap.YSciScale) / 2.]
+                PIXSCALE += [(ap.XSciScale + ap.YSciScale) / 2.0]
             else:
-                raise UserWarning('Data originates from unknown telescope')
-            BLURFWHM += [head.get('BLURFWHM', np.nan)]
-            head = hdul['SCI'].header
-            PIXAR_SR += [head.get('PIXAR_SR', np.nan)]
-            BUNIT += [head.get('BUNIT', 'NONE')]
+                raise UserWarning("Data originates from unknown telescope")
+            BLURFWHM += [head.get("BLURFWHM", np.nan)]
+            head = hdul["SCI"].header
+            PIXAR_SR += [head.get("PIXAR_SR", np.nan)]
+            BUNIT += [head.get("BUNIT", "NONE")]
             if cr_from_siaf:
                 CRPIX1 += [ap.XSciRef]
                 CRPIX2 += [ap.YSciRef]
             else:
-                CRPIX1 += [head.get('CRPIX1', np.nan)]
-                CRPIX2 += [head.get('CRPIX2', np.nan)]
+                CRPIX1 += [head.get("CRPIX1", np.nan)]
+                CRPIX2 += [head.get("CRPIX2", np.nan)]
 
             MASKCENX += [head.get('MASKCENX', float(CRPIX1[i]))]
             MASKCENY += [head.get('MASKCENY', float(CRPIX2[i]))]
@@ -330,8 +368,8 @@ class Database():
         EXPSTART = np.array(EXPSTART)
         NINTS = np.array(NINTS)
         EFFINTTM = np.array(EFFINTTM)
-        IS_PSF = np.array(IS_PSF, dtype='<U5')
-        SELFREF = np.array(SELFREF, dtype='<U5')
+        IS_PSF = np.array(IS_PSF, dtype="<U5")
+        SELFREF = np.array(SELFREF, dtype="<U5")
         SUBARRAY = np.array(SUBARRAY)
         NUMDTHPT = np.array(NUMDTHPT)
         XOFFSET = np.array(XOFFSET)
@@ -351,10 +389,10 @@ class Database():
         STARCENY = np.array(STARCENY)
         CROP_SHIFTX = np.array(CROP_SHIFTX)
         CROP_SHIFTY = np.array(CROP_SHIFTY)
-        ALIGN_SHIFT = np.array(ALIGN_SHIFT, dtype='object')
-        CENTER_SHIFT = np.array(CENTER_SHIFT, dtype='object')
-        ALIGN_MASK = np.array(ALIGN_MASK, dtype='object')
-        CENTER_MASK = np.array(CENTER_MASK, dtype='object')
+        ALIGN_SHIFT = np.array(ALIGN_SHIFT, dtype="object")
+        CENTER_SHIFT = np.array(CENTER_SHIFT, dtype="object")
+        ALIGN_MASK = np.array(ALIGN_MASK, dtype="object")
+        CENTER_MASK = np.array(CENTER_MASK, dtype="object")
         VPARITY = np.array(VPARITY)
         V3I_YANG = np.array(V3I_YANG)
         RA_REF = np.array(RA_REF)
@@ -370,24 +408,40 @@ class Database():
         # Associate TA files with science or reference files.
         ww = []
         for i in range(NHASH_unique):
-            if 'MASKRND_NONE' in HASH_unique[i] or 'MASKBAR_NONE' in HASH_unique[i] or 'NONE_MASK1065' in HASH_unique[i] or 'NONE_MASK1140' in HASH_unique[i] or 'NONE_MASK1550' in HASH_unique[i] or 'NONE_MASKLYOT' in HASH_unique[i]:
+            if (
+                "MASKRND_NONE" in HASH_unique[i]
+                or "MASKBAR_NONE" in HASH_unique[i]
+                or "NONE_MASK1065" in HASH_unique[i]
+                or "NONE_MASK1140" in HASH_unique[i]
+                or "NONE_MASK1550" in HASH_unique[i]
+                or "NONE_MASKLYOT" in HASH_unique[i]
+            ):
                 ww += [-1]
-                HASH_i_split = HASH_unique[i].split('_')
+                HASH_i_split = HASH_unique[i].split("_")
                 for j in range(NHASH_unique):
-                    HASH_j_split = HASH_unique[j].split('_')
-                    if HASH_j_split[0] == HASH_i_split[0] and HASH_j_split[1] == HASH_i_split[1] and HASH_j_split[2] == HASH_i_split[2] and HASH_j_split[4] == HASH_i_split[4] and HASH_j_split[5] != 'NONE' and HASH_j_split[6][-4:] in HASH_i_split[6]:
+                    HASH_j_split = HASH_unique[j].split("_")
+                    if (
+                        HASH_j_split[0] == HASH_i_split[0]
+                        and HASH_j_split[1] == HASH_i_split[1]
+                        and HASH_j_split[2] == HASH_i_split[2]
+                        and HASH_j_split[4] == HASH_i_split[4]
+                        and HASH_j_split[5] != "NONE"
+                        and HASH_j_split[6][-4:] in HASH_i_split[6]
+                    ):
                         ww[-1] = i
                         break
                 if ww[-1] != -1:
                     HASH[HASH == HASH_unique[i]] = HASH_unique[j]
                 else:
-                    raise UserWarning('Could not associate TA files with science or reference files')
+                    raise UserWarning(
+                        "Could not associate TA files with science or reference files"
+                    )
         HASH_unique = np.delete(HASH_unique, ww)
         NHASH_unique = len(HASH_unique)
 
         # Get PSF mask directory.
         maskbase = os.path.split(os.path.abspath(__file__))[0]
-        maskbase = os.path.join(maskbase, 'resources/transmissions/')
+        maskbase = os.path.join(maskbase, "resources/transmissions/")
 
         # Loop through concatenations.
         for i in range(NHASH_unique):
@@ -402,19 +456,19 @@ class Database():
                         ww_ref.append(j)
                     else:
                         ww_sci.append(j)
-                ww_sci = np.array(ww_sci, dtype='int')
-                ww_ref = np.array(ww_ref, dtype='int')
+                ww_sci = np.array(ww_sci, dtype="int")
+                ww_ref = np.array(ww_ref, dtype="int")
             else:
                 is_psf = IS_PSF[ww]
                 exp_type = EXP_TYPE[ww]
                 for j in range(len(exp_type)):
-                    if 'TA' in exp_type[j]:
-                        is_psf[j] = 'False'
-                if 'NONE' not in is_psf:
-                    ww_sci = np.where(is_psf == 'False')[0]
-                    ww_ref = np.where(is_psf == 'True')[0]
+                    if "TA" in exp_type[j]:
+                        is_psf[j] = "False"
+                if "NONE" not in is_psf:
+                    ww_sci = np.where(is_psf == "False")[0]
+                    ww_ref = np.where(is_psf == "True")[0]
                 else:
-                    log.warning('  --> Could not find IS_PSF header keyword')
+                    log.warning("  --> Could not find IS_PSF header keyword")
                     numdthpt = NUMDTHPT[ww]
                     numdthpt_unique = np.unique(numdthpt)
                     if len(numdthpt_unique) == 2 and numdthpt_unique[0] == 1:
@@ -527,50 +581,58 @@ class Database():
                     sci = True
                 else:
                     sci = False
-                if 'TA' in EXP_TYPE[ww][j]:
+                if "TA" in EXP_TYPE[ww][j]:
                     if sci:
-                        tt = 'SCI_TA'
+                        tt = "SCI_TA"
                     else:
-                        tt = 'REF_TA'
-                elif any(bgid in TARGPROP[ww][j].upper() for bgid in ('BG', 'BKG', 'BACK', 'BACKGROUND')):
+                        tt = "REF_TA"
+                elif any(
+                    bgid in TARGPROP[ww][j].upper()
+                    for bgid in ("BG", "BKG", "BACK", "BACKGROUND")
+                ):
                     if sci:
-                        tt = 'SCI_BG'
+                        tt = "SCI_BG"
                     else:
-                        tt = 'REF_BG'
+                        tt = "REF_BG"
                 else:
                     if sci:
-                        tt = 'SCI'
+                        tt = "SCI"
                     else:
-                        tt = 'REF'
+                        tt = "REF"
                 if bgpaths is not None:
                     if allpaths[ww][j] in bgpaths:
                         if sci:
-                            tt = 'SCI_BG'
+                            tt = "SCI_BG"
                         else:
-                            tt = 'REF_BG'
-                maskfile = allpaths[ww][j].replace('.fits', '_psfmask.fits')
+                            tt = "REF_BG"
+                maskfile = allpaths[ww][j].replace(".fits", "_psfmask.fits")
                 if not os.path.exists(maskfile):
-                    if EXP_TYPE[ww][j] == 'NRC_CORON':
-
+                    if EXP_TYPE[ww][j] == "NRC_CORON":
                         config_stpipe_log(suppress=True)  # Suppress logging.
 
                         pipeline = Detector1Pipeline()
                         input = datamodels.open(allpaths[ww][j])
-                        maskfile = pipeline.get_reference_file(input, 'psfmask')
+                        maskfile = pipeline.get_reference_file(input, "psfmask")
                         if (maskfile is None) or (not os.path.exists(maskfile)):
-                            maskfile = 'NONE'
+                            maskfile = "NONE"
 
                         config_stpipe_log(suppress=False)  # Revert to default logging.
 
-                    elif EXP_TYPE[ww][j] == 'MIR_4QPM' or EXP_TYPE[ww][j] == 'MIR_LYOT':
-                        if APERNAME[ww][j] == 'MIRIM_MASK1065':
-                            maskpath = 'JWST_MIRI_F1065C_transmission_webbpsf-ext_v2.fits'
-                        elif APERNAME[ww][j] == 'MIRIM_MASK1140':
-                            maskpath = 'JWST_MIRI_F1140C_transmission_webbpsf-ext_v2.fits'
-                        elif APERNAME[ww][j] == 'MIRIM_MASK1550':
-                            maskpath = 'JWST_MIRI_F1550C_transmission_webbpsf-ext_v2.fits'
-                        elif APERNAME[ww][j] == 'MIRIM_MASKLYOT':
-                            maskpath = 'jwst_miri_psfmask_0009.fits'  # FIXME!
+                    elif EXP_TYPE[ww][j] == "MIR_4QPM" or EXP_TYPE[ww][j] == "MIR_LYOT":
+                        if APERNAME[ww][j] == "MIRIM_MASK1065":
+                            maskpath = (
+                                "JWST_MIRI_F1065C_transmission_webbpsf-ext_v2.fits"
+                            )
+                        elif APERNAME[ww][j] == "MIRIM_MASK1140":
+                            maskpath = (
+                                "JWST_MIRI_F1140C_transmission_webbpsf-ext_v2.fits"
+                            )
+                        elif APERNAME[ww][j] == "MIRIM_MASK1550":
+                            maskpath = (
+                                "JWST_MIRI_F1550C_transmission_webbpsf-ext_v2.fits"
+                            )
+                        elif APERNAME[ww][j] == "MIRIM_MASKLYOT":
+                            maskpath = "jwst_miri_psfmask_0009.fits"  # FIXME!
                         maskfile = os.path.join(maskbase, maskpath)
                     else:
                         maskfile = 'NONE'
@@ -631,39 +693,119 @@ class Database():
 
             # Associate background files with science or reference files.
             for j in range(len(self.obs[HASH_unique[i]])):
-                if self.obs[HASH_unique[i]]['TYPE'][j] == 'SCI_BG':
-                    if (self.obs[HASH_unique[i]]['EFFINTTM'][j] not in self.obs[HASH_unique[i]]['EFFINTTM'][self.obs[HASH_unique[i]]['TYPE'] == 'SCI']) or (self.obs[HASH_unique[i]]['NINTS'][j] not in self.obs[HASH_unique[i]]['NINTS'][self.obs[HASH_unique[i]]['TYPE'] == 'SCI']):
-                        if (self.obs[HASH_unique[i]]['EFFINTTM'][j] in self.obs[HASH_unique[i]]['EFFINTTM'][self.obs[HASH_unique[i]]['TYPE'] == 'REF']) and (self.obs[HASH_unique[i]]['NINTS'][j] in self.obs[HASH_unique[i]]['NINTS'][self.obs[HASH_unique[i]]['TYPE'] == 'REF']):
-                            self.obs[HASH_unique[i]]['TYPE'][j] = 'REF_BG'
+                if self.obs[HASH_unique[i]]["TYPE"][j] == "SCI_BG":
+                    if (
+                        self.obs[HASH_unique[i]]["EFFINTTM"][j]
+                        not in self.obs[HASH_unique[i]]["EFFINTTM"][
+                            self.obs[HASH_unique[i]]["TYPE"] == "SCI"
+                        ]
+                    ) or (
+                        self.obs[HASH_unique[i]]["NINTS"][j]
+                        not in self.obs[HASH_unique[i]]["NINTS"][
+                            self.obs[HASH_unique[i]]["TYPE"] == "SCI"
+                        ]
+                    ):
+                        if (
+                            self.obs[HASH_unique[i]]["EFFINTTM"][j]
+                            in self.obs[HASH_unique[i]]["EFFINTTM"][
+                                self.obs[HASH_unique[i]]["TYPE"] == "REF"
+                            ]
+                        ) and (
+                            self.obs[HASH_unique[i]]["NINTS"][j]
+                            in self.obs[HASH_unique[i]]["NINTS"][
+                                self.obs[HASH_unique[i]]["TYPE"] == "REF"
+                            ]
+                        ):
+                            self.obs[HASH_unique[i]]["TYPE"][j] = "REF_BG"
                         else:
-                            raise UserWarning('Background exposure ' + self.obs[HASH_unique[i]]['FITSFILE'][j] + ' could not be matched with PSF')
-                elif self.obs[HASH_unique[i]]['TYPE'][j] == 'REF_BG':
-                    if (self.obs[HASH_unique[i]]['EFFINTTM'][j] not in self.obs[HASH_unique[i]]['EFFINTTM'][self.obs[HASH_unique[i]]['TYPE'] == 'REF']) or (self.obs[HASH_unique[i]]['NINTS'][j] not in self.obs[HASH_unique[i]]['NINTS'][self.obs[HASH_unique[i]]['TYPE'] == 'REF']):
-                        if (self.obs[HASH_unique[i]]['EFFINTTM'][j] in self.obs[HASH_unique[i]]['EFFINTTM'][self.obs[HASH_unique[i]]['TYPE'] == 'SCI']) and (self.obs[HASH_unique[i]]['NINTS'][j] in self.obs[HASH_unique[i]]['NINTS'][self.obs[HASH_unique[i]]['TYPE'] == 'SCI']):
-                            self.obs[HASH_unique[i]]['TYPE'][j] = 'SCI_BG'
+                            raise UserWarning(
+                                "Background exposure "
+                                + self.obs[HASH_unique[i]]["FITSFILE"][j]
+                                + " could not be matched with PSF"
+                            )
+                elif self.obs[HASH_unique[i]]["TYPE"][j] == "REF_BG":
+                    if (
+                        self.obs[HASH_unique[i]]["EFFINTTM"][j]
+                        not in self.obs[HASH_unique[i]]["EFFINTTM"][
+                            self.obs[HASH_unique[i]]["TYPE"] == "REF"
+                        ]
+                    ) or (
+                        self.obs[HASH_unique[i]]["NINTS"][j]
+                        not in self.obs[HASH_unique[i]]["NINTS"][
+                            self.obs[HASH_unique[i]]["TYPE"] == "REF"
+                        ]
+                    ):
+                        if (
+                            self.obs[HASH_unique[i]]["EFFINTTM"][j]
+                            in self.obs[HASH_unique[i]]["EFFINTTM"][
+                                self.obs[HASH_unique[i]]["TYPE"] == "SCI"
+                            ]
+                        ) and (
+                            self.obs[HASH_unique[i]]["NINTS"][j]
+                            in self.obs[HASH_unique[i]]["NINTS"][
+                                self.obs[HASH_unique[i]]["TYPE"] == "SCI"
+                            ]
+                        ):
+                            self.obs[HASH_unique[i]]["TYPE"][j] = "SCI_BG"
                         else:
-                            raise UserWarning('Background exposure ' + self.obs[HASH_unique[i]]['FITSFILE'][j] + ' could not be matched with PSF')
+                            raise UserWarning(
+                                "Background exposure "
+                                + self.obs[HASH_unique[i]]["FITSFILE"][j]
+                                + " could not be matched with PSF"
+                            )
 
             # Reassociate TA and background files with science or reference
             # files based on target name.
             if assoc_using_targname:
                 for j in range(len(self.obs[HASH_unique[i]])):
-                    if self.obs[HASH_unique[i]]['TYPE'][j] in ['SCI_TA', 'SCI_BG']:
-                        targprop = self.obs[HASH_unique[i]]['TARGPROP'][self.obs[HASH_unique[i]]['TYPE'] == 'SCI']
-                        ww = np.array([s == self.obs[HASH_unique[i]]['TARGPROP'][j] for s in targprop])
+                    if self.obs[HASH_unique[i]]["TYPE"][j] in ["SCI_TA", "SCI_BG"]:
+                        targprop = self.obs[HASH_unique[i]]["TARGPROP"][
+                            self.obs[HASH_unique[i]]["TYPE"] == "SCI"
+                        ]
+                        ww = np.array(
+                            [
+                                s == self.obs[HASH_unique[i]]["TARGPROP"][j]
+                                for s in targprop
+                            ]
+                        )
                         if np.sum(ww) == 0:
-                            targprop = self.obs[HASH_unique[i]]['TARGPROP'][self.obs[HASH_unique[i]]['TYPE'] == 'REF']
-                            ww = np.array([s == self.obs[HASH_unique[i]]['TARGPROP'][j] for s in targprop])
+                            targprop = self.obs[HASH_unique[i]]["TARGPROP"][
+                                self.obs[HASH_unique[i]]["TYPE"] == "REF"
+                            ]
+                            ww = np.array(
+                                [
+                                    s == self.obs[HASH_unique[i]]["TARGPROP"][j]
+                                    for s in targprop
+                                ]
+                            )
                             if np.sum(ww) != 0:
-                                self.obs[HASH_unique[i]]['TYPE'][j] = self.obs[HASH_unique[i]]['TYPE'][j].replace('SCI', 'REF')
-                    if self.obs[HASH_unique[i]]['TYPE'][j] in ['REF_TA', 'REF_BG']:
-                        targprop = self.obs[HASH_unique[i]]['TARGPROP'][self.obs[HASH_unique[i]]['TYPE'] == 'REF']
-                        ww = np.array([s == self.obs[HASH_unique[i]]['TARGPROP'][j] for s in targprop])
+                                self.obs[HASH_unique[i]]["TYPE"][j] = self.obs[
+                                    HASH_unique[i]
+                                ]["TYPE"][j].replace("SCI", "REF")
+                    if self.obs[HASH_unique[i]]["TYPE"][j] in ["REF_TA", "REF_BG"]:
+                        targprop = self.obs[HASH_unique[i]]["TARGPROP"][
+                            self.obs[HASH_unique[i]]["TYPE"] == "REF"
+                        ]
+                        ww = np.array(
+                            [
+                                s == self.obs[HASH_unique[i]]["TARGPROP"][j]
+                                for s in targprop
+                            ]
+                        )
                         if np.sum(ww) == 0:
-                            targprop = self.obs[HASH_unique[i]]['TARGPROP'][self.obs[HASH_unique[i]]['TYPE'] == 'SCI']
-                            ww = np.array([s == self.obs[HASH_unique[i]]['TARGPROP'][j] for s in targprop])
+                            targprop = self.obs[HASH_unique[i]]["TARGPROP"][
+                                self.obs[HASH_unique[i]]["TYPE"] == "SCI"
+                            ]
+                            ww = np.array(
+                                [
+                                    s == self.obs[HASH_unique[i]]["TARGPROP"][j]
+                                    for s in targprop
+                                ]
+                            )
                             if np.sum(ww) != 0:
-                                self.obs[HASH_unique[i]]['TYPE'][j] = self.obs[HASH_unique[i]]['TYPE'][j].replace('REF', 'SCI')
+                                self.obs[HASH_unique[i]]["TYPE"][j] = self.obs[
+                                    HASH_unique[i]
+                                ]["TYPE"][j].replace("REF", "SCI")
 
         # Print Astropy tables for concatenations.
         if self.verbose:
@@ -671,9 +813,7 @@ class Database():
 
         pass
 
-    def read_jwst_s3_data(self,
-                          datapaths,
-                          cr_from_siaf=False):
+    def read_jwst_s3_data(self, datapaths, cr_from_siaf=False):
         """
         Read JWST stage 3 data (this can be i2d data from the official JWST
         pipeline, or data products from the pyKLIP and classical PSF
@@ -698,7 +838,7 @@ class Database():
         if isinstance(datapaths, str):
             datapaths = [datapaths]
         if len(datapaths) == 0:
-            raise UserWarning('Could not find any data paths')
+            raise UserWarning("Could not find any data paths")
 
         # Read FITS headers.
         TYPE = []
@@ -744,10 +884,10 @@ class Database():
         for i in range(Ndatapaths):
             hdul = fits.open(datapaths[i])
             head = hdul[0].header
-            if datapaths[i].endswith('i2d.fits'):
-                TYPE += ['CORON3']
-            elif datapaths[i].endswith('KLmodes-all.fits'):
-                TYPE += ['PYKLIP']
+            if datapaths[i].endswith("i2d.fits"):
+                TYPE += ["CORON3"]
+            elif datapaths[i].endswith("KLmodes-all.fits"):
+                TYPE += ["PYKLIP"]
             else:
                 raise UserWarning('File must have one of the following endings: i2d.fits, KLmodes-all.fits')
             DATAMODL += ['STAGE3']
@@ -776,61 +916,73 @@ class Database():
                     CWAVEL += [np.nan]
                     DWAVEL += [np.nan]
                 else:
-                    raise UserWarning('Data originates from unknown JWST instrument')
+                    raise UserWarning("Data originates from unknown JWST instrument")
             else:
-                raise UserWarning('Data originates from unknown telescope')
-            EXP_TYPE += [head.get('EXP_TYPE', 'UNKNOWN')]
-            EXPSTART += [head.get('EXPSTART', np.nan)]
-            NINTS += [head.get('NINTS', 1)]
-            EFFINTTM += [head.get('EFFINTTM', np.nan)]
-            SUBARRAY += [head.get('SUBARRAY', 'UNKNOWN')]
-            apname = nircam_apname(head) if INSTRUME[-1] == 'NIRCAM' else head.get('APERNAME', 'UNKNOWN')
+                raise UserWarning("Data originates from unknown telescope")
+            EXP_TYPE += [head.get("EXP_TYPE", "UNKNOWN")]
+            EXPSTART += [head.get("EXPSTART", np.nan)]
+            NINTS += [head.get("NINTS", 1)]
+            EFFINTTM += [head.get("EFFINTTM", np.nan)]
+            SUBARRAY += [head.get("SUBARRAY", "UNKNOWN")]
+            apname = (
+                nircam_apname(head)
+                if INSTRUME[-1] == "NIRCAM"
+                else head.get("APERNAME", "UNKNOWN")
+            )
             APERNAME += [apname]
-            PPS_APER += [head.get('PPS_APER', 'UNKNOWN')]
-            coronmask = get_nrcmask_from_apname(PPS_APER[-1]) if INSTRUME[-1] == 'NIRCAM' else head.get('CORONMSK', 'NONE')
+            PPS_APER += [head.get("PPS_APER", "UNKNOWN")]
+            coronmask = (
+                get_nrcmask_from_apname(PPS_APER[-1])
+                if INSTRUME[-1] == "NIRCAM"
+                else head.get("CORONMSK", "NONE")
+            )
             CORONMSK += [coronmask]
-            if TELESCOP[-1] == 'JWST':
-                if INSTRUME[-1] == 'NIRCAM':
+            if TELESCOP[-1] == "JWST":
+                if INSTRUME[-1] == "NIRCAM":
                     ap = siaf_nrc[apname]
-                elif INSTRUME[-1] == 'NIRISS':
+                elif INSTRUME[-1] == "NIRISS":
                     ap = siaf_nis[apname]
-                elif INSTRUME[-1] == 'MIRI':
+                elif INSTRUME[-1] == "MIRI":
                     ap = siaf_mir[apname]
                 else:
-                    raise UserWarning('Data originates from unknown JWST instrument')
+                    raise UserWarning("Data originates from unknown JWST instrument")
                 # Save the average of the X and Y pixel scales.
-                PIXSCALE += [(ap.XSciScale + ap.YSciScale) / 2.]
+                PIXSCALE += [(ap.XSciScale + ap.YSciScale) / 2.0]
             else:
-                raise UserWarning('Data originates from unknown telescope')
-            if TYPE[-1] == 'CORON3':
-                MODE += ['RDI']
+                raise UserWarning("Data originates from unknown telescope")
+            if TYPE[-1] == "CORON3":
+                MODE += ["RDI"]
                 ANNULI += [1]
                 SUBSECTS += [1]
                 try:
-                    KLMODES += [str(head['KLMODE0'])]
+                    KLMODES += [str(head["KLMODE0"])]
                 except KeyError:
-                    log.warning('  --> Could not find KL mode in header, assuming default value of 50')
-                    KLMODES += ['50']
-            elif TYPE[-1] == 'PYKLIP':
-                MODE += [head['MODE']]
-                ANNULI += [head['ANNULI']]
-                SUBSECTS += [head['SUBSECTS']]
-                klmodes = str(head['KLMODE0'])
+                    log.warning(
+                        "  --> Could not find KL mode in header, assuming default value of 50"
+                    )
+                    KLMODES += ["50"]
+            elif TYPE[-1] == "PYKLIP":
+                MODE += [head["MODE"]]
+                ANNULI += [head["ANNULI"]]
+                SUBSECTS += [head["SUBSECTS"]]
+                klmodes = str(head["KLMODE0"])
                 j = 1
                 while True:
                     try:
-                        klmodes += ',' + str(head['KLMODE{0}'.format(j)])
+                        klmodes += "," + str(head["KLMODE{0}".format(j)])
                     except KeyError:
                         break
                     j += 1
                 KLMODES += [klmodes]
             else:
-                raise UserWarning('File must have one of the following types: CORON3, PYKLIP')
-            BLURFWHM += [head.get('BLURFWHM', np.nan)]
-            if TYPE[-1] == 'CORON3':
-                head = hdul['SCI'].header
-            PIXAR_SR += [head.get('PIXAR_SR', np.nan)]
-            BUNIT += [head.get('BUNIT', 'NONE')]
+                raise UserWarning(
+                    "File must have one of the following types: CORON3, PYKLIP"
+                )
+            BLURFWHM += [head.get("BLURFWHM", np.nan)]
+            if TYPE[-1] == "CORON3":
+                head = hdul["SCI"].header
+            PIXAR_SR += [head.get("PIXAR_SR", np.nan)]
+            BUNIT += [head.get("BUNIT", "NONE")]
             if cr_from_siaf:
                 CRPIX1 += [ap.XSciRef]
                 CRPIX2 += [ap.YSciRef]
@@ -897,120 +1049,142 @@ class Database():
 
             # Make Astropy tables for concatenations.
             if HASH_unique[i] not in self.red.keys():
-                tab = Table(names=('TYPE',
-                                   'EXP_TYPE',
-                                   'DATAMODL',
-                                   'TELESCOP',
-                                   'TARGPROP',
-                                   'TARG_RA',
-                                   'TARG_DEC',
-                                   'INSTRUME',
-                                   'DETECTOR',
-                                   'FILTER',
-                                   'CWAVEL',
-                                   'DWAVEL',
-                                   'PUPIL',
-                                   'CORONMSK',
-                                   'EXPSTART',
-                                   'NINTS',
-                                   'EFFINTTM',
-                                   'SUBARRAY',
-                                   'APERNAME',
-                                   'PPS_APER',
-                                   'PIXSCALE',
-                                   'PIXAR_SR',
-                                   'STARCENX',
-                                   'STARCENY',
-                                   'MODE',
-                                   'ANNULI',
-                                   'SUBSECTS',
-                                   'KLMODES',
-                                   'BUNIT',
-                                   'BLURFWHM',
-                                   'FITSFILE',
-                                   'MASKFILE'),
-                            dtype=('object',
-                                   'object',
-                                   'object',
-                                   'object',
-                                   'object',
-                                   'float',
-                                   'float',
-                                   'object',
-                                   'object',
-                                   'object',
-                                   'float',
-                                   'float',
-                                   'object',
-                                   'object',
-                                   'float',
-                                   'int',
-                                   'float',
-                                   'object',
-                                   'object',
-                                   'object',
-                                   'float',
-                                   'float',
-                                   'float',
-                                   'float',
-                                   'object',
-                                   'int',
-                                   'int',
-                                   'object',
-                                   'object',
-                                   'float',
-                                   'object',
-                                   'object'))
+                tab = Table(
+                    names=(
+                        "TYPE",
+                        "EXP_TYPE",
+                        "DATAMODL",
+                        "TELESCOP",
+                        "TARGPROP",
+                        "TARG_RA",
+                        "TARG_DEC",
+                        "INSTRUME",
+                        "DETECTOR",
+                        "FILTER",
+                        "CWAVEL",
+                        "DWAVEL",
+                        "PUPIL",
+                        "CORONMSK",
+                        "EXPSTART",
+                        "NINTS",
+                        "EFFINTTM",
+                        "SUBARRAY",
+                        "APERNAME",
+                        "PPS_APER",
+                        "PIXSCALE",
+                        "PIXAR_SR",
+                        "STARCENX",
+                        "STARCENY",
+                        "MODE",
+                        "ANNULI",
+                        "SUBSECTS",
+                        "KLMODES",
+                        "BUNIT",
+                        "BLURFWHM",
+                        "FITSFILE",
+                        "MASKFILE",
+                    ),
+                    dtype=(
+                        "object",
+                        "object",
+                        "object",
+                        "object",
+                        "object",
+                        "float",
+                        "float",
+                        "object",
+                        "object",
+                        "object",
+                        "float",
+                        "float",
+                        "object",
+                        "object",
+                        "float",
+                        "int",
+                        "float",
+                        "object",
+                        "object",
+                        "object",
+                        "float",
+                        "float",
+                        "float",
+                        "float",
+                        "object",
+                        "int",
+                        "int",
+                        "object",
+                        "object",
+                        "float",
+                        "object",
+                        "object",
+                    ),
+                )
             else:
                 tab = self.red[HASH_unique[i]].copy()
             for j in range(len(ww)):
-                maskfile = os.path.join(os.path.split(datapaths[ww[j]])[0], HASH_unique[i] + '_psfmask.fits')
+                maskfile = os.path.join(
+                    os.path.split(datapaths[ww[j]])[0], HASH_unique[i] + "_psfmask.fits"
+                )
                 if not os.path.exists(maskfile):
-                    maskfile = 'NONE'
-                tab.add_row((TYPE[ww[j]],
-                             EXP_TYPE[ww[j]],
-                             DATAMODL[ww[j]],
-                             TELESCOP[ww[j]],
-                             TARGPROP[ww[j]],
-                             TARG_RA[ww[j]],
-                             TARG_DEC[ww[j]],
-                             INSTRUME[ww[j]],
-                             DETECTOR[ww[j]],
-                             FILTER[ww[j]],
-                             CWAVEL[ww[j]],
-                             DWAVEL[ww[j]],
-                             PUPIL[ww[j]],
-                             CORONMSK[ww[j]],
-                             EXPSTART[ww[j]],
-                             NINTS[ww[j]],
-                             EFFINTTM[ww[j]],
-                             SUBARRAY[ww[j]],
-                             APERNAME[ww[j]],
-                             PPS_APER[ww[j]],
-                             PIXSCALE[ww[j]],
-                             PIXAR_SR[ww[j]],
-                             STARCENX[ww[j]],
-                             STARCENY[ww[j]],
-                             MODE[ww[j]],
-                             ANNULI[ww[j]],
-                             SUBSECTS[ww[j]],
-                             KLMODES[ww[j]],
-                             BUNIT[ww[j]],
-                             BLURFWHM[ww][j],
-                             datapaths[ww[j]],
-                             maskfile))
+                    maskfile = "NONE"
+                tab.add_row(
+                    (
+                        TYPE[ww[j]],
+                        EXP_TYPE[ww[j]],
+                        DATAMODL[ww[j]],
+                        TELESCOP[ww[j]],
+                        TARGPROP[ww[j]],
+                        TARG_RA[ww[j]],
+                        TARG_DEC[ww[j]],
+                        INSTRUME[ww[j]],
+                        DETECTOR[ww[j]],
+                        FILTER[ww[j]],
+                        CWAVEL[ww[j]],
+                        DWAVEL[ww[j]],
+                        PUPIL[ww[j]],
+                        CORONMSK[ww[j]],
+                        EXPSTART[ww[j]],
+                        NINTS[ww[j]],
+                        EFFINTTM[ww[j]],
+                        SUBARRAY[ww[j]],
+                        APERNAME[ww[j]],
+                        PPS_APER[ww[j]],
+                        PIXSCALE[ww[j]],
+                        PIXAR_SR[ww[j]],
+                        STARCENX[ww[j]],
+                        STARCENY[ww[j]],
+                        MODE[ww[j]],
+                        ANNULI[ww[j]],
+                        SUBSECTS[ww[j]],
+                        KLMODES[ww[j]],
+                        BUNIT[ww[j]],
+                        BLURFWHM[ww][j],
+                        datapaths[ww[j]],
+                        maskfile,
+                    )
+                )
             self.red[HASH_unique[i]] = tab.copy()
             del tab
 
             # Read corresponding observations database.
             if HASH_unique[i] not in self.obs.keys():
                 try:
-                    file = os.path.join(os.path.split(datapaths[ww[j]])[0], HASH_unique[i] + '.dat')
-                    self.obs[HASH_unique[i]] = Table.read(file, format='ascii')
-                    self.obs[HASH_unique[i]]['FITSFILE'] = self.obs[HASH_unique[i]]['FITSFILE'].astype(object)
-                    self.obs[HASH_unique[i]]['MASKFILE'] = self.obs[HASH_unique[i]]['MASKFILE'].astype(object)
+                    file = os.path.join(
+                        os.path.split(datapaths[ww[j]])[0], HASH_unique[i] + ".dat"
+                    )
+                    self.obs[HASH_unique[i]] = Table.read(file, format="ascii")
+                    self.obs[HASH_unique[i]]["FITSFILE"] = self.obs[HASH_unique[i]][
+                        "FITSFILE"
+                    ].astype(object)
+                    self.obs[HASH_unique[i]]["MASKFILE"] = self.obs[HASH_unique[i]][
+                        "MASKFILE"
+                    ].astype(object)
                 except FileNotFoundError:
-                    raise UserWarning('Observations database for concatenation ' + HASH_unique[i] + ' not found')
+                    raise UserWarning(
+                        "Observations database for concatenation "
+                        + HASH_unique[i]
+                        + " not found"
+                    )
 
         # Print Astropy tables for concatenations.
         if self.verbose:
@@ -1018,8 +1192,7 @@ class Database():
 
         pass
 
-    def read_jwst_s4_data(self,
-                          datapaths):
+    def read_jwst_s4_data(self, datapaths):
         """
         Read JWST stage 4 data (spaceKLIP PSF fitting products) into the
         Database.src dictionary. It contains a list of tables of metadata for
@@ -1040,82 +1213,91 @@ class Database():
         if isinstance(datapaths, str):
             datapaths = [datapaths]
         if len(datapaths) == 0:
-            raise UserWarning('Could not find any data paths')
+            raise UserWarning("Could not find any data paths")
 
         # Find unique concatenations.
         HASH = []
         Ndatapaths = len(datapaths)
         for i in range(Ndatapaths):
             temp = os.path.split(datapaths[i])[1]
-            ww = temp.find('-fitpsf_')
+            ww = temp.find("-fitpsf_")
             HASH += [temp[:ww]]
         HASH_unique = np.unique(np.array(HASH))
         NHASH_unique = len(HASH_unique)
 
         # Loop through concatenations.
         for i in range(NHASH_unique):
-
             # Make Astropy tables for concatenations.
             if HASH_unique[i] not in self.src.keys():
                 self.src[HASH_unique[i]] = []
-            tab = Table(names=('ID',
-                               'RA',
-                               'RA_ERR',
-                               'DEC',
-                               'DEC_ERR',
-                               'CON',
-                               'CON_ERR',
-                               'DELMAG',
-                               'DELMAG_ERR',
-                               'APPMAG',
-                               'APPMAG_ERR',
-                               'MSTAR',
-                               'MSTAR_ERR',
-                               'SNR',
-                               'LN(Z/Z0)',
-                               'FITSFILE'),
-                        dtype=('int',
-                               'float',
-                               'float',
-                               'float',
-                               'float',
-                               'float',
-                               'float',
-                               'float',
-                               'float',
-                               'float',
-                               'float',
-                               'float',
-                               'float',
-                               'float',
-                               'float',
-                               'object'))
+            tab = Table(
+                names=(
+                    "ID",
+                    "RA",
+                    "RA_ERR",
+                    "DEC",
+                    "DEC_ERR",
+                    "CON",
+                    "CON_ERR",
+                    "DELMAG",
+                    "DELMAG_ERR",
+                    "APPMAG",
+                    "APPMAG_ERR",
+                    "MSTAR",
+                    "MSTAR_ERR",
+                    "SNR",
+                    "LN(Z/Z0)",
+                    "FITSFILE",
+                ),
+                dtype=(
+                    "int",
+                    "float",
+                    "float",
+                    "float",
+                    "float",
+                    "float",
+                    "float",
+                    "float",
+                    "float",
+                    "float",
+                    "float",
+                    "float",
+                    "float",
+                    "float",
+                    "float",
+                    "object",
+                ),
+            )
 
             # Read FITS headers.
             for j in range(Ndatapaths):
                 if HASH[j] == HASH_unique[i]:
                     hdul = fits.open(datapaths[j])
                     head = hdul[0].header
-                    if head['LN(Z/Z0)'] == 'NONE':
+                    if head["LN(Z/Z0)"] == "NONE":
                         evidence_ratio = np.nan
                     else:
-                        evidence_ratio = head['LN(Z/Z0)']
-                    tab.add_row((head['ID'],
-                                 head['RA'],
-                                 head['RA_ERR'],
-                                 head['DEC'],
-                                 head['DEC_ERR'],
-                                 head['CON'],
-                                 head['CON_ERR'],
-                                 head['DELMAG'],
-                                 head['DELMAG_ERR'],
-                                 head['APPMAG'],
-                                 head['APPMAG_ERR'],
-                                 head['MSTAR'],
-                                 head['MSTAR_ERR'],
-                                 head['SNR'],
-                                 evidence_ratio,
-                                 head['FITSFILE']))
+                        evidence_ratio = head["LN(Z/Z0)"]
+                    tab.add_row(
+                        (
+                            head["ID"],
+                            head["RA"],
+                            head["RA_ERR"],
+                            head["DEC"],
+                            head["DEC_ERR"],
+                            head["CON"],
+                            head["CON_ERR"],
+                            head["DELMAG"],
+                            head["DELMAG_ERR"],
+                            head["APPMAG"],
+                            head["APPMAG_ERR"],
+                            head["MSTAR"],
+                            head["MSTAR_ERR"],
+                            head["SNR"],
+                            evidence_ratio,
+                            head["FITSFILE"],
+                        )
+                    )
             self.src[HASH_unique[i]] += [tab.copy()]
             del tab
 
@@ -1125,8 +1307,7 @@ class Database():
 
         pass
 
-    def print_obs(self,
-                  include_fitsfiles=False):
+    def print_obs(self, include_fitsfiles=False):
         """
         Print an abbreviated version of the observations database.
 
@@ -1142,9 +1323,9 @@ class Database():
         """
 
         # Print Astropy tables for concatenations.
-        log.info('--> Identified %.0f concatenation(s)' % len(self.obs))
+        log.info("--> Identified %.0f concatenation(s)" % len(self.obs))
         for i, key in enumerate(self.obs.keys()):
-            log.info('  --> Concatenation %.0f: ' % (i + 1) + key)
+            log.info("  --> Concatenation %.0f: " % (i + 1) + key)
             print_tab = copy.deepcopy(self.obs[key])
             if include_fitsfiles:
                 print_tab.remove_columns(['TARG_RA', 'TARG_DEC', 'EXPSTART', 'APERNAME', 'PPS_APER',
@@ -1162,8 +1343,7 @@ class Database():
 
         pass
 
-    def print_red(self,
-                  include_fitsfiles=False):
+    def print_red(self, include_fitsfiles=False):
         """
         Print an abbreviated version of the reductions database.
 
@@ -1179,20 +1359,31 @@ class Database():
         """
 
         # Print Astropy tables for concatenations.
-        log.info('--> Identified %.0f concatenation(s)' % len(self.red))
+        log.info("--> Identified %.0f concatenation(s)" % len(self.red))
         for i, key in enumerate(self.red.keys()):
-            log.info('  --> Concatenation %.0f: ' % (i + 1) + key)
+            log.info("  --> Concatenation %.0f: " % (i + 1) + key)
             print_tab = copy.deepcopy(self.red[key])
             if include_fitsfiles:
-                print_tab.remove_columns(['TARG_RA', 'TARG_DEC', 'EXPSTART', 'APERNAME', 'PPS_APER'])
+                print_tab.remove_columns(
+                    ["TARG_RA", "TARG_DEC", "EXPSTART", "APERNAME", "PPS_APER"]
+                )
             else:
-                print_tab.remove_columns(['TARG_RA', 'TARG_DEC', 'EXPSTART', 'APERNAME', 'PPS_APER', 'FITSFILE', 'MASKFILE'])
+                print_tab.remove_columns(
+                    [
+                        "TARG_RA",
+                        "TARG_DEC",
+                        "EXPSTART",
+                        "APERNAME",
+                        "PPS_APER",
+                        "FITSFILE",
+                        "MASKFILE",
+                    ]
+                )
             print_tab.pprint()
 
         pass
 
-    def print_src(self,
-                  include_fitsfiles=False):
+    def print_src(self, include_fitsfiles=False):
         """
         Print an abbreviated version of the source database.
 
@@ -1207,17 +1398,17 @@ class Database():
         """
 
         # Print Astropy tables for concatenations.
-        log.info('--> Identified %.0f concatenation(s)' % len(self.src))
+        log.info("--> Identified %.0f concatenation(s)" % len(self.src))
         for i, key in enumerate(self.src.keys()):
-            log.info('  --> Concatenation %.0f: ' % (i + 1) + key)
-            log.info('  --> Identified %.0f system(s)' % len(self.src[key]))
+            log.info("  --> Concatenation %.0f: " % (i + 1) + key)
+            log.info("  --> Identified %.0f system(s)" % len(self.src[key]))
             for j in range(len(self.src[key])):
-                log.info('    --> System %.0f:' % (j + 1))
+                log.info("    --> System %.0f:" % (j + 1))
                 print_tab = copy.deepcopy(self.src[key][j])
                 if include_fitsfiles:
                     pass
                 else:
-                    print_tab.remove_columns(['FITSFILE'])
+                    print_tab.remove_columns(["FITSFILE"])
                 print_tab.pprint()
 
         pass
@@ -1326,31 +1517,33 @@ class Database():
         """
 
         # Update spaceKLIP database.
-        if 'uncal' in fitsfile:
-            DATAMODL = 'STAGE0'
-        elif 'rate' in fitsfile or 'rateints' in fitsfile:
-            DATAMODL = 'STAGE1'
-        elif 'cal' in fitsfile or 'calints' in fitsfile:
-            DATAMODL = 'STAGE2'
+        if "uncal" in fitsfile:
+            DATAMODL = "STAGE0"
+        elif "rate" in fitsfile or "rateints" in fitsfile:
+            DATAMODL = "STAGE1"
+        elif "cal" in fitsfile or "calints" in fitsfile:
+            DATAMODL = "STAGE2"
         else:
-            raise UserWarning('File name must contain one of the following: uncal, rate, rateints, cal, calints')
+            raise UserWarning(
+                "File name must contain one of the following: uncal, rate, rateints, cal, calints"
+            )
         hdul = fits.open(fitsfile)
-        self.obs[key]['DATAMODL'][index] = DATAMODL
+        self.obs[key]["DATAMODL"][index] = DATAMODL
         if nints is not None:
-            self.obs[key]['NINTS'][index] = nints
+            self.obs[key]["NINTS"][index] = nints
         if effinttm is not None:
-            self.obs[key]['EFFINTTM'][index] = effinttm
-        self.obs[key]['BUNIT'][index] = hdul['SCI'].header['BUNIT']
+            self.obs[key]["EFFINTTM"][index] = effinttm
+        self.obs[key]["BUNIT"][index] = hdul["SCI"].header["BUNIT"]
         if xoffset is not None:
-            self.obs[key]['XOFFSET'][index] = xoffset
+            self.obs[key]["XOFFSET"][index] = xoffset
         if yoffset is not None:
-            self.obs[key]['YOFFSET'][index] = yoffset
+            self.obs[key]["YOFFSET"][index] = yoffset
         if crpix1 is not None:
-            self.obs[key]['CRPIX1'][index] = crpix1
+            self.obs[key]["CRPIX1"][index] = crpix1
         if crpix2 is not None:
-            self.obs[key]['CRPIX2'][index] = crpix2
+            self.obs[key]["CRPIX2"][index] = crpix2
         if maskcenx is not None:
-            self.obs[key]['MASKCENX'][index] = maskcenx
+            self.obs[key]["MASKCENX"][index] = maskcenx
         if maskceny is not None:
             self.obs[key]['MASKCENY'][index] = maskceny
         if nanmaskcenx is not None:
@@ -1358,42 +1551,41 @@ class Database():
         if nanmaskceny is not None:
             self.obs[key]['NANMASKCENY'][index] = nanmaskceny
         if starcenx is not None:
-            self.obs[key]['STARCENX'][index] = starcenx
+            self.obs[key]["STARCENX"][index] = starcenx
         if starceny is not None:
-            self.obs[key]['STARCENY'][index] = starceny
+            self.obs[key]["STARCENY"][index] = starceny
         if crop_shiftx is not None:
-            self.obs[key]['CROP_SHIFTX'][index] = crop_shiftx
+            self.obs[key]["CROP_SHIFTX"][index] = crop_shiftx
         if crop_shifty is not None:
-            self.obs[key]['CROP_SHIFTY'][index] = crop_shifty
+            self.obs[key]["CROP_SHIFTY"][index] = crop_shifty
         if align_shift is not None:
-            self.obs[key]['ALIGN_SHIFT'][index] = align_shift
+            self.obs[key]["ALIGN_SHIFT"][index] = align_shift
         if center_shift is not None:
-            self.obs[key]['CENTER_SHIFT'][index] = center_shift
+            self.obs[key]["CENTER_SHIFT"][index] = center_shift
         if align_mask is not None:
-            self.obs[key]['ALIGN_MASK'][index] = align_mask
+            self.obs[key]["ALIGN_MASK"][index] = align_mask
         if center_mask is not None:
-            self.obs[key]['CENTER_MASK'][index] = center_mask
+            self.obs[key]["CENTER_MASK"][index] = center_mask
         if blurfwhm is not None:
-            self.obs[key]['BLURFWHM'][index] = blurfwhm
-        self.obs[key]['FITSFILE'][index] = fitsfile
+            self.obs[key]["BLURFWHM"][index] = blurfwhm
+        self.obs[key]["FITSFILE"][index] = fitsfile
         if maskfile is not None:
             self.obs[key]['MASKFILE'][index] = maskfile
         if nanmaskfile is not None:
             self.obs[key]['NANMASKFILE'][index] = nanmaskfile
         if update_pxar:
             try:
-                pxar = fits.getheader(self.obs[key]['FITSFILE'][index], 'SCI')['PIXAR_SR']
-                self.obs[key]['PIXAR_SR'][index] = pxar
+                pxar = fits.getheader(self.obs[key]["FITSFILE"][index], "SCI")[
+                    "PIXAR_SR"
+                ]
+                self.obs[key]["PIXAR_SR"][index] = pxar
             except:
                 pass
         hdul.close()
 
         pass
 
-    def update_src(self,
-                   key,
-                   index,
-                   tab):
+    def update_src(self, key, index, tab):
         """
         Update the content of the source database.
 
@@ -1445,10 +1637,12 @@ class Database():
             data_dict = getattr(self, data_type)
             for key in data_dict.keys():
                 for i in range(len(data_dict[key])):
-                    data_dict[key]['FITSFILE'][i] = os.path.join(dir_path,
-                                                                 os.path.split(data_dict[key]['FITSFILE'][i])[1])
-                    data_dict[key]['MASKFILE'][i] = os.path.join(dir_path,
-                                                                 os.path.split(data_dict[key]['MASKFILE'][i])[1])
+                    data_dict[key]["FITSFILE"][i] = os.path.join(
+                        dir_path, os.path.split(data_dict[key]["FITSFILE"][i])[1]
+                    )
+                    data_dict[key]["MASKFILE"][i] = os.path.join(
+                        dir_path, os.path.split(data_dict[key]["MASKFILE"][i])[1]
+                    )
         except Exception as e:
             raise UserWarning(f"Invalid directory: {dir_path}. Error: {e}")
 
@@ -1481,55 +1675,70 @@ class Database():
                 Less redundant concatenation name.
             """
 
-            parts = concat_name.split('_')
+            parts = concat_name.split("_")
 
-            return "_".join([parts[1], parts[3], parts[5], ])
+            return "_".join(
+                [
+                    parts[1],
+                    parts[3],
+                    parts[5],
+                ]
+            )
 
         for mode in self.obs:
             print(short_concat_name(mode))
             tab = self.obs[mode]
             for stage in [0, 1, 2]:
-                stagetab = tab[tab['DATAMODL'] == f'STAGE{stage}']
+                stagetab = tab[tab["DATAMODL"] == f"STAGE{stage}"]
                 if len(stagetab):
-                    nsci = np.sum(stagetab['TYPE'] == 'SCI')
-                    nref = np.sum(stagetab['TYPE'] == 'REF')
-                    nta = np.sum((stagetab['TYPE'] == 'SCI_TA') | (stagetab['TYPE'] == 'REF_TA'))
-                    nbg = np.sum((stagetab['TYPE'] == 'SCI_BG') | (stagetab['TYPE'] == 'REF_BG'))
+                    nsci = np.sum(stagetab["TYPE"] == "SCI")
+                    nref = np.sum(stagetab["TYPE"] == "REF")
+                    nta = np.sum(
+                        (stagetab["TYPE"] == "SCI_TA") | (stagetab["TYPE"] == "REF_TA")
+                    )
+                    nbg = np.sum(
+                        (stagetab["TYPE"] == "SCI_BG") | (stagetab["TYPE"] == "REF_BG")
+                    )
 
-                    summarystr = f'\tSTAGE{stage}: {len(stagetab)} files;\t{nsci} SCI, {nref} REF'
+                    summarystr = f"\tSTAGE{stage}: {len(stagetab)} files;\t{nsci} SCI, {nref} REF"
                     if nta:
-                        summarystr += f', {nta} TA'
+                        summarystr += f", {nta} TA"
                     if nbg:
-                        summarystr += f', {nbg} BG'
+                        summarystr += f", {nbg} BG"
                     print(summarystr)
-            if hasattr(self, 'red') and mode in self.red:
+            if hasattr(self, "red") and mode in self.red:
                 tab = self.red[mode]
                 stage = 3
-                stagetab = tab[tab['DATAMODL'] == f'STAGE{stage}']
+                stagetab = tab[tab["DATAMODL"] == f"STAGE{stage}"]
                 if len(stagetab):
-                    s3types = sorted(list(set(tab['TYPE'].value)))
-                    nta = np.sum((stagetab['TYPE'] == 'SCI_TA') | (stagetab['TYPE'] == 'REF_TA'))
-                    nbg = np.sum((stagetab['TYPE'] == 'SCI_BG') | (stagetab['TYPE'] == 'REF_BG'))
+                    s3types = sorted(list(set(tab["TYPE"].value)))
+                    nta = np.sum(
+                        (stagetab["TYPE"] == "SCI_TA") | (stagetab["TYPE"] == "REF_TA")
+                    )
+                    nbg = np.sum(
+                        (stagetab["TYPE"] == "SCI_BG") | (stagetab["TYPE"] == "REF_BG")
+                    )
 
-                    summarystr = f'\tSTAGE{stage}: {len(stagetab)} files;\t'
+                    summarystr = f"\tSTAGE{stage}: {len(stagetab)} files;\t"
                     for i, typestr in enumerate(s3types):
-                        ntype = np.sum(stagetab['TYPE'] == typestr)
-                        summarystr += (', ' if i > 0 else '') + f'{ntype} {typestr}'
+                        ntype = np.sum(stagetab["TYPE"] == typestr)
+                        summarystr += (", " if i > 0 else "") + f"{ntype} {typestr}"
                     print(summarystr)
 
 
-def create_database(output_dir,
-                    pid=None,
-                    obsids=None,
-                    input_dir=None,
-                    psflibpaths=None,
-                    bgpaths=None,
-                    assoc_using_targname=True,
-                    verbose=True,
-                    readlevel='012',
-                    cr_from_siaf=False,
-                    **kwargs):
-
+def create_database(
+    output_dir,
+    pid=None,
+    obsids=None,
+    input_dir=None,
+    psflibpaths=None,
+    bgpaths=None,
+    assoc_using_targname=True,
+    verbose=True,
+    readlevel="012",
+    cr_from_siaf=False,
+    **kwargs,
+):
     """
     Create a spaceKLIP database from JWST data
 
@@ -1590,8 +1799,8 @@ def create_database(output_dir,
     if (pid is None) and (input_dir is None):
         raise ValueError("Must provide either a pid or an input_dir")
     elif input_dir is None:
-        mast_dir = os.getenv('JWSTDOWNLOAD_OUTDIR')
-        input_dir = os.path.join(mast_dir, f'{pid:05d}')
+        mast_dir = os.getenv("JWSTDOWNLOAD_OUTDIR")
+        input_dir = os.path.join(mast_dir, f"{pid:05d}")
 
     # Check if obsids is not a list, tuple, or numpy array
     if not isinstance(obsids, (list, tuple, np.ndarray)):
@@ -1606,19 +1815,25 @@ def create_database(output_dir,
     db = Database(output_dir=output_dir)
     db.verbose = verbose
 
-    if str(readlevel) in '012' or str(readlevel) == '012':
-        db.read_jwst_s012_data(datapaths=datapaths,
-                               psflibpaths=psflibpaths,
-                               bgpaths=bgpaths,
-                               cr_from_siaf=cr_from_siaf,
-                               assoc_using_targname=assoc_using_targname)
-    elif str(readlevel) == '3':
+    if str(readlevel) in "012" or str(readlevel) == "012":
+        db.read_jwst_s012_data(
+            datapaths=datapaths,
+            psflibpaths=psflibpaths,
+            bgpaths=bgpaths,
+            cr_from_siaf=cr_from_siaf,
+            assoc_using_targname=assoc_using_targname,
+        )
+    elif str(readlevel) == "3":
         # the above get_files usage won't match KLIP outputsa, so find them here
         datapaths_klip = sorted(glob.glob(os.path.join(input_dir, "*KLmodes-all.fits")))
-        db.read_jwst_s3_data(datapaths=datapaths+datapaths_klip,
-                             cr_from_siaf=cr_from_siaf,)
-    elif str(readlevel) == '4':
-        db.read_jwst_s4_data(datapaths=datapaths,)
+        db.read_jwst_s3_data(
+            datapaths=datapaths + datapaths_klip,
+            cr_from_siaf=cr_from_siaf,
+        )
+    elif str(readlevel) == "4":
+        db.read_jwst_s4_data(
+            datapaths=datapaths,
+        )
     else:
         raise ValueError("Invalid/unknown value for readlevel parameter")
 

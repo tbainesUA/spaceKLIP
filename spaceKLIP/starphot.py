@@ -1,64 +1,64 @@
 from __future__ import division
 
-import matplotlib
+import importlib
+import logging
 
 # =============================================================================
 # IMPORTS
 # =============================================================================
-
 import os
-import pdb
-import sys
-
-import astropy.io.fits as pyfits
-import matplotlib.pyplot as plt
-import numpy as np
-
-import importlib
-import webbpsf_ext
 
 import astropy.units as u
-
+import matplotlib.pyplot as plt
+import numpy as np
+import webbpsf_ext
 from astropy.table import Table
 from astroquery.svo_fps import SvoFps
 from synphot import Observation, SourceSpectrum, SpectralElement
 from synphot.models import Empirical1D
 from synphot.units import convert_flux
 
-import logging
 log = logging.getLogger(__name__)
 log.setLevel(logging.INFO)
 
 from spaceKLIP.plotting import load_plt_style
+
 # =============================================================================
 # MAIN
 # =============================================================================
 
+
 def read_spec_file(starfile):
     """
     Read a spectrum from a TXT file.
-    
+
     Parameters
     ----------
     starfile : path
         Path of two column TXT file with wavelength (micron) and flux (Jy).
-    
+
     Returns
     -------
     sed : synphot.SourceSpectrum
         Spectrum of the source.
-    
+
     """
-    
+
     try:
         data = np.genfromtxt(starfile).transpose()
         model_wave = data[0]
-        model_flux = data[1]    
-        sed = SourceSpectrum(Empirical1D, points=model_wave << u.Unit('micron'), lookup_table=model_flux << u.Unit('Jy'))
-        sed.meta['name'] = starfile.split('/')[-1]
+        model_flux = data[1]
+        sed = SourceSpectrum(
+            Empirical1D,
+            points=model_wave << u.Unit("micron"),
+            lookup_table=model_flux << u.Unit("Jy"),
+        )
+        sed.meta["name"] = starfile.split("/")[-1]
     except:
-        raise ValueError('Unable to read provided starfile; ensure format is in two columns with wavelength (microns), flux (Jy)')
-    
+        raise ValueError(
+            "Unable to read provided starfile; ensure format is in two columns with wavelength (microns), flux (Jy)"
+        )
+
     return sed
 
 def read_votable(starfile, spectral_type, instrume, output_dir, plot_style, **kwargs):
@@ -149,7 +149,7 @@ def get_stellar_magnitudes(starfile,
     output_dir : path, optional
         Path of the directory where the SED plot shall be saved. The default is
         None.
-    
+
     Keyword Args
     ------------
     Teff : float
@@ -186,7 +186,7 @@ def get_stellar_magnitudes(starfile,
     fzero_wm2um : dict
         Dictionary of the zero point flux (W/m^2/um) of each filter of the
         JWST instrument in use.
-    
+
     """
 
     # Handle deprecated return_si kwarg
