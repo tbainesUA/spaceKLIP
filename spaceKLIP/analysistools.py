@@ -11,6 +11,7 @@ import shutil
 import sys
 from functools import partial
 from io import StringIO
+from pathlib import Path
 
 import astropy.io.fits as fits
 import astropy.units as u
@@ -46,6 +47,405 @@ log = logging.getLogger(__name__)
 log.setLevel(logging.INFO)
 
 
+#
+# Helpers
+#
+
+from typing import Final, Tuple
+
+# =============================================================================
+# DOMAIN CONSTANTS
+# =============================================================================
+
+MIRI_4QPM_ROTATION_OFFSET_DEG: Final[float] = 4.83544897
+
+MIRI_4QPM_WIDE_BAR_WIDTH_PIX: Final[int] = 10
+MIRI_4QPM_THIN_BAR_WIDTH_PIX: Final[int] = 2
+MIRI_4QPM_INNER_CLEAR_RADIUS_PIX: Final[int] = 15
+
+MIRI_ROTATION_REFERENCE_DEG: Final[float] = 90.0
+
+MASK_OCCUPANCY_THRESHOLD: Final[float] = 0.5
+
+
+# =============================================================================
+# LOW-LEVEL GEOMETRIC KERNELS
+# =============================================================================
+
+
+def rotate_coordinates(
+    x_coords: np.ndarray,
+    y_coords: np.ndarray,
+    rotation_angles_deg: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Rotate detector coordinates using broadcasted rotation matrices.
+
+    Returns
+    -------
+    x_rotated, y_rotated
+        Arrays with shape (n_rolls, ny, nx)
+    """
+    theta_rad = np.deg2rad(rotation_angles_deg)
+
+    cos_theta = np.cos(theta_rad)[:, None, None]
+    sin_theta = np.sin(theta_rad)[:, None, None]
+
+    x_rotated = x_coords[None, :, :] * cos_theta - y_coords[None, :, :] * sin_theta
+
+    y_rotated = x_coords[None, :, :] * sin_theta + y_coords[None, :, :] * cos_theta
+
+    return x_rotated, y_rotated
+
+
+def evaluate_cross_occultation(
+    x_coords_pix: np.ndarray,
+    y_coords_pix: np.ndarray,
+    wide_bar_width_pix: float,
+    thin_bar_width_pix: float,
+    inner_clear_radius_pix: float,
+) -> np.ndarray:
+    """
+    Evaluate analytic 4QPM occultation geometry.
+    """
+    half_wide = wide_bar_width_pix / 2.0
+    half_thin = thin_bar_width_pix / 2.0
+
+    radius_squared = x_coords_pix**2 + y_coords_pix**2
+
+    central_clear_region = radius_squared < inner_clear_radius_pix**2
+
+    vertical_wide = np.abs(x_coords_pix) <= half_wide
+    horizontal_wide = np.abs(y_coords_pix) <= half_wide
+
+    vertical_thin = np.abs(x_coords_pix) <= half_thin
+    horizontal_thin = np.abs(y_coords_pix) <= half_thin
+
+    occulted_region = (vertical_wide | horizontal_wide) & ~central_clear_region
+
+    structural_cross = vertical_thin | horizontal_thin
+
+    return occulted_region | structural_cross
+
+
+# =============================================================================
+# HIGH-LEVEL DOMAIN API
+# =============================================================================
+
+
+def generate_miri_4qpm_mask(
+    detector_shape: Tuple[int, int],
+    coronagraph_center_pix: Tuple[float, float],
+    roll_reference_angles_deg: np.ndarray,
+    upsample_factor: int = 1,
+    padding_pix: int = 0,
+) -> np.ndarray:
+    """
+    Generate the MIRI 4QPM occultation mask analytically.
+
+    Parameters
+    ----------
+    detector_shape
+        Detector shape as (ny, nx).
+
+    coronagraph_center_pix
+        Coronagraph center coordinates as (x_center, y_center).
+
+    roll_reference_angles_deg
+        Telescope roll angles in degrees.
+
+    upsample_factor
+        Integer detector upsampling factor.
+
+    Returns
+    -------
+    np.ndarray
+        Float mask where occulted pixels are NaN.
+    """
+    if upsample_factor < 1:
+        raise ValueError("upsample_factor must be >= 1")
+
+    if np.any(~np.isfinite(roll_reference_angles_deg)):
+        raise ValueError("roll_reference_angles_deg contains NaN or Inf values.")
+
+    ny, nx = detector_shape
+
+    # Here we're preserving the padding and upsampling
+    padded_ny = ny + 2 * padding_pix
+    padded_nx = nx + 2 * padding_pix
+
+    x_center_pix, y_center_pix = coronagraph_center_pix
+    x_center_pix += padding_pix
+    y_center_pix += padding_pix
+
+    sampled_ny = padded_ny * upsample_factor
+    sampled_nx = padded_nx * upsample_factor
+
+    y_coords_pix = (
+        np.arange(sampled_ny, dtype=np.float32) / upsample_factor - y_center_pix
+    )
+
+    x_coords_pix = (
+        np.arange(sampled_nx, dtype=np.float32) / upsample_factor - x_center_pix
+    )
+
+    x_grid_pix, y_grid_pix = np.meshgrid(
+        x_coords_pix,
+        y_coords_pix,
+        indexing="xy",
+        sparse=False,
+    )
+
+    rotation_angles_deg = (
+        MIRI_ROTATION_REFERENCE_DEG
+        - roll_reference_angles_deg
+        + MIRI_4QPM_ROTATION_OFFSET_DEG
+    )
+
+    x_rotated_pix, y_rotated_pix = rotate_coordinates(
+        x_grid_pix,
+        y_grid_pix,
+        rotation_angles_deg,
+    )
+
+    occultation_stack = evaluate_cross_occultation(
+        x_coords_pix=x_rotated_pix,
+        y_coords_pix=y_rotated_pix,
+        wide_bar_width_pix=MIRI_4QPM_WIDE_BAR_WIDTH_PIX,
+        thin_bar_width_pix=MIRI_4QPM_THIN_BAR_WIDTH_PIX,
+        inner_clear_radius_pix=MIRI_4QPM_INNER_CLEAR_RADIUS_PIX,
+    )
+
+    combined_occultation = np.any(occultation_stack, axis=0)
+
+    if upsample_factor > 1:
+        combined_occultation = combined_occultation[
+            ::upsample_factor,
+            ::upsample_factor,
+        ]
+
+    combined_occultation = combined_occultation[
+        padding_pix : padding_pix + ny,
+        padding_pix : padding_pix + nx,
+    ]
+
+    final_mask = np.ones(
+        detector_shape,
+        dtype=np.float32,
+    )
+
+    final_mask[combined_occultation] = np.nan
+
+    return set_surrounded_pixels(final_mask)
+
+
+# =============================================================================
+# HIGH-LEVEL Contrast calculation API
+# =============================================================================
+from typing import Optional
+
+
+def calc_single_contrast_curve(
+    normalized_frame: np.ndarray,
+    spatial_resolution_pix: float,
+    center_pix: tuple[float, float],
+    inner_working_angle_pix: int | float,
+    outer_working_angle_pix: int | float,
+    coronagraph_transmission_mask: Optional[np.ndarray] = None,
+    low_pass_filter: bool = False,
+) -> tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
+    """Compute raw and throughput-corrected contrast curve for single detector frame"""
+
+    separations_pix, raw_contrast = klip.meas_contrast(
+        dat=normalized_frame,
+        center=center_pix,
+        iwa=inner_working_angle_pix,
+        owa=outer_working_angle_pix,
+        resolution=spatial_resolution_pix,
+        low_pass_filter=low_pass_filter,
+    )
+
+    corrected_contrast = None
+    if coronagraph_transmission_mask is not None:
+        corrected_frame = normalized_frame / coronagraph_transmission_mask
+
+        _, corrected_contrast = klip.meas_contrast(
+            dat=corrected_frame,
+            center=center_pix,
+            iwa=inner_working_angle_pix,
+            owa=outer_working_angle_pix,
+            resolution=spatial_resolution_pix,
+            low_pass_filter=low_pass_filter,
+        )
+
+    return (separations_pix, raw_contrast, corrected_contrast)
+
+
+MIN_CORONAGRAPH_TRANSMISSION = 1e-12
+
+
+def normalize_contrast_frame(
+    frame_data: np.ndarray,
+    normalization_factor: float,
+) -> np.ndarray:
+    """
+    Normalize detector frame into contrast units.
+    """
+    return frame_data * normalization_factor
+
+
+def apply_throughput_correction(
+    normalized_frame: np.ndarray,
+    transmission_mask: np.ndarray,
+    minimum_transmission: float = MIN_CORONAGRAPH_TRANSMISSION,
+) -> np.ndarray:
+    """
+    Apply bounded coronagraph throughput correction.
+
+    Pixels below minimum transmission are masked to NaN.
+    """
+    corrected_frame = np.full_like(
+        normalized_frame,
+        np.nan,
+        dtype=np.float32,
+    )
+
+    valid_transmission = transmission_mask >= minimum_transmission
+
+    np.divide(
+        normalized_frame,
+        transmission_mask,
+        out=corrected_frame,
+        where=valid_transmission,
+    )
+
+    return corrected_frame
+
+
+def compute_contrast_curves(
+    data_cube: np.ndarray,
+    pixel_area_sr: float,
+    stellar_flux_peak: float,
+    spatial_resolution_pix: float,
+    center_pix: Tuple[float, float],
+    inner_working_angle_pix: int | float = 1,
+    outer_working_angle_pix: Optional[int | float] = None,
+    coronagraph_transmission_mask: Optional[np.ndarray] = None,
+) -> Tuple[
+    np.ndarray,
+    np.ndarray,
+    Optional[np.ndarray],
+]:
+    """
+    Compute raw and throughput-corrected contrast curves.
+
+    Parameters
+    ----------
+    data_cube
+        Input detector cube with shape (n_frames, ny, nx).
+
+    pixel_area_sr
+        Pixel solid angle in steradians.
+
+    stellar_flux_peak
+        Stellar peak normalization flux.
+
+    resolution_element_pix
+        Resolution element diameter in pixels.
+
+    center_pix
+        PSF center coordinates as (x, y).
+
+    inner_working_angle_pix
+        Inner working angle in pixels.
+
+    outer_working_angle_pix
+        Outer working angle in pixels.
+
+    coronagraph_transmission_mask
+        Optional coronagraph throughput transmission map.
+
+    Returns
+    -------
+    separations_pix
+        Radial separations in pixels.
+
+    raw_contrast_curves
+        Raw 5-sigma contrast curves.
+
+    throughput_corrected_contrast_curves
+        Throughput-corrected contrast curves.
+    """
+    if data_cube.ndim != 3:
+        raise ValueError("data_cube must have shape (n_frames, ny, nx)")
+
+    if stellar_flux_peak <= 0:
+        raise ValueError("stellar_flux_peak must be positive.")
+
+    if coronagraph_transmission_mask is not None:
+        if coronagraph_transmission_mask.shape != data_cube.shape[1:]:
+            raise ValueError("coronagraph_transmission_mask shape mismatch.")
+
+    n_frames = data_cube.shape[0]
+
+    if outer_working_angle_pix is None:
+        outer_working_angle_pix = min(data_cube.shape[1:]) // 2
+
+    normalization_factor = pixel_area_sr / stellar_flux_peak
+
+    # Precompute normalized cube
+    normalized_cube = (data_cube * normalization_factor).astype(np.float32, copy=False)
+
+    raw_contrast_curves = []
+    throughput_corrected_curves = []
+
+    radial_separations_pix = None
+
+    contrast_kwargs = dict(
+        inner_working_angle_pix=inner_working_angle_pix,
+        outer_working_angle_pix=outer_working_angle_pix,
+        spatial_resolution_pix=spatial_resolution_pix,
+        center_pix=center_pix,
+        low_pass_filter=False,
+        coronagraph_transmission_mask=coronagraph_transmission_mask,
+    )
+
+    for normalized_frame in normalized_cube:
+        (
+            separations_pix,
+            raw_contrast,
+            corrected_contrast,
+        ) = calc_single_contrast_curve(
+            normalized_frame=normalized_frame, **contrast_kwargs
+        )
+        # shared radial separations
+        if radial_separations_pix is None:
+            radial_separations_pix = separations_pix
+
+        raw_contrast_curves.append(raw_contrast)
+        throughput_corrected_curves.append(corrected_contrast)
+
+    # convert to arrays
+    raw_contrast_curves = np.asarray(
+        raw_contrast_curves,
+        dtype=np.float32,
+    )
+
+    throughput_corrected_array = None
+
+    if coronagraph_transmission_mask is not None:
+        throughput_corrected_array = np.asarray(
+            throughput_corrected_curves,
+            dtype=np.float32,
+        )
+
+    return (
+        radial_separations_pix,
+        raw_contrast_curves,
+        throughput_corrected_array,
+    )
+
+
 # =============================================================================
 # MAIN
 # =============================================================================
@@ -74,6 +474,7 @@ class AnalysisTools:
         """
 
         # Make an internal alias of the spaceKLIP database class.
+        print("Hello")
         self.database = database
 
         pass
@@ -138,25 +539,41 @@ class AnalysisTools:
                     )
 
         # Set output directory.
-        output_dir = os.path.join(self.database.output_dir, subdir)
-        if not os.path.exists(output_dir):
-            os.makedirs(output_dir)
+        star_path = Path(starfile)
+        output_dir = Path(self.database.output_dir) / subdir
+        output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Copy the starfile that will be used into this directory
-        new_starfile_path = output_dir + "/" + starfile.split("/")[-1]
-        if starfile[-4:] == ".vot":
-            # Will be using the input spectral type, should record it
-            spectype_str = "Spectral Type: {}".format(spectral_type)
-        else:
-            # Spectral type won't be relevant, don't record misleading info
-            spectype_str = "Spectral Type: N/A"
-        new_header = "#" + starfile.split("/")[-1] + f" /// {spectype_str}" + "\n"
-        contrast_curve_info_path = output_dir + "/contrast_curve_info.txt"
-        # Also copy this info to the contrast curve file
-        with open(contrast_curve_info_path, "w") as ccinfo:
-            ccinfo.write(new_header)
-        log.info("Copying starfile {} to {}".format(starfile, new_starfile_path))
-        write_starfile(starfile, new_starfile_path)
+        # Build clean serialization files cleanly using standard pathlib
+        new_starfile_path = output_dir / star_path.name
+        spectype_str = (
+            f"Spectral Type: {spectral_type}"
+            if star_path.suffix == ".vot"
+            else "Spectral Type: N/A"
+        )
+
+        contrast_curve_info_path = output_dir / "contrast_curve_info.txt"
+        contrast_curve_info_path.write_text(
+            f"#{star_path.name} /// {spectype_str}\n", encoding="utf-8"
+        )
+
+        log.info("Syncing starfile assets: %s to %s", star_path, new_starfile_path)
+        write_starfile(str(star_path), str(new_starfile_path))
+
+        # # Copy the starfile that will be used into this directory
+        # new_starfile_path = output_dir + "/" + starfile.split("/")[-1]
+        # if starfile[-4:] == ".vot":
+        #     # Will be using the input spectral type, should record it
+        #     spectype_str = "Spectral Type: {}".format(spectral_type)
+        # else:
+        #     # Spectral type won't be relevant, don't record misleading info
+        #     spectype_str = "Spectral Type: N/A"
+        # new_header = "#" + starfile.split("/")[-1] + f" /// {spectype_str}" + "\n"
+        # contrast_curve_info_path = output_dir + "/contrast_curve_info.txt"
+        # # Also copy this info to the contrast curve file
+        # with open(contrast_curve_info_path, "w") as ccinfo:
+        #     ccinfo.write(new_header)
+        # log.info("Copying starfile {} to {}".format(starfile, new_starfile_path))
+        # write_starfile(starfile, new_starfile_path)
 
         # Loop through concatenations.
         for i, key in enumerate(self.database.red.keys()):
@@ -167,20 +584,35 @@ class AnalysisTools:
             for j in range(nfitsfiles):
                 log.info("Analyzing file " + self.database.red[key]["FITSFILE"][j])
 
+                # Fetch data
+                instrument = self.database.red[key]["INSTRUME"][j]
+                subarray = self.database.red[key]["SUBARRAY"][j]
+                filt = self.database.red[key]["FILTER"][j]
+                exp_type = self.database.red[key]["EXP_TYPE"][j]
+                pixscale = self.database.red[key]["PIXSCALE"][j]
+                c_wavelength = self.database.red[key]["CWAVEL"][j]
+
                 # Get stellar magnitudes and filter zero points.
+                # mstar, fzero = get_stellar_magnitudes(
+                #     starfile,
+                #     spectral_type,
+                #     self.database.red[key]["INSTRUME"][j],
+                #     output_dir=output_dir,
+                #     **kwargs,
+                # )
                 mstar, fzero = get_stellar_magnitudes(
-                    starfile,
+                    str(star_path),
                     spectral_type,
-                    self.database.red[key]["INSTRUME"][j],
-                    output_dir=output_dir,
+                    instrument,
+                    output_dir=str(output_dir),
                     **kwargs,
                 )  # vegamag, Jy
 
-                tp_comsubst = ut.get_tp_comsubst(
-                    self.database.red[key]["INSTRUME"][j],
-                    self.database.red[key]["SUBARRAY"][j],
-                    self.database.red[key]["FILTER"][j],
-                )
+                # tp_comsubst = ut.get_tp_comsubst(
+                #     self.database.red[key]["INSTRUME"][j],
+                #     self.database.red[key]["SUBARRAY"][j],
+                #     self.database.red[key]["FILTER"][j],
+                # )
 
                 # Read FITS file and PSF mask.
                 fitsfile = self.database.red[key]["FITSFILE"][j]
@@ -258,6 +690,8 @@ class AnalysisTools:
                     )  # pix (0-indexed)
 
                 # Mask coronagraph spiders, 4QPM edges, etc.
+                debug_bar_mask = True
+                print(" --------- I am here -------")
                 if self.database.red[key]["EXP_TYPE"][j] in ["NRC_CORON"]:
                     if "WB" in self.database.red[key]["CORONMSK"][j]:
                         log.info("  Masking out areas for NIRCam bar coronagraph")
@@ -282,6 +716,13 @@ class AnalysisTools:
                                 temp = (pa > pa1) | (pa < pa2)
                             else:
                                 temp = (pa > pa1) & (pa < pa2)
+                            if debug_bar_mask:
+                                plt.figure()
+                                plt.title("NIRCam Bar Mask")
+                                plt.imshow(temp)
+                                plt.show()
+                                debug_bar_mask = False
+
                             data[:, temp] = np.nan
                 elif self.database.red[key]["EXP_TYPE"][j] in ["MIR_4QPM"]:
                     # This is MIRI 4QPM data, want to mask edges. However, close
@@ -354,6 +795,28 @@ class AnalysisTools:
                     nanmask = nanmask[::samp, ::samp]
                     nanmask = nanmask[pad:-pad, pad:-pad]
                     nanmask = set_surrounded_pixels(nanmask)
+
+                    # miri mask
+                    # print("running new miri mask")
+                    # roll_angles = self.database.obs[key]["ROLL_REF"][ww_sci]
+                    # nanmask = generate_miri_4qpm_mask(
+                    #     detector_shape=data[0].shape,
+                    #     coronagraph_center_pix=center,
+                    #     roll_reference_angles_deg=roll_angles,
+                    #     padding_pix=pad,
+                    #     upsample_factor=samp,
+                    # )
+
+                    #
+                    print(f"data shape: {data.shape}")
+                    print(f"center: {center}")
+                    plt.figure()
+                    plt.title("MIRI - 4PQM - MASK")
+                    plt.imshow(nanmask)
+                    plt.axvline(center[0])
+                    plt.axhline(center[1])
+                    plt.show()
+
                     data *= nanmask
                 elif self.database.red[key]["EXP_TYPE"][j] in ["MIR_LYOT"]:
                     raise NotImplementedError()
@@ -373,41 +836,79 @@ class AnalysisTools:
                         rad *= resolution  # pix
                         data[:, rr <= rad] = np.nan
 
+                        print(f"Resolution: {resolution}")
+                        print(f"pixel Scale (arcsec): {pxsc_arcsec}")
+
+                # ------------------------------------------------
                 # Compute raw contrast.
-                seps = []
-                cons = []
+                # ------------------------------------------------
+                # seps = []
+                # cons = []
+                # log.info("  Measuring raw contrast in annuli")
+                # for k in range(data.shape[0]):
+                #     sep, con = klip.meas_contrast(
+                #         dat=data[k] * pxar / fstar,
+                #         iwa=iwa,
+                #         owa=owa,
+                #         resolution=resolution,
+                #         center=center,
+                #         low_pass_filter=False,
+                #     )
+                #     seps += [sep * self.database.red[key]["PIXSCALE"][j]]  # arcsec
+                #     cons += [con]
+                # seps = np.array(seps)
+                # cons = np.array(cons)
+
+                # # If available, apply the coronagraphic transmission before
+                # # computing the raw contrast.
+                # if mask is not None:
+                #     cons_mask = []
+                #     log.info("  Measuring raw contrast for masked data")
+                #     for k in range(data.shape[0]):
+                #         _, con_mask = klip.meas_contrast(
+                #             dat=np.true_divide(data[k], mask) * pxar / fstar,
+                #             iwa=iwa,
+                #             owa=owa,
+                #             resolution=resolution,
+                #             center=center,
+                #             low_pass_filter=False,
+                #         )
+                #         cons_mask += [con_mask]
+                #     cons_mask = np.array(cons_mask)
+
+                # end of old contrast
+
+                # injecting new contrast calculations:
                 log.info("  Measuring raw contrast in annuli")
-                for k in range(data.shape[0]):
-                    sep, con = klip.meas_contrast(
-                        dat=data[k] * pxar / fstar,
-                        iwa=iwa,
-                        owa=owa,
-                        resolution=resolution,
-                        center=center,
-                        low_pass_filter=False,
-                    )
-                    seps += [sep * self.database.red[key]["PIXSCALE"][j]]  # arcsec
-                    cons += [con]
-                seps = np.array(seps)
-                cons = np.array(cons)
+                contrast_results = compute_contrast_curves(
+                    data_cube=data,
+                    pixel_area_sr=pxar,
+                    stellar_flux_peak=fstar,
+                    spatial_resolution_pix=resolution,
+                    center_pix=center,
+                    inner_working_angle_pix=iwa,
+                    outer_working_angle_pix=owa,
+                    coronagraph_transmission_mask=mask,
+                )
 
-                # If available, apply the coronagraphic transmission before
-                # computing the raw contrast.
-                if mask is not None:
-                    cons_mask = []
-                    log.info("  Measuring raw contrast for masked data")
-                    for k in range(data.shape[0]):
-                        _, con_mask = klip.meas_contrast(
-                            dat=np.true_divide(data[k], mask) * pxar / fstar,
-                            iwa=iwa,
-                            owa=owa,
-                            resolution=resolution,
-                            center=center,
-                            low_pass_filter=False,
-                        )
-                        cons_mask += [con_mask]
-                    cons_mask = np.array(cons_mask)
+                (
+                    radial_separations_pix,
+                    raw_contrast_curves,
+                    throughput_corrected_array,
+                ) = contrast_results
 
+                # assuming pixel scale is the same between all data.
+                radial_separations_pix *= self.database.red[key]["PIXSCALE"][0]
+
+                # map back to orignal setup
+                # ideally we shouldnt need this because we should only need one coorindate
+                # The radial separations.
+                seps = np.tile(radial_separations_pix, (len(data), 1))
+                cons = raw_contrast_curves
+                cons_mask = throughput_corrected_array
+
+
+                
                 # Plot masked data.
                 klmodes = self.database.red[key]["KLMODES"][j].split(",")
                 fitsfile = os.path.join(output_dir, os.path.split(fitsfile)[1])
