@@ -685,9 +685,8 @@ def calculate_spatial_resolution_pix(
 # =============================================================================
 
 
-
 def validate_companions(companions):
-    """Validation check to ensure that a list of companions (objects) have 
+    """Validation check to ensure that a list of companions (objects) have
     3 elements (ra, dec, size lambda/D units) want a list of lists"""
     if companions is None:
         return None
@@ -804,22 +803,6 @@ class AnalysisTools:
         log.info("Syncing starfile assets: %s to %s", star_path, new_starfile_path)
         write_starfile(str(star_path), str(new_starfile_path))
 
-        # # Copy the starfile that will be used into this directory
-        # new_starfile_path = output_dir + "/" + starfile.split("/")[-1]
-        # if starfile[-4:] == ".vot":
-        #     # Will be using the input spectral type, should record it
-        #     spectype_str = "Spectral Type: {}".format(spectral_type)
-        # else:
-        #     # Spectral type won't be relevant, don't record misleading info
-        #     spectype_str = "Spectral Type: N/A"
-        # new_header = "#" + starfile.split("/")[-1] + f" /// {spectype_str}" + "\n"
-        # contrast_curve_info_path = output_dir + "/contrast_curve_info.txt"
-        # # Also copy this info to the contrast curve file
-        # with open(contrast_curve_info_path, "w") as ccinfo:
-        #     ccinfo.write(new_header)
-        # log.info("Copying starfile {} to {}".format(starfile, new_starfile_path))
-        # write_starfile(starfile, new_starfile_path)
-
         # Loop through concatenations.
         for i, key in enumerate(self.database.red.keys()):
             log.info("--> Concatenation " + key)
@@ -838,13 +821,6 @@ class AnalysisTools:
                 c_wavelength = self.database.red[key]["CWAVEL"][j]
 
                 # Get stellar magnitudes and filter zero points.
-                # mstar, fzero = get_stellar_magnitudes(
-                #     starfile,
-                #     spectral_type,
-                #     self.database.red[key]["INSTRUME"][j],
-                #     output_dir=output_dir,
-                #     **kwargs,
-                # )
                 mstar, fzero = get_stellar_magnitudes(
                     str(star_path),
                     spectral_type,
@@ -852,12 +828,6 @@ class AnalysisTools:
                     output_dir=str(output_dir),
                     **kwargs,
                 )  # vegamag, Jy
-
-                # tp_comsubst = ut.get_tp_comsubst(
-                #     self.database.red[key]["INSTRUME"][j],
-                #     self.database.red[key]["SUBARRAY"][j],
-                #     self.database.red[key]["FILTER"][j],
-                # )
 
                 # Read FITS file and PSF mask.
                 fitsfile = self.database.red[key]["FITSFILE"][j]
@@ -883,28 +853,28 @@ class AnalysisTools:
                 )
 
                 # old pix area
-                pxar = self.database.red[key]["PIXAR_SR"][j]  # sr
+                pxar = pixel_area_sr  # self.database.red[key]["PIXAR_SR"][j]  # sr
 
-                if np.isnan(pxar):
-                    # log.warning(
-                    #     "PIXAR_SR not found in database, falling back to use PIXSCALE"
-                    # )
-                    log.warning(
-                        f"[{key}][Index {j}] PIXAR_SR not found in telescope telemetry database. "
-                        f"Falling back to geometric pixel scale calculation."
-                    )
-                    pxsc_arcsec = self.database.red[key]["PIXSCALE"][j]  # arcsec
-                    # pxar = pxsc_rad**2  # sr
-                    # pxsc_rad = pxsc_arcsec / 3600.0 / 180.0 * np.pi  # rad
-                    pixel_area_sr = calculate_pixel_area_sr(
-                        pixel_scale_arcsec=pxsc_arcsec
-                    )
-                    print(f"DEGUG -- original: {pxar} | new: {pixel_area_sr}")
-                    pxar = pixel_area_sr
-                else:
-                    log.info(
-                        f"[{key}][Index {j}] PIXAR_SR found in telescope telemetry database. "
-                    )
+                # if np.isnan(pxar):
+                #     # log.warning(
+                #     #     "PIXAR_SR not found in database, falling back to use PIXSCALE"
+                #     # )
+                #     log.warning(
+                #         f"[{key}][Index {j}] PIXAR_SR not found in telescope telemetry database. "
+                #         f"Falling back to geometric pixel scale calculation."
+                #     )
+                #     pxsc_arcsec = self.database.red[key]["PIXSCALE"][j]  # arcsec
+                #     # pxar = pxsc_rad**2  # sr
+                #     # pxsc_rad = pxsc_arcsec / 3600.0 / 180.0 * np.pi  # rad
+                #     pixel_area_sr = calculate_pixel_area_sr(
+                #         pixel_scale_arcsec=pxsc_arcsec
+                #     )
+                #     print(f"DEGUG -- original: {pxar} | new: {pixel_area_sr}")
+                #     pxar = pixel_area_sr
+                # else:
+                #     log.info(
+                #         f"[{key}][Index {j}] PIXAR_SR found in telescope telemetry database. "
+                #     )
 
                 # Convert the host star brightness from vegamag to MJy. Use an
                 # unocculted model PSF whose integrated flux is normalized to
@@ -949,28 +919,9 @@ class AnalysisTools:
                 print(
                     f"Standardized Resolution tracking element: {spatial_resolution_pix:.4f} pixels"
                 )
+
+                # keep original config
                 resolution = spatial_resolution_pix
-                # if self.database.red[key]["TELESCOP"][j] == "JWST":
-                #     if self.database.red[key]["EXP_TYPE"][j] in [
-                #         "NRC_CORON",
-                #         "NRC_TACONFIRM",
-                #         "NRC_TACQ",
-                #     ]:
-                #         diam = 5.2
-                #     else:
-                #         diam = JWST_CIRCUMSCRIBED_DIAMETER
-                # else:
-                #     raise UserWarning("Data originates from unknown telescope")
-                # resolution = (
-                #     1e-6 * self.database.red[key]["CWAVEL"][j] / diam / pxsc_rad
-                # )  # pix
-                # if not np.isnan(self.database.obs[key]["BLURFWHM"][j]):
-                #     resolution = np.hypot(
-                #         resolution, self.database.obs[key]["BLURFWHM"][j]
-                #     )
-                # print(
-                #     f"Spatial Resolution: {resolution}  | {spatial_resolution_pix} (pixels)"
-                # )
 
                 # Get the star position.
                 if overwrite_crpix is None:
@@ -1133,62 +1084,6 @@ class AnalysisTools:
                     # apply the mask and fill with nans
                     data[:, companion_mask] = np.nan
 
-                # if companions is not None:
-                #     log.info(
-                #         f"  Masking out {len(companions)} known companions using provided parameters."
-                #     )
-                #     for k in range(len(companions)):
-                #         ra, dec, rad = companions[k]  # arcsec, arcsec, lambda/D
-                #         yy, xx = np.indices(data.shape[1:])  # pix
-                #         rr = np.sqrt(
-                #             (xx - center[0] + ra / pxsc_arcsec) ** 2
-                #             + (yy - center[1] - dec / pxsc_arcsec) ** 2
-                #         )  # pix
-                #         rad *= resolution  # pix
-                #         data[:, rr <= rad] = np.nan
-
-                #         print(f"Resolution: {resolution}")
-                #         print(f"pixel Scale (arcsec): {pxsc_arcsec}")
-
-                # ------------------------------------------------
-                # Compute raw contrast.
-                # ------------------------------------------------
-                # seps = []
-                # cons = []
-                # log.info("  Measuring raw contrast in annuli")
-                # for k in range(data.shape[0]):
-                #     sep, con = klip.meas_contrast(
-                #         dat=data[k] * pxar / fstar,
-                #         iwa=iwa,
-                #         owa=owa,
-                #         resolution=resolution,
-                #         center=center,
-                #         low_pass_filter=False,
-                #     )
-                #     seps += [sep * self.database.red[key]["PIXSCALE"][j]]  # arcsec
-                #     cons += [con]
-                # seps = np.array(seps)
-                # cons = np.array(cons)
-
-                # # If available, apply the coronagraphic transmission before
-                # # computing the raw contrast.
-                # if mask is not None:
-                #     cons_mask = []
-                #     log.info("  Measuring raw contrast for masked data")
-                #     for k in range(data.shape[0]):
-                #         _, con_mask = klip.meas_contrast(
-                #             dat=np.true_divide(data[k], mask) * pxar / fstar,
-                #             iwa=iwa,
-                #             owa=owa,
-                #             resolution=resolution,
-                #             center=center,
-                #             low_pass_filter=False,
-                #         )
-                #         cons_mask += [con_mask]
-                #     cons_mask = np.array(cons_mask)
-
-                # end of old contrast
-
                 # injecting new contrast calculations:
                 log.info("  Measuring raw contrast in annuli")
                 contrast_results = compute_contrast_curves(
@@ -1222,8 +1117,8 @@ class AnalysisTools:
 
                 # Plot masked data.
 
-                Maksed Data plotting
-                
+                # Maksed Data plotting
+
                 klmodes = self.database.red[key]["KLMODES"][j].split(",")
                 fitsfile = os.path.join(output_dir, os.path.split(fitsfile)[1])
 
