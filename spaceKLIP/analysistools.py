@@ -447,6 +447,135 @@ def compute_contrast_curves(
 
 
 # =============================================================================
+# Adding in the companion masks now
+# =============================================================================
+from typing import List, Tuple
+
+import numpy as np
+from numpy.typing import NDArray
+
+# =============================================================================
+# ATOMIC MATHEMATICAL KERNEL (Pure Point Logic)
+# =============================================================================
+
+
+def compute_single_companion_mask(
+    x_grid: NDArray[np.float64],
+    y_grid: NDArray[np.float64],
+    center_pix: Tuple[float, float],
+    pixscale_arcsec: float,
+    resolution_element_pix: float,
+    ra_offset_arcsec: float,
+    dec_offset_arcsec: float,
+    mask_radius_ld: float,
+) -> NDArray[np.bool_]:
+    """
+    Compute a 2D boolean exclusion mask for a single celestial companion.
+
+    This function acts as a pure stateless coordinate-space kernel. It does
+    not know about data frames, arrays of companions, or file paths.
+
+    Parameters
+    ----------
+    x_grid : NDArray[np.float64]
+        2D matrix containing the horizontal (X) pixel coordinates.
+    y_grid : NDArray[np.float64]
+        2D matrix containing the vertical (Y) pixel coordinates.
+    center_pix : Tuple[float, float]
+        0-indexed host star coordinate array (X_center, Y_center).
+    pixscale_arcsec : float
+        Pixel scale of the instrument detector in arcseconds/pixel.
+    resolution_element_pix : float
+        Calculated resolution element size (lambda/D) expressed in pixels.
+    ra_offset_arcsec : float
+        Right Ascension angular offset relative to host star in arcseconds.
+    dec_offset_arcsec : float
+        Declination angular offset relative to host star in arcseconds.
+    mask_radius_ld : float
+        Exclusion zone cutoff radius in units of lambda/D.
+
+    Returns
+    -------
+    NDArray[np.bool_]
+        A 2D boolean mask of shape matching the input grid, where True
+        denotes coordinates inside the companion exclusion boundary.
+    """
+    # Transform physical angular coordinates into raw pixel displacements
+    delta_x_pix = ra_offset_arcsec / pixscale_arcsec
+    delta_y_pix = dec_offset_arcsec / pixscale_arcsec
+    cutoff_radius_pix = mask_radius_ld * resolution_element_pix
+
+    # Calculate radial Euclidean distance from the companion's shifted center
+    radial_distance_map = np.sqrt(
+        (x_grid - center_pix[0] + delta_x_pix) ** 2
+        + (y_grid - center_pix[1] - delta_y_pix) ** 2
+    )
+
+    return radial_distance_map <= cutoff_radius_pix
+
+
+# =============================================================================
+# GEOMETRIC EXCLUSION FACTORY (State Aggregator Layer)
+# =============================================================================
+
+
+def generate_companion_spatial_mask(
+    spatial_shape: Tuple[int, int],
+    center_pix: Tuple[float, float],
+    pixscale_arcsec: float,
+    resolution_element_pix: float,
+    companions: List[List[float]],
+) -> NDArray[np.bool_]:
+    """
+    Generate a unified 2D binary mask indicating multi-companion exclusion zones.
+
+    Parameters
+    ----------
+    spatial_shape : Tuple[int, int]
+        The (Y, X) pixel dimensions of the target frame layout.
+    center_pix : Tuple[float, float]
+        0-indexed target coordinate array (X_center, Y_center).
+    pixscale_arcsec : float
+        Pixel scale of the instrument detector in arcseconds/pixel.
+    resolution_element_pix : float
+        Calculated resolution element size (lambda/D) expressed in pixels.
+    companions : List[List[float]]
+        Matrix of target companions where each row represents
+        [RA_offset, Dec_offset, radius_ld].
+
+    Returns
+    -------
+    NDArray[np.bool_]
+        2D unified spatial boolean mask layout.
+    """
+    ny, nx = spatial_shape
+    y_indices, x_indices = np.indices((ny, nx), dtype=np.float64)
+
+    # Initialize a master empty mask
+    combined_mask = np.zeros((ny, nx), dtype=bool)
+
+    # Map the companion list across our mathematical kernel
+    for companion in companions:
+        ra_off, dec_off, radius_ld = companion
+
+        single_mask = compute_single_companion_mask(
+            x_grid=x_indices,
+            y_grid=y_indices,
+            center_pix=center_pix,
+            pixscale_arcsec=pixscale_arcsec,
+            resolution_element_pix=resolution_element_pix,
+            ra_offset_arcsec=ra_off,
+            dec_offset_arcsec=dec_off,
+            mask_radius_ld=radius_ld,
+        )
+
+        # Accumulate the mask footprint using bitwise OR
+        combined_mask |= single_mask
+
+    return combined_mask
+
+
+# =============================================================================
 # MAIN
 # =============================================================================
 
@@ -826,18 +955,34 @@ class AnalysisTools:
                     log.info(
                         f"  Masking out {len(companions)} known companions using provided parameters."
                     )
-                    for k in range(len(companions)):
-                        ra, dec, rad = companions[k]  # arcsec, arcsec, lambda/D
-                        yy, xx = np.indices(data.shape[1:])  # pix
-                        rr = np.sqrt(
-                            (xx - center[0] + ra / pxsc_arcsec) ** 2
-                            + (yy - center[1] - dec / pxsc_arcsec) ** 2
-                        )  # pix
-                        rad *= resolution  # pix
-                        data[:, rr <= rad] = np.nan
+                    print(f"Resolution: {resolution}")
+                    print(f"pixel Scale (arcsec): {pxsc_arcsec}")
+                    companion_mask = generate_companion_spatial_mask(
+                        spatial_shape=data.shape[1:],
+                        center_pix=center,
+                        pixscale_arcsec=pxsc_arcsec,
+                        resolution_element_pix=resolution,
+                        companions=companions,
+                    )
+                    # apply the mask and fill with nans
+                    data[:, companion_mask] = np.nan
 
-                        print(f"Resolution: {resolution}")
-                        print(f"pixel Scale (arcsec): {pxsc_arcsec}")
+                # if companions is not None:
+                #     log.info(
+                #         f"  Masking out {len(companions)} known companions using provided parameters."
+                #     )
+                #     for k in range(len(companions)):
+                #         ra, dec, rad = companions[k]  # arcsec, arcsec, lambda/D
+                #         yy, xx = np.indices(data.shape[1:])  # pix
+                #         rr = np.sqrt(
+                #             (xx - center[0] + ra / pxsc_arcsec) ** 2
+                #             + (yy - center[1] - dec / pxsc_arcsec) ** 2
+                #         )  # pix
+                #         rad *= resolution  # pix
+                #         data[:, rr <= rad] = np.nan
+
+                #         print(f"Resolution: {resolution}")
+                #         print(f"pixel Scale (arcsec): {pxsc_arcsec}")
 
                 # ------------------------------------------------
                 # Compute raw contrast.
@@ -907,8 +1052,6 @@ class AnalysisTools:
                 cons = raw_contrast_curves
                 cons_mask = throughput_corrected_array
 
-
-                
                 # Plot masked data.
                 klmodes = self.database.red[key]["KLMODES"][j].split(",")
                 fitsfile = os.path.join(output_dir, os.path.split(fitsfile)[1])
