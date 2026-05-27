@@ -350,7 +350,7 @@ def compute_contrast_curves(
     stellar_flux_peak
         Stellar peak normalization flux.
 
-    resolution_element_pix
+    spatial_resolution_pix
         Resolution element diameter in pixels.
 
     center_pix
@@ -464,7 +464,7 @@ def compute_single_companion_mask(
     y_grid: NDArray[np.float64],
     center_pix: Tuple[float, float],
     pixscale_arcsec: float,
-    resolution_element_pix: float,
+    spatial_resolution_pix: float,
     ra_offset_arcsec: float,
     dec_offset_arcsec: float,
     mask_radius_ld: float,
@@ -485,7 +485,7 @@ def compute_single_companion_mask(
         0-indexed host star coordinate array (X_center, Y_center).
     pixscale_arcsec : float
         Pixel scale of the instrument detector in arcseconds/pixel.
-    resolution_element_pix : float
+    spatial_resolution_pix : float
         Calculated resolution element size (lambda/D) expressed in pixels.
     ra_offset_arcsec : float
         Right Ascension angular offset relative to host star in arcseconds.
@@ -503,7 +503,7 @@ def compute_single_companion_mask(
     # Transform physical angular coordinates into raw pixel displacements
     delta_x_pix = ra_offset_arcsec / pixscale_arcsec
     delta_y_pix = dec_offset_arcsec / pixscale_arcsec
-    cutoff_radius_pix = mask_radius_ld * resolution_element_pix
+    cutoff_radius_pix = mask_radius_ld * spatial_resolution_pix
 
     # Calculate radial Euclidean distance from the companion's shifted center
     radial_distance_map = np.sqrt(
@@ -523,7 +523,7 @@ def generate_companion_spatial_mask(
     spatial_shape: Tuple[int, int],
     center_pix: Tuple[float, float],
     pixscale_arcsec: float,
-    resolution_element_pix: float,
+    spatial_resolution_pix: float,
     companions: List[List[float]],
 ) -> NDArray[np.bool_]:
     """
@@ -537,7 +537,7 @@ def generate_companion_spatial_mask(
         0-indexed target coordinate array (X_center, Y_center).
     pixscale_arcsec : float
         Pixel scale of the instrument detector in arcseconds/pixel.
-    resolution_element_pix : float
+    spatial_resolution_pix : float
         Calculated resolution element size (lambda/D) expressed in pixels.
     companions : List[List[float]]
         Matrix of target companions where each row represents
@@ -563,7 +563,7 @@ def generate_companion_spatial_mask(
             y_grid=y_indices,
             center_pix=center_pix,
             pixscale_arcsec=pixscale_arcsec,
-            resolution_element_pix=resolution_element_pix,
+            spatial_resolution_pix=spatial_resolution_pix,
             ra_offset_arcsec=ra_off,
             dec_offset_arcsec=dec_off,
             mask_radius_ld=radius_ld,
@@ -576,8 +576,132 @@ def generate_companion_spatial_mask(
 
 
 # =============================================================================
+# math
+# =============================================================================
+ARCSEC_PER_RADIAN = 180.0 * 3600.0 / np.pi
+
+
+def calculate_pixel_area_sr(pixel_scale_arcsec: float) -> float:
+    """
+    Calculate the solid angle subtended by a single detector pixel in steradians.
+
+    Parameters
+    ----------
+    pixel_scale_arcsec : float
+        The physical size of a single detector pixel in arcseconds.
+
+    Returns
+    -------
+    float
+        The solid angle area equivalent expressed in units of steradians (sr).
+    """
+    if pixel_scale_arcsec <= 0:
+        raise ValueError("pixel_scale_arcsec must be a positive non-zero value.")
+
+    # Convert linear pixel edge dimension from arcseconds to radians
+    pixel_scale_rad = pixel_scale_arcsec / ARCSEC_PER_RADIAN
+
+    # Compute 2D area component (square radians is structurally equivalent to steradians)
+    pixel_area_sr = pixel_scale_rad**2
+
+    return float(pixel_area_sr)
+
+
+# Official JWST Entrance Pupil/Primary Mirror Diameter Constants (Meters)
+# JWST_CIRCUMSCRIBED_DIAMETER = 6.6  # Outer edge boundary
+MICRON_TO_METERS = 1e-6
+JWST_CORONAGRAPH_DIAMETER = (
+    5.2  # Effective clearance diameter for specialized coronagraph masking
+)
+
+
+def calculate_spatial_resolution_pix(
+    wavelength_um: float,
+    pixel_scale_rad: float,
+    telescope_name: str,
+    exposure_type: str,
+    blur_fwhm_pix: float = 0.0,
+    factor: float = 1.0,
+) -> float:
+    """
+    Calculate the effective structural resolution element in pixels, accounting
+    for optical diffraction limitations and instrument-level blurring.
+
+    Parameters
+    ----------
+    wavelength_um : float
+        The observation center wavelength in micrometers (CWAVEL).
+    pixel_scale_rad : float
+        The pixel scale size expressed in radians per pixel (pxsc_rad).
+    telescope_name : str
+        Name identifier of the origin observatory (e.g., 'JWST').
+    exposure_type : str
+        Telemetry exposure type block code (e.g., 'NRC_CORON').
+    blur_fwhm_pix : float, optional
+        Additional atmospheric/instrument blur FWHM in pixel units (BLURFWHM). Defaults to 0.0.
+    factor : float, optional
+        Diffraction element scaling modifier. Defaults to 1.0 (lambda/D). Change to 1.22
+        if strictly computing a Rayleigh criteria resolution bound.
+
+    Returns
+    -------
+    float
+        The effective physical resolution element scaled into detector pixels.
+    """
+    # 1. Enforce strict telescope type gating
+    if str(telescope_name).upper() != "JWST":
+        raise ValueError(
+            f"Unsupported or unknown telescope platform: '{telescope_name}'"
+        )
+
+    if wavelength_um <= 0 or pixel_scale_rad <= 0:
+        raise ValueError(
+            "Wavelength and pixel scale inputs must evaluate to positive non-zero floats."
+        )
+
+    # 2. Assign effective optical diameter based on specialized pupil masking profiles
+    if str(exposure_type).upper() in ["NRC_CORON", "NRC_TACONFIRM", "NRC_TACQ"]:
+        # NIRCam coronagraph masks constrain the open entrance pupil to an effective 5.2m
+        aperture_diameter_m = JWST_CORONAGRAPH_DIAMETER
+    else:
+        aperture_diameter_m = JWST_CIRCUMSCRIBED_DIAMETER
+
+    # 3. Compute structural diffraction footprint (meters to micrometers cancel via 1e-6)
+    wavelength_m = wavelength_um * 1e-6  # MICRON_TO_METERS
+    diffraction_limit_rad = (factor * wavelength_m) / aperture_diameter_m
+
+    # Map the spatial angular bounds directly into detector pixel grids
+    spatial_resolution_pix = diffraction_limit_rad / pixel_scale_rad
+
+    # 4. Apply additional instrumental/smearing blurring adjustments via quadrature addition
+    if not np.isnan(blur_fwhm_pix) and blur_fwhm_pix > 0:
+        spatial_resolution_pix = np.hypot(spatial_resolution_pix, blur_fwhm_pix)
+
+    return float(spatial_resolution_pix)
+
+
+# =============================================================================
 # MAIN
 # =============================================================================
+
+
+
+def validate_companions(companions):
+    """Validation check to ensure that a list of companions (objects) have 
+    3 elements (ra, dec, size lambda/D units) want a list of lists"""
+    if companions is None:
+        return None
+
+    if not companions:
+        return []
+
+    if not isinstance(companions[0], (list, tuple)):
+        companions = [companions]
+
+    if any(len(c) != 3 for c in companions):
+        raise ValueError("Each companion must contain exactly 3 elements")
+
+    return companions
 
 
 class AnalysisTools:
@@ -657,15 +781,7 @@ class AnalysisTools:
         """
 
         # Check input.
-        if companions is not None:
-            if not isinstance(companions[0], list):
-                if len(companions) == 3:
-                    companions = [companions]
-            for i in range(len(companions)):
-                if len(companions[i]) != 3:
-                    raise UserWarning(
-                        "There should be three elements for each companion in the companions list"
-                    )
+        companions = validate_companions(companions)
 
         # Set output directory.
         star_path = Path(starfile)
@@ -774,14 +890,41 @@ class AnalysisTools:
                     )
 
                 # Compute the pixel area in steradian.
-                pxsc_arcsec = self.database.red[key]["PIXSCALE"][j]  # arcsec
-                pxsc_rad = pxsc_arcsec / 3600.0 / 180.0 * np.pi  # rad
+                # 1. Resolve pixel scaling and solid angles uniformly
+                pxsc_arcsec = self.database.red[key]["PIXSCALE"][j]
+                pxsc_rad = pxsc_arcsec / ARCSEC_PER_RADIAN
+
+                # Establish a consistent, standardized tracking variable
+                pxar_telemetry = self.database.red[key]["PIXAR_SR"][j]
+                pixel_area_sr = (
+                    pxar_telemetry
+                    if not np.isnan(pxar_telemetry)
+                    else calculate_pixel_area_sr(pxsc_arcsec)
+                )
+
+                # old pix area
                 pxar = self.database.red[key]["PIXAR_SR"][j]  # sr
+
                 if np.isnan(pxar):
+                    # log.warning(
+                    #     "PIXAR_SR not found in database, falling back to use PIXSCALE"
+                    # )
                     log.warning(
-                        "PIXAR_SR not found in database, falling back to use PIXSCALE"
+                        f"[{key}][Index {j}] PIXAR_SR not found in telescope telemetry database. "
+                        f"Falling back to geometric pixel scale calculation."
                     )
-                    pxar = pxsc_rad**2  # sr
+                    pxsc_arcsec = self.database.red[key]["PIXSCALE"][j]  # arcsec
+                    # pxar = pxsc_rad**2  # sr
+                    # pxsc_rad = pxsc_arcsec / 3600.0 / 180.0 * np.pi  # rad
+                    pixel_area_sr = calculate_pixel_area_sr(
+                        pixel_scale_arcsec=pxsc_arcsec
+                    )
+                    print(f"DEGUG -- original: {pxar} | new: {pixel_area_sr}")
+                    pxar = pixel_area_sr
+                else:
+                    log.info(
+                        f"[{key}][Index {j}] PIXAR_SR found in telescope telemetry database. "
+                    )
 
                 # Convert the host star brightness from vegamag to MJy. Use an
                 # unocculted model PSF whose integrated flux is normalized to
@@ -807,24 +950,47 @@ class AnalysisTools:
                 # resolution element. Account for possible blurring.
                 iwa = 1  # pix
                 owa = data.shape[1] // 2  # pix
-                if self.database.red[key]["TELESCOP"][j] == "JWST":
-                    if self.database.red[key]["EXP_TYPE"][j] in [
-                        "NRC_CORON",
-                        "NRC_TACONFIRM",
-                        "NRC_TACQ",
-                    ]:
-                        diam = 5.2
-                    else:
-                        diam = JWST_CIRCUMSCRIBED_DIAMETER
-                else:
-                    raise UserWarning("Data originates from unknown telescope")
-                resolution = (
-                    1e-6 * self.database.red[key]["CWAVEL"][j] / diam / pxsc_rad
-                )  # pix
-                if not np.isnan(self.database.obs[key]["BLURFWHM"][j]):
-                    resolution = np.hypot(
-                        resolution, self.database.obs[key]["BLURFWHM"][j]
-                    )
+
+                # 2. Extract instrument-level configurations safely
+                telescop = self.database.red[key]["TELESCOP"][j]
+                exp_type = self.database.red[key]["EXP_TYPE"][j]
+                cwave_um = self.database.red[key]["CWAVEL"][j]
+                blur_fwhm = self.database.obs[key]["BLURFWHM"][j]
+
+                # 3. Call the standardized resolution tracking function
+                spatial_resolution_pix = calculate_spatial_resolution_pix(
+                    wavelength_um=cwave_um,
+                    pixel_scale_rad=pxsc_rad,  # Directly matching your linear baseline scale variable
+                    telescope_name=telescop,
+                    exposure_type=exp_type,
+                    blur_fwhm_pix=blur_fwhm,
+                )
+
+                print(
+                    f"Standardized Resolution tracking element: {spatial_resolution_pix:.4f} pixels"
+                )
+                resolution = spatial_resolution_pix
+                # if self.database.red[key]["TELESCOP"][j] == "JWST":
+                #     if self.database.red[key]["EXP_TYPE"][j] in [
+                #         "NRC_CORON",
+                #         "NRC_TACONFIRM",
+                #         "NRC_TACQ",
+                #     ]:
+                #         diam = 5.2
+                #     else:
+                #         diam = JWST_CIRCUMSCRIBED_DIAMETER
+                # else:
+                #     raise UserWarning("Data originates from unknown telescope")
+                # resolution = (
+                #     1e-6 * self.database.red[key]["CWAVEL"][j] / diam / pxsc_rad
+                # )  # pix
+                # if not np.isnan(self.database.obs[key]["BLURFWHM"][j]):
+                #     resolution = np.hypot(
+                #         resolution, self.database.obs[key]["BLURFWHM"][j]
+                #     )
+                # print(
+                #     f"Spatial Resolution: {resolution}  | {spatial_resolution_pix} (pixels)"
+                # )
 
                 # Get the star position.
                 if overwrite_crpix is None:
@@ -981,7 +1147,7 @@ class AnalysisTools:
                         spatial_shape=data.shape[1:],
                         center_pix=center,
                         pixscale_arcsec=pxsc_arcsec,
-                        resolution_element_pix=resolution,
+                        spatial_resolution_pix=resolution,
                         companions=companions,
                     )
                     # apply the mask and fill with nans
@@ -1072,7 +1238,12 @@ class AnalysisTools:
                 cons = raw_contrast_curves
                 cons_mask = throughput_corrected_array
 
+                # PLOTTING DATA
+
                 # Plot masked data.
+
+                Maksed Data plotting
+                
                 klmodes = self.database.red[key]["KLMODES"][j].split(",")
                 fitsfile = os.path.join(output_dir, os.path.split(fitsfile)[1])
 
@@ -1136,6 +1307,8 @@ class AnalysisTools:
                 plt.show()
                 plt.close(fig)
 
+                # PLOTTING THE Raw Contrast Curves
+
                 # Plot raw contrast.
                 klmodes = self.database.red[key]["KLMODES"][j].split(",")
                 fitsfile = os.path.join(output_dir, os.path.split(fitsfile)[1])
@@ -1193,6 +1366,8 @@ class AnalysisTools:
                     log.info(f" Plot saved in {output_file}")
                 plt.show()
                 plt.close(fig)
+
+                # Exporting Data
 
                 if output_filetype.lower() == "ecsv":
                     # Save outputs as astropy ECSV text tables
@@ -1286,15 +1461,7 @@ class AnalysisTools:
         """
 
         # Check input.
-        if companions is not None:
-            if not isinstance(companions[0], list):
-                if len(companions) == 3:
-                    companions = [companions]
-            for i in range(len(companions)):
-                if len(companions[i]) != 3:
-                    raise UserWarning(
-                        "There should be three elements for each companion in the companions list"
-                    )
+        companions = validate_companions(companions)
 
         # Set output directory.
         output_dir = os.path.join(self.database.output_dir, subdir)
