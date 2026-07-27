@@ -891,7 +891,7 @@ class AnalysisTools:
                     else calculate_pixel_area_sr(pxsc_arcsec)
                 )
 
-                # old pix area
+                # Keep old pix area variable temporarily so that things continue to work
                 pxar = pixel_area_sr  # self.database.red[key]["PIXAR_SR"][j]  # sr
 
                 # if np.isnan(pxar):
@@ -978,6 +978,9 @@ class AnalysisTools:
                 debug_bar_mask = True
                 print(" --------- I am here -------")
                 if self.database.red[key]["EXP_TYPE"][j] in ["NRC_CORON"]:
+                    # NOTES: TB I am not sure what this is suppose to look like.
+                    # The test/code I have for this produces a result but I do not have
+                    # a reference to compare it too.
                     if "WB" in self.database.red[key]["CORONMSK"][j]:
                         log.info("  Masking out areas for NIRCam bar coronagraph")
                         xr = np.arange(data.shape[-1]) - center[0]
@@ -1081,7 +1084,10 @@ class AnalysisTools:
                     nanmask = nanmask[pad:-pad, pad:-pad]
                     nanmask = set_surrounded_pixels(nanmask)
 
-                    # miri mask
+                    ####################
+                    # MIRI mask (This works I just need to fold it in)
+                    ####################
+
                     # print("running new miri mask")
                     # roll_angles = self.database.obs[key]["ROLL_REF"][ww_sci]
                     # nanmask = generate_miri_4qpm_mask(
@@ -1106,7 +1112,9 @@ class AnalysisTools:
                 elif self.database.red[key]["EXP_TYPE"][j] in ["MIR_LYOT"]:
                     raise NotImplementedError()
 
-                # Mask companions.
+                ####################
+                # Mask companions Step
+                ####################
                 if companions is not None:
                     log.info(
                         f"  Masking out {len(companions)} known companions using provided parameters."
@@ -1123,7 +1131,9 @@ class AnalysisTools:
                     # apply the mask and fill with nans
                     data[:, companion_mask] = np.nan
 
+                ####################
                 # injecting new contrast calculations:
+                ####################
                 log.info("  Measuring raw contrast in annuli")
                 contrast_results = compute_contrast_curves(
                     data_cube=data,
@@ -1141,6 +1151,10 @@ class AnalysisTools:
                     raw_contrast_curves,
                     throughput_corrected_array,
                 ) = contrast_results
+
+                # NOTES: The raw contrast calculation like should be migrated to a table
+                # or dataclass result structure rather than floating variables, its a result.
+                # can keep things more orgnanized.  
 
                 # assuming pixel scale is the same between all data.
                 radial_separations_pix *= self.database.red[key]["PIXSCALE"][0]
