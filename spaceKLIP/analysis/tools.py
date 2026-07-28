@@ -23,6 +23,10 @@ from tqdm.auto import trange
 
 from spaceKLIP.imagetools import gaussian_kernel
 
+from .contrast.calibrate import run_calibrate_contrast
+from .contrast.extract_companions import run_extract_companions
+from .contrast.raw import run_raw_contrast
+
 log = logging.getLogger(__name__)
 log.setLevel(logging.INFO)
 
@@ -31,9 +35,6 @@ log.setLevel(logging.INFO)
 # Helpers
 #
 
-from contrast.calibrate import calibrate_contrast
-from contrast.extract_companions import extract_companions
-from contrast.raw import raw_contrast
 
 # # =============================================================================
 # # DOMAIN CONSTANTS
@@ -726,17 +727,17 @@ class AnalysisTools:
         plot_style=None,
         **kwargs,
     ):
-        return raw_contrast(
+        return run_raw_contrast(
             self.database,
             starfile,
-            spectral_type="G2V",
-            companions=None,
-            overwrite_crpix=None,
-            subdir="rawcon",
-            output_filetype="npy",
-            plot_xlim=(0, 10),
-            save_figures=True,
-            plot_style=None,
+            spectral_type=spectral_type,
+            companions=companions,
+            overwrite_crpix=overwrite_crpix,
+            subdir=subdir,
+            output_filetype=output_filetype,
+            plot_xlim=plot_xlim,
+            save_figures=save_figures,
+            plot_style=plot_style,
             **kwargs,
         )
 
@@ -798,20 +799,20 @@ class AnalysisTools:
         None.
         """
 
-        return calibrate_contrast(
+        return run_calibrate_contrast(
             self.database,
-            subdir="calcon",
-            rawcon_subdir="rawcon",
-            rawcon_filetype="npy",
-            companions=None,
-            injection_seps="default",
-            injection_pas="default",
-            injection_flux_sigma=20,
-            multi_injection_spacing=None,
-            use_saved=False,
-            thrput_fit_method="median",
-            plot_xlim=(0, 10),
-            plot_style=None,
+            subdir=subdir,
+            rawcon_subdir=rawcon_subdir,
+            rawcon_filetype=rawcon_filetype,
+            companions=companions,
+            injection_seps=injection_seps,
+            injection_pas=injection_pas,
+            injection_flux_sigma=injection_flux_sigma,
+            multi_injection_spacing=multi_injection_spacing,
+            use_saved=use_saved,
+            thrput_fit_method=thrput_fit_method,
+            plot_xlim=plot_xlim,
+            plot_style=plot_style,
             **kwargs,
         )
 
@@ -919,28 +920,28 @@ class AnalysisTools:
 
         """
 
-        return extract_companions(
+        return run_extract_companions(
             self.database,
-            companions,
-            starfile,
-            mstar_err,
-            spectral_type="G2V",
-            planetfile=None,
-            klmode="max",
-            date="auto",
-            use_fm_psf=True,
-            flip_fmpsf_xy=None,
-            highpass=False,
-            fitmethod="mcmc",
-            minmethod=None,
-            fitkernel="diag",
-            subtract=True,
-            inject=False,
-            remove_background=False,
-            save_preklip=False,
-            overwrite=True,
-            subdir="companions",
-            save_figures=True,
+            companions=companions,
+            starfile=starfile,
+            mstar_err=mstar_err,
+            spectral_type=spectral_type,
+            planetfile=planetfile,
+            klmode=klmode,
+            date=date,
+            use_fm_psf=use_fm_psf,
+            flip_fmpsf_xy=flip_fmpsf_xy,
+            highpass=highpass,
+            fitmethod=fitmethod,
+            minmethod=minmethod,
+            fitkernel=fitkernel,
+            subtract=subtract,
+            inject=inject,
+            remove_background=remove_background,
+            save_preklip=save_preklip,
+            overwrite=overwrite,
+            subdir=subdir,
+            save_figures=save_figures,
             **kwargs,
         )
 

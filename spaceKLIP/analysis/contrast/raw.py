@@ -9,7 +9,6 @@ import os
 from pathlib import Path
 
 import astropy.units as u
-import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
 from astropy.table import Table
@@ -18,10 +17,11 @@ from scipy.ndimage import rotate
 from stpsf.constants import JWST_CIRCUMSCRIBED_DIAMETER
 
 from spaceKLIP import utils as ut
-from spaceKLIP.plotting import load_plt_style
 from spaceKLIP.psf import get_offsetpsf
 from spaceKLIP.starphot import get_stellar_magnitudes
 from spaceKLIP.utils import set_surrounded_pixels, write_starfile
+
+from .plotting import plot_masked_data, plot_raw_contrast
 
 log = logging.getLogger(__name__)
 log.setLevel(logging.INFO)
@@ -683,7 +683,7 @@ def validate_companions(companions):
     return companions
 
 
-def raw_contrast(
+def run_raw_contrast(
     database,
     starfile,
     spectral_type="G2V",
@@ -736,7 +736,7 @@ def raw_contrast(
 
     # Set output directory.
     star_path = Path(starfile)
-    output_dir = Path(database.database.output_dir) / subdir
+    output_dir = Path(database.output_dir) / subdir
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Build clean serialization files cleanly using standard pathlib
@@ -756,21 +756,21 @@ def raw_contrast(
     write_starfile(str(star_path), str(new_starfile_path))
 
     # Loop through concatenations.
-    for i, key in enumerate(database.database.red.keys()):
+    for i, key in enumerate(database.red.keys()):
         log.info("--> Concatenation " + key)
 
         # Loop through FITS files.
-        nfitsfiles = len(database.database.red[key])
+        nfitsfiles = len(database.red[key])
         for j in range(nfitsfiles):
-            log.info("Analyzing file " + database.database.red[key]["FITSFILE"][j])
+            log.info("Analyzing file " + database.red[key]["FITSFILE"][j])
 
             # Fetch data
-            instrument = database.database.red[key]["INSTRUME"][j]
-            subarray = database.database.red[key]["SUBARRAY"][j]
-            filt = database.database.red[key]["FILTER"][j]
-            exp_type = database.database.red[key]["EXP_TYPE"][j]
-            pixscale = database.database.red[key]["PIXSCALE"][j]
-            c_wavelength = database.database.red[key]["CWAVEL"][j]
+            instrument = database.red[key]["INSTRUME"][j]
+            subarray = database.red[key]["SUBARRAY"][j]
+            filt = database.red[key]["FILTER"][j]
+            exp_type = database.red[key]["EXP_TYPE"][j]
+            pixscale = database.red[key]["PIXSCALE"][j]
+            c_wavelength = database.red[key]["CWAVEL"][j]
 
             # Get stellar magnitudes and filter zero points.
             mstar, fzero = get_stellar_magnitudes(
@@ -782,9 +782,9 @@ def raw_contrast(
             )  # vegamag, Jy
 
             # Read FITS file and PSF mask.
-            fitsfile = database.database.red[key]["FITSFILE"][j]
+            fitsfile = database.red[key]["FITSFILE"][j]
             data, head_pri, head_sci, is2d = ut.read_red(fitsfile)
-            maskfile = database.database.red[key]["MASKFILE"][j]
+            maskfile = database.red[key]["MASKFILE"][j]
             mask = ut.read_msk(maskfile)
             if mask is None:
                 log.warning(
@@ -793,11 +793,11 @@ def raw_contrast(
 
             # Compute the pixel area in steradian.
             # 1. Resolve pixel scaling and solid angles uniformly
-            pxsc_arcsec = database.database.red[key]["PIXSCALE"][j]
+            pxsc_arcsec = database.red[key]["PIXSCALE"][j]
             pxsc_rad = pxsc_arcsec / ARCSEC_PER_RADIAN
 
             # Establish a consistent, standardized tracking variable
-            pxar_telemetry = database.database.red[key]["PIXAR_SR"][j]
+            pxar_telemetry = database.red[key]["PIXAR_SR"][j]
             pixel_area_sr = (
                 pxar_telemetry
                 if not np.isnan(pxar_telemetry)
@@ -805,7 +805,7 @@ def raw_contrast(
             )
 
             # Keep old pix area variable temporarily so that things continue to work
-            pxar = pixel_area_sr  # database.database.red[key]["PIXAR_SR"][j]  # sr
+            pxar = pixel_area_sr  # database.red[key]["PIXAR_SR"][j]  # sr
 
             # if np.isnan(pxar):
             #     # log.warning(
@@ -815,7 +815,7 @@ def raw_contrast(
             #         f"[{key}][Index {j}] PIXAR_SR not found in telescope telemetry database. "
             #         f"Falling back to geometric pixel scale calculation."
             #     )
-            #     pxsc_arcsec = database.database.red[key]["PIXSCALE"][j]  # arcsec
+            #     pxsc_arcsec = database.red[key]["PIXSCALE"][j]  # arcsec
             #     # pxar = pxsc_rad**2  # sr
             #     # pxsc_rad = pxsc_arcsec / 3600.0 / 180.0 * np.pi  # rad
             #     pixel_area_sr = calculate_pixel_area_sr(
@@ -832,8 +832,8 @@ def raw_contrast(
             # unocculted model PSF whose integrated flux is normalized to
             # one in order to obtain the theoretical peak count of the
             # star.
-            filt = database.database.red[key]["FILTER"][j]
-            offsetpsf = get_offsetpsf(database.database.obs[key])
+            filt = database.red[key]["FILTER"][j]
+            offsetpsf = get_offsetpsf(database.obs[key])
             fstar = (
                 fzero[filt] / 10.0 ** (mstar[filt] / 2.5) / 1e6 * np.nanmax(offsetpsf)
             )  # MJy
@@ -851,10 +851,10 @@ def raw_contrast(
             owa = data.shape[1] // 2  # pix
 
             # 2. Extract instrument-level configurations safely
-            telescop = database.database.red[key]["TELESCOP"][j]
-            exp_type = database.database.red[key]["EXP_TYPE"][j]
-            cwave_um = database.database.red[key]["CWAVEL"][j]
-            blur_fwhm = database.database.obs[key]["BLURFWHM"][j]
+            telescop = database.red[key]["TELESCOP"][j]
+            exp_type = database.red[key]["EXP_TYPE"][j]
+            cwave_um = database.red[key]["CWAVEL"][j]
+            blur_fwhm = database.obs[key]["BLURFWHM"][j]
 
             # 3. Call the standardized resolution tracking function
             spatial_resolution_pix = calculate_spatial_resolution_pix(
@@ -887,20 +887,20 @@ def raw_contrast(
             # Mask coronagraph spiders, 4QPM edges, etc.
             debug_bar_mask = True
             print(" --------- I am here -------")
-            if database.database.red[key]["EXP_TYPE"][j] in ["NRC_CORON"]:
+            if database.red[key]["EXP_TYPE"][j] in ["NRC_CORON"]:
                 # NOTES: TB I am not sure what this is suppose to look like.
                 # The test/code I have for this produces a result but I do not have
                 # a reference to compare it too.
-                if "WB" in database.database.red[key]["CORONMSK"][j]:
+                if "WB" in database.red[key]["CORONMSK"][j]:
                     log.info("  Masking out areas for NIRCam bar coronagraph")
                     xr = np.arange(data.shape[-1]) - center[0]
                     yr = np.arange(data.shape[-2]) - center[1]
                     xx, yy = np.meshgrid(xr, yr)
                     pa = -np.rad2deg(np.arctan2(xx, yy))
                     pa[pa < 0.0] += 360.0
-                    ww_sci = np.where(database.database.obs[key]["TYPE"] == "SCI")[0]
+                    ww_sci = np.where(database.obs[key]["TYPE"] == "SCI")[0]
                     for ww in ww_sci:
-                        roll_ref = database.database.obs[key]["ROLL_REF"][ww]  # deg
+                        roll_ref = database.obs[key]["ROLL_REF"][ww]  # deg
                         pa1 = (90.0 - 15.0 + roll_ref) % 360.0
                         pa2 = (90.0 + 15.0 + roll_ref) % 360.0
                         if pa1 > pa2:
@@ -922,7 +922,7 @@ def raw_contrast(
                             debug_bar_mask = False
 
                         data[:, temp] = np.nan
-            elif database.database.red[key]["EXP_TYPE"][j] in ["MIR_4QPM"]:
+            elif database.red[key]["EXP_TYPE"][j] in ["MIR_4QPM"]:
                 # This is MIRI 4QPM data, want to mask edges. However, close
                 # to the center you don't have a choice. So, want to use
                 # rectangles with a gap in the center.
@@ -966,10 +966,10 @@ def raw_contrast(
                 circ = rad_dist < circ_rad
 
                 # Loop over images
-                ww_sci = np.where(database.database.obs[key]["TYPE"] == "SCI")[0]
+                ww_sci = np.where(database.obs[key]["TYPE"] == "SCI")[0]
                 for ww in ww_sci:
                     # Apply cross
-                    roll_ref = database.database.obs[key]["ROLL_REF"][ww]  # deg
+                    roll_ref = database.obs[key]["ROLL_REF"][ww]  # deg
                     temp = np.zeros_like(nanmask)
                     temp[:, rect[0] : rect[1]] = 1  # Vertical
                     temp[rect[2] : rect[3], :] = 1  # Horizontal
@@ -999,7 +999,7 @@ def raw_contrast(
                 ####################
 
                 # print("running new miri mask")
-                # roll_angles = database.database.obs[key]["ROLL_REF"][ww_sci]
+                # roll_angles = database.obs[key]["ROLL_REF"][ww_sci]
                 # nanmask = generate_miri_4qpm_mask(
                 #     detector_shape=data[0].shape,
                 #     coronagraph_center_pix=center,
@@ -1019,7 +1019,7 @@ def raw_contrast(
                 plt.show()
 
                 data *= nanmask
-            elif database.database.red[key]["EXP_TYPE"][j] in ["MIR_LYOT"]:
+            elif database.red[key]["EXP_TYPE"][j] in ["MIR_LYOT"]:
                 raise NotImplementedError()
 
             ####################
@@ -1067,7 +1067,7 @@ def raw_contrast(
             # can keep things more orgnanized.
 
             # assuming pixel scale is the same between all data.
-            radial_separations_pix *= database.database.red[key]["PIXSCALE"][0]
+            radial_separations_pix *= database.red[key]["PIXSCALE"][0]
 
             # map back to orignal setup
             # ideally we shouldnt need this because we should only need one coorindate
@@ -1082,115 +1082,175 @@ def raw_contrast(
 
             # Maksed Data plotting
 
-            klmodes = database.database.red[key]["KLMODES"][j].split(",")
-            fitsfile = os.path.join(output_dir, os.path.split(fitsfile)[1])
+            logging.info("Creating figures")
 
-            load_plt_style(plot_style)
-            fig = plt.figure(figsize=(6.4, 4.8))
-            ax = plt.gca()
-            xx = np.arange(data.shape[2]) - center[0]  # pix
-            yy = np.arange(data.shape[1]) - center[1]  # pix
-            extent = (
-                -(xx[0] - 0.5) * pxsc_arcsec,
-                -(xx[-1] + 0.5) * pxsc_arcsec,
-                (yy[0] - 0.5) * pxsc_arcsec,
-                (yy[-1] + 0.5) * pxsc_arcsec,
-            )
-            vmax = np.nanmax(data[-1])
-            ax.imshow(
-                data[-1],
-                origin="lower",
-                cmap="inferno",
-                norm=matplotlib.colors.SymLogNorm(
-                    vmin=-vmax, vmax=vmax, linthresh=vmax / 100
-                ),
-                extent=extent,
-            )
-            ax.set_xlabel(r"$\Delta$RA [arcsec]")
-            ax.set_ylabel(r"$\Delta$Dec [arcsec]")
-            ax.set_title(f"Masked data in {filt}, {psfsub_strategy} ({klmodes[-1]} KL)")
-            for r in [5, 10]:
-                ax.add_patch(
-                    matplotlib.patches.Circle(
-                        (0, 0),
-                        r,
-                        ls="--",
-                        facecolor="none",
-                        edgecolor="cyan",
-                        clip_on=True,
-                    )
-                )
-                ax.text(r, 0, f" {r}''", color="cyan")
-            import textwrap
+            klmodes = database.red[key]["KLMODES"][j].split(",")
+            fitsfile = os.path.join(output_dir, os.path.basename(fitsfile))
 
-            ax.text(
-                0.01,
-                0.99,
-                textwrap.fill(os.path.basename(fitsfile), width=40),
-                transform=ax.transAxes,
-                color="black",
-                verticalalignment="top",
-                fontsize=9,
-            )
-            # plt.colorbar(
-            #     mappable=ax.images[0], label=database.database.red[key]["BUNIT"][j]
+            # plot_masked_data(
+            #     data=data,
+            #     center=center,
+            #     pixel_scale=pxsc_arcsec,
+            #     klmodes=klmodes,
+            #     filter_name=filt,
+            #     psfsub_strategy=psfsub_strategy,
+            #     fitsfile=fitsfile,
+            #     bunit=database.red[key]["BUNIT"][j],
+            #     save_figure=save_figures,
+            #     # plot_style=plot_style,
             # )
-            plt.tight_layout()
-            if save_figures:
-                output_file = fitsfile[:-5] + "_masked.pdf"
-                plt.savefig(output_file)
-                log.info(f" Plot saved in {output_file}")
-            plt.show()
-            plt.close(fig)
 
-            # PLOTTING THE Raw Contrast Curves
-
-            # Plot raw contrast.
-            klmodes = database.database.red[key]["KLMODES"][j].split(",")
-            fitsfile = os.path.join(output_dir, os.path.split(fitsfile)[1])
-            colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
-            mod = len(colors)
-            load_plt_style(plot_style)
-            fig = plt.figure(figsize=(6.4, 4.8))
-            ax = plt.gca()
-            for k in range(data.shape[0]):
-                if mask is None:
-                    ax.plot(
-                        seps[k],
-                        cons[k],
-                        color=colors[k % mod],
-                        label=klmodes[k] + " KL",
-                    )
-                else:
-                    ax.plot(seps[k], cons[k], color=colors[k % mod], alpha=0.3, ls="--")
-                    ax.plot(
-                        seps[k],
-                        cons_mask[k],
-                        color=colors[k % mod],
-                        label=klmodes[k] + " KL",
-                    )
-            ax.set_yscale("log")
-            ax.set_ylim([None, 1])
-            if plot_xlim is not None:
-                ax.set_xlim(plot_xlim)
-            ax.set_xlabel("Separation [arcsec]")
-            ax.set_ylabel(r"5-$\sigma$ contrast")
-            ax.legend(
-                loc="upper right",
-                ncols=3,
-                title=None
-                if mask is None
-                else "Dashed lines exclude coronagraph mask throughput",
-                title_fontsize=10,
+            plot_masked_data(
+                data=data,
+                center=center,
+                pixel_scale=pxsc_arcsec,
+                klmodes=klmodes,
+                filter_name=filt,
+                psfsub_strategy=psfsub_strategy,
+                fitsfile=fitsfile,
+                bunit=database.red[key]["BUNIT"][j],
             )
-            ax.set_title(f"Raw contrast in {filt}, {psfsub_strategy}")
-            plt.tight_layout()
-            if save_figures:
-                output_file = fitsfile[:-5] + "_rawcon.pdf"
-                plt.savefig(output_file)
-                log.info(f" Plot saved in {output_file}")
-            plt.show()
-            plt.close(fig)
+
+            # fig, ax, artists = plot_masked_data(
+            #     data=data,
+            #     center=center,
+            #     pixel_scale=pxsc_arcsec,
+            #     klmodes=klmodes,
+            #     filter_name=filt,
+            #     psfsub_strategy=psfsub_strategy,
+            #     fitsfile=fitsfile,
+            #     bunit=database.red[key]["BUNIT"][j],
+            #     figure_mode="diagnostic",
+            #     scale="symlog",
+            #     percentile=99.8,
+            #     show_filename=True,
+            #     save_figure=True,
+            #     output_formats=("pdf",),
+            # )
+
+            plot_raw_contrast(
+                separations=seps,
+                contrasts=cons,
+                masked_contrasts=cons_mask if mask is not None else None,
+                klmodes=klmodes,
+                filter_name=filt,
+                psfsub_strategy=psfsub_strategy,
+                fitsfile=fitsfile,
+                plot_xlim=plot_xlim,
+                # plot_ylim=plot_ylim,
+                save_figure=save_figures,
+                plot_style=plot_style,
+            )
+
+            # klmodes = database.red[key]["KLMODES"][j].split(",")
+            # fitsfile = os.path.join(output_dir, os.path.split(fitsfile)[1])
+
+            # load_plt_style(plot_style)
+            # fig = plt.figure(figsize=(6.4, 4.8))
+            # ax = plt.gca()
+            # xx = np.arange(data.shape[2]) - center[0]  # pix
+            # yy = np.arange(data.shape[1]) - center[1]  # pix
+            # extent = (
+            #     -(xx[0] - 0.5) * pxsc_arcsec,
+            #     -(xx[-1] + 0.5) * pxsc_arcsec,
+            #     (yy[0] - 0.5) * pxsc_arcsec,
+            #     (yy[-1] + 0.5) * pxsc_arcsec,
+            # )
+            # vmax = np.nanmax(data[-1])
+            # ax.imshow(
+            #     data[-1],
+            #     origin="lower",
+            #     cmap="inferno",
+            #     norm=matplotlib.colors.SymLogNorm(
+            #         vmin=-vmax, vmax=vmax, linthresh=vmax / 100
+            #     ),
+            #     extent=extent,
+            # )
+            # ax.set_xlabel(r"$\Delta$RA [arcsec]")
+            # ax.set_ylabel(r"$\Delta$Dec [arcsec]")
+            # ax.set_title(f"Masked data in {filt}, {psfsub_strategy} ({klmodes[-1]} KL)")
+            # for r in [5, 10]:
+            #     ax.add_patch(
+            #         matplotlib.patches.Circle(
+            #             (0, 0),
+            #             r,
+            #             ls="--",
+            #             facecolor="none",
+            #             edgecolor="cyan",
+            #             clip_on=True,
+            #         )
+            #     )
+            #     ax.text(r, 0, f" {r}''", color="cyan")
+            # import textwrap
+
+            # ax.text(
+            #     0.01,
+            #     0.99,
+            #     textwrap.fill(os.path.basename(fitsfile), width=40),
+            #     transform=ax.transAxes,
+            #     color="black",
+            #     verticalalignment="top",
+            #     fontsize=9,
+            # )
+            # # plt.colorbar(
+            # #     mappable=ax.images[0], label=database.red[key]["BUNIT"][j]
+            # # )
+            # plt.tight_layout()
+            # if save_figures:
+            #     output_file = fitsfile[:-5] + "_masked.pdf"
+            #     plt.savefig(output_file)
+            #     log.info(f" Plot saved in {output_file}")
+            # plt.show()
+            # plt.close(fig)
+
+            # # PLOTTING THE Raw Contrast Curves
+
+            # # Plot raw contrast.
+            # klmodes = database.red[key]["KLMODES"][j].split(",")
+            # fitsfile = os.path.join(output_dir, os.path.split(fitsfile)[1])
+            # colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+            # mod = len(colors)
+            # load_plt_style(plot_style)
+            # fig = plt.figure(figsize=(6.4, 4.8))
+            # ax = plt.gca()
+            # for k in range(data.shape[0]):
+            #     if mask is None:
+            #         ax.plot(
+            #             seps[k],
+            #             cons[k],
+            #             color=colors[k % mod],
+            #             label=klmodes[k] + " KL",
+            #         )
+            #     else:
+            #         ax.plot(seps[k], cons[k], color=colors[k % mod], alpha=0.3, ls="--")
+            #         ax.plot(
+            #             seps[k],
+            #             cons_mask[k],
+            #             color=colors[k % mod],
+            #             label=klmodes[k] + " KL",
+            #         )
+            # ax.set_yscale("log")
+            # ax.set_ylim([None, 1])
+            # if plot_xlim is not None:
+            #     ax.set_xlim(plot_xlim)
+            # ax.set_xlabel("Separation [arcsec]")
+            # ax.set_ylabel(r"5-$\sigma$ contrast")
+            # ax.legend(
+            #     loc="upper right",
+            #     ncols=3,
+            #     title=None
+            #     if mask is None
+            #     else "Dashed lines exclude coronagraph mask throughput",
+            #     title_fontsize=10,
+            # )
+            # ax.set_title(f"Raw contrast in {filt}, {psfsub_strategy}")
+            # plt.tight_layout()
+            # if save_figures:
+            #     output_file = fitsfile[:-5] + "_rawcon.pdf"
+            #     plt.savefig(output_file)
+            #     log.info(f" Plot saved in {output_file}")
+            # plt.show()
+            # plt.close(fig)
 
             # Exporting Data
 
@@ -1208,7 +1268,7 @@ def raw_contrast(
                 results_table["separation"].unit = u.arcsec
                 # the following needs debugging:
                 # for kw in ['TELESCOP', 'INSTRUME', 'SUBARRAY', 'FILTER', 'CORONMSK', 'EXP_TYPE', 'FITSFILE']:
-                #    results_table.meta[kw] = database.database.red[key][kw][j]
+                #    results_table.meta[kw] = database.red[key][kw][j]
 
                 output_fn = fitsfile[:-5] + "_contrast.ecsv"
                 results_table.write(output_fn, overwrite=True)
