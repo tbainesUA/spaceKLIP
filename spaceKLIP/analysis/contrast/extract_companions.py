@@ -16,7 +16,7 @@ log = logging.getLogger(__name__)
 log.setLevel(logging.INFO)
 
 
-def extract_companions(
+def run_extract_companions(
     database,
     companions,
     starfile,

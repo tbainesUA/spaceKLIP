@@ -26,7 +26,7 @@ log = logging.getLogger(__name__)
 log.setLevel(logging.INFO)
 
 
-def calibrate_contrast(
+def run_calibrate_contrast(
     database,
     subdir="calcon",
     rawcon_subdir="rawcon",
@@ -88,19 +88,19 @@ def calibrate_contrast(
     companions = validate_companions(companions)
 
     # Set output directory.
-    output_dir = os.path.join(database.database.output_dir, subdir)
+    output_dir = os.path.join(database.output_dir, subdir)
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
 
     # Get raw contrast directory
-    rawcon_dir = os.path.join(database.database.output_dir, rawcon_subdir)
+    rawcon_dir = os.path.join(database.output_dir, rawcon_subdir)
     if not os.path.exists(rawcon_dir):
         raise TypeError(
             'Raw contrast must be calculated first. "rawcon" subdirectory not found.'
         )
 
     # Loop through concatenations.
-    for i, key in enumerate(database.database.red.keys()):
+    for i, key in enumerate(database.red.keys()):
         log.info("--> Concatenation " + key)
 
         # Need to generate the offset PSF we'll be injecting. Best to do
@@ -109,15 +109,15 @@ def calibrate_contrast(
             # Don't need to bother generating the PSF, use dummy value
             offsetpsf = 1
         else:
-            offsetpsf = get_offsetpsf(database.database.obs[key])
+            offsetpsf = get_offsetpsf(database.obs[key])
 
         # Loop through FITS files.
-        nfitsfiles = len(database.database.red[key])
+        nfitsfiles = len(database.red[key])
         for j in range(nfitsfiles):
             # Read FITS file and PSF mask.
-            fitsfile = database.database.red[key]["FITSFILE"][j]
+            fitsfile = database.red[key]["FITSFILE"][j]
             data, head_pri, head_sci, is2d = ut.read_red(fitsfile)
-            maskfile = database.database.red[key]["MASKFILE"][j]
+            maskfile = database.red[key]["MASKFILE"][j]
             mask = ut.read_msk(maskfile)
 
             log.info("Analyzing file " + fitsfile)
@@ -148,10 +148,10 @@ def calibrate_contrast(
             pyklip_dataset = JWSTData(filepaths, psflib_filepaths)
 
             # Compute the resolution element. Account for possible blurring.
-            pxsc_arcsec = database.database.red[key]["PIXSCALE"][j]  # arcsec
+            pxsc_arcsec = database.red[key]["PIXSCALE"][j]  # arcsec
             pxsc_rad = pxsc_arcsec / 3600.0 / 180.0 * np.pi  # rad
-            if database.database.red[key]["TELESCOP"][j] == "JWST":
-                if database.database.red[key]["EXP_TYPE"][j] in [
+            if database.red[key]["TELESCOP"][j] == "JWST":
+                if database.red[key]["EXP_TYPE"][j] in [
                     "NRC_CORON",
                     "NRC_TACONFIRM",
                     "NRC_TACQ",
@@ -161,11 +161,9 @@ def calibrate_contrast(
                     diam = JWST_CIRCUMSCRIBED_DIAMETER
             else:
                 raise UserWarning("Data originates from unknown telescope")
-            resolution = (
-                1e-6 * database.database.red[key]["CWAVEL"][j] / diam / pxsc_rad
-            )  # pix
-            if not np.isnan(database.database.obs[key]["BLURFWHM"][j]):
-                resolution *= database.database.obs[key]["BLURFWHM"][j]
+            resolution = 1e-6 * database.red[key]["CWAVEL"][j] / diam / pxsc_rad  # pix
+            if not np.isnan(database.obs[key]["BLURFWHM"][j]):
+                resolution *= database.obs[key]["BLURFWHM"][j]
             resolution_fwhm = 1.025 * resolution
 
             # Get stellar magnitudes and filter zero points, but use the same file as rawcon
@@ -177,11 +175,11 @@ def calibrate_contrast(
             mstar, fzero = get_stellar_magnitudes(
                 starfile,
                 spectral_type,
-                database.database.red[key]["INSTRUME"][j],
+                database.red[key]["INSTRUME"][j],
                 output_dir=output_dir,
                 **kwargs,
             )  # vegamag, Jy
-            filt = database.database.red[key]["FILTER"][j]
+            filt = database.red[key]["FILTER"][j]
             fstar = (
                 fzero[filt] / 10.0 ** (mstar[filt] / 2.5) / 1e6 * np.nanmax(offsetpsf)
             )  # MJy
@@ -223,9 +221,9 @@ def calibrate_contrast(
             inj_seps_pix = inj_seps / pxsc_arcsec  # Convert separation to pixels
 
             if injection_pas == "default":
-                if "4QPM" in database.database.red[key]["CORONMSK"][j]:
+                if "4QPM" in database.red[key]["CORONMSK"][j]:
                     inj_pas = [57.5, 147.5, 237.5, 327.5]
-                elif "WB" in database.database.red[key]["CORONMSK"][j]:
+                elif "WB" in database.red[key]["CORONMSK"][j]:
                     inj_pas = [45.0, 135.0, 225.0, 315.0]
                 else:
                     inj_pas = [0, 60, 120, 180, 240, 300]
@@ -268,11 +266,11 @@ def calibrate_contrast(
 
             # Need to get exactly the same KLIP arguments that were used for this subtraction.
             klip_args = {}
-            klip_args["mode"] = database.database.red[key]["MODE"][j]
-            klip_args["annuli"] = database.database.red[key]["ANNULI"][j]
-            klip_args["subsections"] = database.database.red[key]["SUBSECTS"][j]
+            klip_args["mode"] = database.red[key]["MODE"][j]
+            klip_args["annuli"] = database.red[key]["ANNULI"][j]
+            klip_args["subsections"] = database.red[key]["SUBSECTS"][j]
             klip_args["numbasis"] = [
-                int(nb) for nb in database.database.red[key]["KLMODES"][j].split(",")
+                int(nb) for nb in database.red[key]["KLMODES"][j].split(",")
             ]
             klip_args["algo"] = (
                 "klip"  # Currently not logged, may need changing in future.
