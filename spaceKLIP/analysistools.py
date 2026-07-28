@@ -1,4063 +1,4084 @@
-from __future__ import division
-
-import copy
-import logging
-
-# =============================================================================
-# IMPORTS
-# =============================================================================
-import os
-import shutil
-import sys
-from functools import partial
-from io import StringIO
-from pathlib import Path
-
-import astropy.io.fits as fits
-import astropy.units as u
-import matplotlib
-import matplotlib.patheffects as PathEffects
-import matplotlib.pyplot as plt
-import numpy as np
-import pyklip.fakes as fakes
-import pyklip.fitpsf as fitpsf
-import pyklip.fm as fm
-import pyklip.fmlib.fmpsf as fmpsf
-import scipy.ndimage.interpolation as sinterp
-from astropy.table import Table
-from cycler import cycler
-from pyklip import klip, parallelized
-from pyklip.instruments.JWST import JWSTData
-from scipy.interpolate import interp1d
-from scipy.ndimage import convolve, fourier_shift, gaussian_filter, rotate
-from scipy.ndimage import shift as spline_shift
-from scipy.optimize import minimize
-from stpsf.constants import JWST_CIRCUMSCRIBED_DIAMETER
-from tqdm.auto import trange
+# from __future__ import division
+
+# import copy
+# import logging
+
+# # =============================================================================
+# # IMPORTS
+# # =============================================================================
+# import os
+# import shutil
+# import sys
+# from functools import partial
+# from io import StringIO
+# from pathlib import Path
+
+# import astropy.io.fits as fits
+# import astropy.units as u
+# import matplotlib
+# import matplotlib.patheffects as PathEffects
+# import matplotlib.pyplot as plt
+# import numpy as np
+# import pyklip.fakes as fakes
+# import pyklip.fitpsf as fitpsf
+# import pyklip.fm as fm
+# import pyklip.fmlib.fmpsf as fmpsf
+# import scipy.ndimage.interpolation as sinterp
+# from astropy.table import Table
+# from cycler import cycler
+# from pyklip import klip, parallelized
+# from pyklip.instruments.JWST import JWSTData
+# from scipy.interpolate import interp1d
+# from scipy.ndimage import convolve, fourier_shift, gaussian_filter, rotate
+# from scipy.ndimage import shift as spline_shift
+# from scipy.optimize import minimize
+# from stpsf.constants import JWST_CIRCUMSCRIBED_DIAMETER
+# from tqdm.auto import trange
 
-from spaceKLIP import utils as ut
-from spaceKLIP.imagetools import gaussian_kernel
-from spaceKLIP.plotting import load_plt_style
-from spaceKLIP.psf import JWST_PSF, get_offsetpsf
-from spaceKLIP.pyklippipeline import get_pyklip_filepaths
-from spaceKLIP.starphot import get_stellar_magnitudes, read_spec_file
-from spaceKLIP.utils import pop_pxar_kw, set_surrounded_pixels, write_starfile
-
-log = logging.getLogger(__name__)
-log.setLevel(logging.INFO)
-
-
-#
-# Helpers
-#
-
-from typing import Final, Tuple
-
-# =============================================================================
-# DOMAIN CONSTANTS
-# =============================================================================
-
-MIRI_4QPM_ROTATION_OFFSET_DEG: Final[float] = 4.83544897
+# from spaceKLIP import utils as ut
+# from spaceKLIP.imagetools import gaussian_kernel
+# from spaceKLIP.plotting import load_plt_style
+# from spaceKLIP.psf import JWST_PSF, get_offsetpsf
+# from spaceKLIP.pyklippipeline import get_pyklip_filepaths
+# from spaceKLIP.starphot import get_stellar_magnitudes, read_spec_file
+# from spaceKLIP.utils import pop_pxar_kw, set_surrounded_pixels, write_starfile
+
+# log = logging.getLogger(__name__)
+# log.setLevel(logging.INFO)
+
+
+# #
+# # Helpers
+# #
+
+# from typing import Final, Tuple
+
+# # =============================================================================
+# # DOMAIN CONSTANTS
+# # =============================================================================
+
+# MIRI_4QPM_ROTATION_OFFSET_DEG: Final[float] = 4.83544897
 
-MIRI_4QPM_WIDE_BAR_WIDTH_PIX: Final[int] = 10
-MIRI_4QPM_THIN_BAR_WIDTH_PIX: Final[int] = 2
-MIRI_4QPM_INNER_CLEAR_RADIUS_PIX: Final[int] = 15
-
-MIRI_ROTATION_REFERENCE_DEG: Final[float] = 90.0
-
-MASK_OCCUPANCY_THRESHOLD: Final[float] = 0.5
-
-
-# =============================================================================
-# LOW-LEVEL GEOMETRIC KERNELS
-# =============================================================================
-
-
-def rotate_coordinates(
-    x_coords: np.ndarray,
-    y_coords: np.ndarray,
-    rotation_angles_deg: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Rotate detector coordinates using broadcasted rotation matrices.
-
-    Returns
-    -------
-    x_rotated, y_rotated
-        Arrays with shape (n_rolls, ny, nx)
-    """
-    theta_rad = np.deg2rad(rotation_angles_deg)
-
-    cos_theta = np.cos(theta_rad)[:, None, None]
-    sin_theta = np.sin(theta_rad)[:, None, None]
+# MIRI_4QPM_WIDE_BAR_WIDTH_PIX: Final[int] = 10
+# MIRI_4QPM_THIN_BAR_WIDTH_PIX: Final[int] = 2
+# MIRI_4QPM_INNER_CLEAR_RADIUS_PIX: Final[int] = 15
+
+# MIRI_ROTATION_REFERENCE_DEG: Final[float] = 90.0
+
+# MASK_OCCUPANCY_THRESHOLD: Final[float] = 0.5
+
+
+# # =============================================================================
+# # LOW-LEVEL GEOMETRIC KERNELS
+# # =============================================================================
+
+
+# def rotate_coordinates(
+#     x_coords: np.ndarray,
+#     y_coords: np.ndarray,
+#     rotation_angles_deg: np.ndarray,
+# ) -> tuple[np.ndarray, np.ndarray]:
+#     """
+#     Rotate detector coordinates using broadcasted rotation matrices.
+
+#     Returns
+#     -------
+#     x_rotated, y_rotated
+#         Arrays with shape (n_rolls, ny, nx)
+#     """
+#     theta_rad = np.deg2rad(rotation_angles_deg)
+
+#     cos_theta = np.cos(theta_rad)[:, None, None]
+#     sin_theta = np.sin(theta_rad)[:, None, None]
 
-    x_rotated = x_coords[None, :, :] * cos_theta - y_coords[None, :, :] * sin_theta
-
-    y_rotated = x_coords[None, :, :] * sin_theta + y_coords[None, :, :] * cos_theta
-
-    return x_rotated, y_rotated
-
-
-def evaluate_cross_occultation(
-    x_coords_pix: np.ndarray,
-    y_coords_pix: np.ndarray,
-    wide_bar_width_pix: float,
-    thin_bar_width_pix: float,
-    inner_clear_radius_pix: float,
-) -> np.ndarray:
-    """
-    Evaluate analytic 4QPM occultation geometry.
-    """
-    half_wide = wide_bar_width_pix / 2.0
-    half_thin = thin_bar_width_pix / 2.0
-
-    radius_squared = x_coords_pix**2 + y_coords_pix**2
-
-    central_clear_region = radius_squared < inner_clear_radius_pix**2
-
-    vertical_wide = np.abs(x_coords_pix) <= half_wide
-    horizontal_wide = np.abs(y_coords_pix) <= half_wide
-
-    vertical_thin = np.abs(x_coords_pix) <= half_thin
-    horizontal_thin = np.abs(y_coords_pix) <= half_thin
-
-    occulted_region = (vertical_wide | horizontal_wide) & ~central_clear_region
-
-    structural_cross = vertical_thin | horizontal_thin
-
-    return occulted_region | structural_cross
-
-
-# =============================================================================
-# HIGH-LEVEL DOMAIN API
-# =============================================================================
-
-
-def generate_miri_4qpm_mask(
-    detector_shape: Tuple[int, int],
-    coronagraph_center_pix: Tuple[float, float],
-    roll_reference_angles_deg: np.ndarray,
-    upsample_factor: int = 1,
-    padding_pix: int = 0,
-) -> np.ndarray:
-    """
-    Generate the MIRI 4QPM occultation mask analytically.
-
-    Parameters
-    ----------
-    detector_shape
-        Detector shape as (ny, nx).
-
-    coronagraph_center_pix
-        Coronagraph center coordinates as (x_center, y_center).
-
-    roll_reference_angles_deg
-        Telescope roll angles in degrees.
-
-    upsample_factor
-        Integer detector upsampling factor.
-
-    Returns
-    -------
-    np.ndarray
-        Float mask where occulted pixels are NaN.
-    """
-    if upsample_factor < 1:
-        raise ValueError("upsample_factor must be >= 1")
-
-    if np.any(~np.isfinite(roll_reference_angles_deg)):
-        raise ValueError("roll_reference_angles_deg contains NaN or Inf values.")
-
-    ny, nx = detector_shape
-
-    # Here we're preserving the padding and upsampling
-    padded_ny = ny + 2 * padding_pix
-    padded_nx = nx + 2 * padding_pix
-
-    x_center_pix, y_center_pix = coronagraph_center_pix
-    x_center_pix += padding_pix
-    y_center_pix += padding_pix
-
-    sampled_ny = padded_ny * upsample_factor
-    sampled_nx = padded_nx * upsample_factor
-
-    y_coords_pix = (
-        np.arange(sampled_ny, dtype=np.float32) / upsample_factor - y_center_pix
-    )
-
-    x_coords_pix = (
-        np.arange(sampled_nx, dtype=np.float32) / upsample_factor - x_center_pix
-    )
-
-    x_grid_pix, y_grid_pix = np.meshgrid(
-        x_coords_pix,
-        y_coords_pix,
-        indexing="xy",
-        sparse=False,
-    )
-
-    rotation_angles_deg = (
-        MIRI_ROTATION_REFERENCE_DEG
-        - roll_reference_angles_deg
-        + MIRI_4QPM_ROTATION_OFFSET_DEG
-    )
-
-    x_rotated_pix, y_rotated_pix = rotate_coordinates(
-        x_grid_pix,
-        y_grid_pix,
-        rotation_angles_deg,
-    )
-
-    occultation_stack = evaluate_cross_occultation(
-        x_coords_pix=x_rotated_pix,
-        y_coords_pix=y_rotated_pix,
-        wide_bar_width_pix=MIRI_4QPM_WIDE_BAR_WIDTH_PIX,
-        thin_bar_width_pix=MIRI_4QPM_THIN_BAR_WIDTH_PIX,
-        inner_clear_radius_pix=MIRI_4QPM_INNER_CLEAR_RADIUS_PIX,
-    )
-
-    combined_occultation = np.any(occultation_stack, axis=0)
-
-    if upsample_factor > 1:
-        combined_occultation = combined_occultation[
-            ::upsample_factor,
-            ::upsample_factor,
-        ]
-
-    combined_occultation = combined_occultation[
-        padding_pix : padding_pix + ny,
-        padding_pix : padding_pix + nx,
-    ]
-
-    final_mask = np.ones(
-        detector_shape,
-        dtype=np.float32,
-    )
-
-    final_mask[combined_occultation] = np.nan
-
-    return set_surrounded_pixels(final_mask)
-
-
-# =============================================================================
-# HIGH-LEVEL Contrast calculation API
-# =============================================================================
-from typing import Optional
-
-
-def calc_single_contrast_curve(
-    normalized_frame: np.ndarray,
-    spatial_resolution_pix: float,
-    center_pix: tuple[float, float],
-    inner_working_angle_pix: int | float,
-    outer_working_angle_pix: int | float,
-    coronagraph_transmission_mask: Optional[np.ndarray] = None,
-    low_pass_filter: bool = False,
-) -> tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
-    """Compute raw and throughput-corrected contrast curve for single detector frame"""
-
-    separations_pix, raw_contrast = klip.meas_contrast(
-        dat=normalized_frame,
-        center=center_pix,
-        iwa=inner_working_angle_pix,
-        owa=outer_working_angle_pix,
-        resolution=spatial_resolution_pix,
-        low_pass_filter=low_pass_filter,
-    )
-
-    corrected_contrast = None
-    if coronagraph_transmission_mask is not None:
-        corrected_frame = normalized_frame / coronagraph_transmission_mask
-
-        _, corrected_contrast = klip.meas_contrast(
-            dat=corrected_frame,
-            center=center_pix,
-            iwa=inner_working_angle_pix,
-            owa=outer_working_angle_pix,
-            resolution=spatial_resolution_pix,
-            low_pass_filter=low_pass_filter,
-        )
-
-    return (separations_pix, raw_contrast, corrected_contrast)
-
-
-MIN_CORONAGRAPH_TRANSMISSION = 1e-12
-
-
-def normalize_contrast_frame(
-    frame_data: np.ndarray,
-    normalization_factor: float,
-) -> np.ndarray:
-    """
-    Normalize detector frame into contrast units.
-    """
-    return frame_data * normalization_factor
-
-
-def apply_throughput_correction(
-    normalized_frame: np.ndarray,
-    transmission_mask: np.ndarray,
-    minimum_transmission: float = MIN_CORONAGRAPH_TRANSMISSION,
-) -> np.ndarray:
-    """
-    Apply bounded coronagraph throughput correction.
-
-    Pixels below minimum transmission are masked to NaN.
-    """
-    corrected_frame = np.full_like(
-        normalized_frame,
-        np.nan,
-        dtype=np.float32,
-    )
-
-    valid_transmission = transmission_mask >= minimum_transmission
-
-    np.divide(
-        normalized_frame,
-        transmission_mask,
-        out=corrected_frame,
-        where=valid_transmission,
-    )
-
-    return corrected_frame
-
-
-def compute_contrast_curves(
-    data_cube: np.ndarray,
-    pixel_area_sr: float,
-    stellar_flux_peak: float,
-    spatial_resolution_pix: float,
-    center_pix: Tuple[float, float],
-    inner_working_angle_pix: int | float = 1,
-    outer_working_angle_pix: Optional[int | float] = None,
-    coronagraph_transmission_mask: Optional[np.ndarray] = None,
-) -> Tuple[
-    np.ndarray,
-    np.ndarray,
-    Optional[np.ndarray],
-]:
-    """
-    Compute raw and throughput-corrected contrast curves.
-
-    Parameters
-    ----------
-    data_cube
-        Input detector cube with shape (n_frames, ny, nx).
-
-    pixel_area_sr
-        Pixel solid angle in steradians.
-
-    stellar_flux_peak
-        Stellar peak normalization flux.
-
-    spatial_resolution_pix
-        Resolution element diameter in pixels.
-
-    center_pix
-        PSF center coordinates as (x, y).
-
-    inner_working_angle_pix
-        Inner working angle in pixels.
-
-    outer_working_angle_pix
-        Outer working angle in pixels.
-
-    coronagraph_transmission_mask
-        Optional coronagraph throughput transmission map.
-
-    Returns
-    -------
-    separations_pix
-        Radial separations in pixels.
-
-    raw_contrast_curves
-        Raw 5-sigma contrast curves.
-
-    throughput_corrected_contrast_curves
-        Throughput-corrected contrast curves.
-    """
-    if data_cube.ndim != 3:
-        raise ValueError("data_cube must have shape (n_frames, ny, nx)")
-
-    if stellar_flux_peak <= 0:
-        raise ValueError("stellar_flux_peak must be positive.")
-
-    if coronagraph_transmission_mask is not None:
-        if coronagraph_transmission_mask.shape != data_cube.shape[1:]:
-            raise ValueError("coronagraph_transmission_mask shape mismatch.")
-
-    n_frames = data_cube.shape[0]
-
-    if outer_working_angle_pix is None:
-        outer_working_angle_pix = min(data_cube.shape[1:]) // 2
-
-    normalization_factor = pixel_area_sr / stellar_flux_peak
-
-    # Precompute normalized cube
-    normalized_cube = (data_cube * normalization_factor).astype(np.float32, copy=False)
-
-    raw_contrast_curves = []
-    throughput_corrected_curves = []
-
-    radial_separations_pix = None
-
-    contrast_kwargs = dict(
-        inner_working_angle_pix=inner_working_angle_pix,
-        outer_working_angle_pix=outer_working_angle_pix,
-        spatial_resolution_pix=spatial_resolution_pix,
-        center_pix=center_pix,
-        low_pass_filter=False,
-        coronagraph_transmission_mask=coronagraph_transmission_mask,
-    )
-
-    for normalized_frame in normalized_cube:
-        (
-            separations_pix,
-            raw_contrast,
-            corrected_contrast,
-        ) = calc_single_contrast_curve(
-            normalized_frame=normalized_frame, **contrast_kwargs
-        )
-        # shared radial separations
-        if radial_separations_pix is None:
-            radial_separations_pix = separations_pix
-
-        raw_contrast_curves.append(raw_contrast)
-        throughput_corrected_curves.append(corrected_contrast)
-
-    # convert to arrays
-    raw_contrast_curves = np.asarray(
-        raw_contrast_curves,
-        dtype=np.float32,
-    )
-
-    throughput_corrected_array = None
-
-    if coronagraph_transmission_mask is not None:
-        throughput_corrected_array = np.asarray(
-            throughput_corrected_curves,
-            dtype=np.float32,
-        )
-
-    return (
-        radial_separations_pix,
-        raw_contrast_curves,
-        throughput_corrected_array,
-    )
-
-
-# =============================================================================
-# Adding in the companion masks now
-# =============================================================================
-from typing import List, Tuple
-
-import numpy as np
-from numpy.typing import NDArray
-
-# =============================================================================
-# ATOMIC MATHEMATICAL KERNEL (Pure Point Logic)
-# =============================================================================
-
-
-def compute_single_companion_mask(
-    x_grid: NDArray[np.float64],
-    y_grid: NDArray[np.float64],
-    center_pix: Tuple[float, float],
-    pixscale_arcsec: float,
-    spatial_resolution_pix: float,
-    ra_offset_arcsec: float,
-    dec_offset_arcsec: float,
-    mask_radius_ld: float,
-) -> NDArray[np.bool_]:
-    """
-    Compute a 2D boolean exclusion mask for a single celestial companion.
-
-    This function acts as a pure stateless coordinate-space kernel. It does
-    not know about data frames, arrays of companions, or file paths.
-
-    Parameters
-    ----------
-    x_grid : NDArray[np.float64]
-        2D matrix containing the horizontal (X) pixel coordinates.
-    y_grid : NDArray[np.float64]
-        2D matrix containing the vertical (Y) pixel coordinates.
-    center_pix : Tuple[float, float]
-        0-indexed host star coordinate array (X_center, Y_center).
-    pixscale_arcsec : float
-        Pixel scale of the instrument detector in arcseconds/pixel.
-    spatial_resolution_pix : float
-        Calculated resolution element size (lambda/D) expressed in pixels.
-    ra_offset_arcsec : float
-        Right Ascension angular offset relative to host star in arcseconds.
-    dec_offset_arcsec : float
-        Declination angular offset relative to host star in arcseconds.
-    mask_radius_ld : float
-        Exclusion zone cutoff radius in units of lambda/D.
-
-    Returns
-    -------
-    NDArray[np.bool_]
-        A 2D boolean mask of shape matching the input grid, where True
-        denotes coordinates inside the companion exclusion boundary.
-    """
-    # Transform physical angular coordinates into raw pixel displacements
-    delta_x_pix = ra_offset_arcsec / pixscale_arcsec
-    delta_y_pix = dec_offset_arcsec / pixscale_arcsec
-    cutoff_radius_pix = mask_radius_ld * spatial_resolution_pix
-
-    # Calculate radial Euclidean distance from the companion's shifted center
-    radial_distance_map = np.sqrt(
-        (x_grid - center_pix[0] + delta_x_pix) ** 2
-        + (y_grid - center_pix[1] - delta_y_pix) ** 2
-    )
-
-    return radial_distance_map <= cutoff_radius_pix
-
-
-# =============================================================================
-# GEOMETRIC EXCLUSION FACTORY (State Aggregator Layer)
-# =============================================================================
-
-
-def generate_companion_spatial_mask(
-    spatial_shape: Tuple[int, int],
-    center_pix: Tuple[float, float],
-    pixscale_arcsec: float,
-    spatial_resolution_pix: float,
-    companions: List[List[float]],
-) -> NDArray[np.bool_]:
-    """
-    Generate a unified 2D binary mask indicating multi-companion exclusion zones.
-
-    Parameters
-    ----------
-    spatial_shape : Tuple[int, int]
-        The (Y, X) pixel dimensions of the target frame layout.
-    center_pix : Tuple[float, float]
-        0-indexed target coordinate array (X_center, Y_center).
-    pixscale_arcsec : float
-        Pixel scale of the instrument detector in arcseconds/pixel.
-    spatial_resolution_pix : float
-        Calculated resolution element size (lambda/D) expressed in pixels.
-    companions : List[List[float]]
-        Matrix of target companions where each row represents
-        [RA_offset, Dec_offset, radius_ld].
-
-    Returns
-    -------
-    NDArray[np.bool_]
-        2D unified spatial boolean mask layout.
-    """
-    ny, nx = spatial_shape
-    y_indices, x_indices = np.indices((ny, nx), dtype=np.float64)
-
-    # Initialize a master empty mask
-    combined_mask = np.zeros((ny, nx), dtype=bool)
-
-    # Map the companion list across our mathematical kernel
-    for companion in companions:
-        ra_off, dec_off, radius_ld = companion
-
-        single_mask = compute_single_companion_mask(
-            x_grid=x_indices,
-            y_grid=y_indices,
-            center_pix=center_pix,
-            pixscale_arcsec=pixscale_arcsec,
-            spatial_resolution_pix=spatial_resolution_pix,
-            ra_offset_arcsec=ra_off,
-            dec_offset_arcsec=dec_off,
-            mask_radius_ld=radius_ld,
-        )
-
-        # Accumulate the mask footprint using bitwise OR
-        combined_mask |= single_mask
-
-    return combined_mask
-
-
-# =============================================================================
-# math
-# =============================================================================
-ARCSEC_PER_RADIAN = 180.0 * 3600.0 / np.pi
-
-
-def calculate_pixel_area_sr(pixel_scale_arcsec: float) -> float:
-    """
-    Calculate the solid angle subtended by a single detector pixel in steradians.
-
-    Parameters
-    ----------
-    pixel_scale_arcsec : float
-        The physical size of a single detector pixel in arcseconds.
-
-    Returns
-    -------
-    float
-        The solid angle area equivalent expressed in units of steradians (sr).
-    """
-    if pixel_scale_arcsec <= 0:
-        raise ValueError("pixel_scale_arcsec must be a positive non-zero value.")
-
-    # Convert linear pixel edge dimension from arcseconds to radians
-    pixel_scale_rad = pixel_scale_arcsec / ARCSEC_PER_RADIAN
-
-    # Compute 2D area component (square radians is structurally equivalent to steradians)
-    pixel_area_sr = pixel_scale_rad**2
-
-    return float(pixel_area_sr)
-
-
-# Official JWST Entrance Pupil/Primary Mirror Diameter Constants (Meters)
-# JWST_CIRCUMSCRIBED_DIAMETER = 6.6  # Outer edge boundary
-MICRON_TO_METERS = 1e-6
-JWST_CORONAGRAPH_DIAMETER = (
-    5.2  # Effective clearance diameter for specialized coronagraph masking
-)
-
-
-def calculate_spatial_resolution_pix(
-    wavelength_um: float,
-    pixel_scale_rad: float,
-    telescope_name: str,
-    exposure_type: str,
-    blur_fwhm_pix: float = 0.0,
-    factor: float = 1.0,
-) -> float:
-    """
-    Calculate the effective structural resolution element in pixels, accounting
-    for optical diffraction limitations and instrument-level blurring.
-
-    Parameters
-    ----------
-    wavelength_um : float
-        The observation center wavelength in micrometers (CWAVEL).
-    pixel_scale_rad : float
-        The pixel scale size expressed in radians per pixel (pxsc_rad).
-    telescope_name : str
-        Name identifier of the origin observatory (e.g., 'JWST').
-    exposure_type : str
-        Telemetry exposure type block code (e.g., 'NRC_CORON').
-    blur_fwhm_pix : float, optional
-        Additional atmospheric/instrument blur FWHM in pixel units (BLURFWHM). Defaults to 0.0.
-    factor : float, optional
-        Diffraction element scaling modifier. Defaults to 1.0 (lambda/D). Change to 1.22
-        if strictly computing a Rayleigh criteria resolution bound.
-
-    Returns
-    -------
-    float
-        The effective physical resolution element scaled into detector pixels.
-    """
-    # 1. Enforce strict telescope type gating
-    if str(telescope_name).upper() != "JWST":
-        raise ValueError(
-            f"Unsupported or unknown telescope platform: '{telescope_name}'"
-        )
-
-    if wavelength_um <= 0 or pixel_scale_rad <= 0:
-        raise ValueError(
-            "Wavelength and pixel scale inputs must evaluate to positive non-zero floats."
-        )
-
-    # 2. Assign effective optical diameter based on specialized pupil masking profiles
-    if str(exposure_type).upper() in ["NRC_CORON", "NRC_TACONFIRM", "NRC_TACQ"]:
-        # NIRCam coronagraph masks constrain the open entrance pupil to an effective 5.2m
-        aperture_diameter_m = JWST_CORONAGRAPH_DIAMETER
-    else:
-        aperture_diameter_m = JWST_CIRCUMSCRIBED_DIAMETER
-
-    # 3. Compute structural diffraction footprint (meters to micrometers cancel via 1e-6)
-    wavelength_m = wavelength_um * 1e-6  # MICRON_TO_METERS
-    diffraction_limit_rad = (factor * wavelength_m) / aperture_diameter_m
-
-    # Map the spatial angular bounds directly into detector pixel grids
-    spatial_resolution_pix = diffraction_limit_rad / pixel_scale_rad
-
-    # 4. Apply additional instrumental/smearing blurring adjustments via quadrature addition
-    if not np.isnan(blur_fwhm_pix) and blur_fwhm_pix > 0:
-        spatial_resolution_pix = np.hypot(spatial_resolution_pix, blur_fwhm_pix)
-
-    return float(spatial_resolution_pix)
-
-
-# =============================================================================
-# MAIN
-# =============================================================================
-
-
-def validate_companions(companions):
-    """Validation check to ensure that a list of companions (objects) have
-    3 elements (ra, dec, size lambda/D units) want a list of lists"""
-    if companions is None:
-        return None
-
-    if not companions:
-        return []
-
-    if not isinstance(companions[0], (list, tuple)):
-        companions = [companions]
-
-    if any(len(c) != 3 for c in companions):
-        raise ValueError("Each companion must contain exactly 3 elements")
-
-    return companions
-
-
-class AnalysisTools:
-    """
-    The spaceKLIP astrophysical analysis tools class.
-
-    """
-
-    def __init__(self, database):
-        """
-        Initialize the spaceKLIP astrophysical analysis tools class.
-
-        Parameters
-        ----------
-        database : spaceKLIP.Database
-            SpaceKLIP database on which the astrophysical analysis steps shall
-            be run.
-
-        Returns
-        -------
-        None.
-
-        """
-
-        # Make an internal alias of the spaceKLIP database class.
-        print("Hello")
-        self.database = database
-
-        pass
-
-    def raw_contrast(
-        self,
-        starfile,
-        spectral_type="G2V",
-        companions=None,
-        overwrite_crpix=None,
-        subdir="rawcon",
-        output_filetype="npy",
-        plot_xlim=(0, 10),
-        save_figures=True,
-        plot_style=None,
-        **kwargs,
-    ):
-        """
-        Compute the raw contrast relative to the provided host star flux.
-
-        Parameters
-        ----------
-        starfile : path
-            Path of VizieR VOTable containing host star photometry or two
-            column TXT file with wavelength (micron) and flux (Jy).
-        spectral_type : str, optional
-            Host star spectral type for the stellar model SED. The default is
-            'G2V'.
-        companions : list of list of three float, optional
-            List of companions to be masked before computing the raw contrast.
-            For each companion, there should be a three element list containing
-            [RA offset (arcsec), Dec offset (arcsec), mask radius (lambda/D)].
-            The default is None.
-        overwrite_crpix : tuple of two float, optional
-            Overwrite the PSF center with the (CRPIX1, CRPIX2) values provided
-            here (in 1-indexed coordinates). This is required for Coron3 data!
-            The default is None.
-        subdir : str, optional
-            Name of the directory where the data products shall be saved. The
-            default is 'rawcon'.
-        output_filetype : str
-            File type to save the raw contrast information to. Options are 'ecsv'
-            or 'npy'.
-        save_figures : bool, optional
-            Save the plots in a PDF?
-
-        Returns
-        -------
-        None.
-
-        """
-
-        # Check input.
-        companions = validate_companions(companions)
-
-        # Set output directory.
-        star_path = Path(starfile)
-        output_dir = Path(self.database.output_dir) / subdir
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        # Build clean serialization files cleanly using standard pathlib
-        new_starfile_path = output_dir / star_path.name
-        spectype_str = (
-            f"Spectral Type: {spectral_type}"
-            if star_path.suffix == ".vot"
-            else "Spectral Type: N/A"
-        )
-
-        contrast_curve_info_path = output_dir / "contrast_curve_info.txt"
-        contrast_curve_info_path.write_text(
-            f"#{star_path.name} /// {spectype_str}\n", encoding="utf-8"
-        )
-
-        log.info("Syncing starfile assets: %s to %s", star_path, new_starfile_path)
-        write_starfile(str(star_path), str(new_starfile_path))
-
-        # Loop through concatenations.
-        for i, key in enumerate(self.database.red.keys()):
-            log.info("--> Concatenation " + key)
-
-            # Loop through FITS files.
-            nfitsfiles = len(self.database.red[key])
-            for j in range(nfitsfiles):
-                log.info("Analyzing file " + self.database.red[key]["FITSFILE"][j])
-
-                # Fetch data
-                instrument = self.database.red[key]["INSTRUME"][j]
-                subarray = self.database.red[key]["SUBARRAY"][j]
-                filt = self.database.red[key]["FILTER"][j]
-                exp_type = self.database.red[key]["EXP_TYPE"][j]
-                pixscale = self.database.red[key]["PIXSCALE"][j]
-                c_wavelength = self.database.red[key]["CWAVEL"][j]
-
-                # Get stellar magnitudes and filter zero points.
-                mstar, fzero = get_stellar_magnitudes(
-                    str(star_path),
-                    spectral_type,
-                    instrument,
-                    output_dir=str(output_dir),
-                    **kwargs,
-                )  # vegamag, Jy
-
-                # Read FITS file and PSF mask.
-                fitsfile = self.database.red[key]["FITSFILE"][j]
-                data, head_pri, head_sci, is2d = ut.read_red(fitsfile)
-                maskfile = self.database.red[key]["MASKFILE"][j]
-                mask = ut.read_msk(maskfile)
-                if mask is None:
-                    log.warning(
-                        "No mask file provided; MASKFILE is None. This may cause problems!!"
-                    )
-
-                # Compute the pixel area in steradian.
-                # 1. Resolve pixel scaling and solid angles uniformly
-                pxsc_arcsec = self.database.red[key]["PIXSCALE"][j]
-                pxsc_rad = pxsc_arcsec / ARCSEC_PER_RADIAN
-
-                # Establish a consistent, standardized tracking variable
-                pxar_telemetry = self.database.red[key]["PIXAR_SR"][j]
-                pixel_area_sr = (
-                    pxar_telemetry
-                    if not np.isnan(pxar_telemetry)
-                    else calculate_pixel_area_sr(pxsc_arcsec)
-                )
-
-                # Keep old pix area variable temporarily so that things continue to work
-                pxar = pixel_area_sr  # self.database.red[key]["PIXAR_SR"][j]  # sr
-
-                # if np.isnan(pxar):
-                #     # log.warning(
-                #     #     "PIXAR_SR not found in database, falling back to use PIXSCALE"
-                #     # )
-                #     log.warning(
-                #         f"[{key}][Index {j}] PIXAR_SR not found in telescope telemetry database. "
-                #         f"Falling back to geometric pixel scale calculation."
-                #     )
-                #     pxsc_arcsec = self.database.red[key]["PIXSCALE"][j]  # arcsec
-                #     # pxar = pxsc_rad**2  # sr
-                #     # pxsc_rad = pxsc_arcsec / 3600.0 / 180.0 * np.pi  # rad
-                #     pixel_area_sr = calculate_pixel_area_sr(
-                #         pixel_scale_arcsec=pxsc_arcsec
-                #     )
-                #     print(f"DEGUG -- original: {pxar} | new: {pixel_area_sr}")
-                #     pxar = pixel_area_sr
-                # else:
-                #     log.info(
-                #         f"[{key}][Index {j}] PIXAR_SR found in telescope telemetry database. "
-                #     )
-
-                # Convert the host star brightness from vegamag to MJy. Use an
-                # unocculted model PSF whose integrated flux is normalized to
-                # one in order to obtain the theoretical peak count of the
-                # star.
-                filt = self.database.red[key]["FILTER"][j]
-                offsetpsf = get_offsetpsf(self.database.obs[key])
-                fstar = (
-                    fzero[filt]
-                    / 10.0 ** (mstar[filt] / 2.5)
-                    / 1e6
-                    * np.nanmax(offsetpsf)
-                )  # MJy
-
-                # Get PSF subtraction strategy used, for use in plot labels below.
-                psfsub_strategy = (
-                    f"{head_pri['MODE']} with {head_pri['ANNULI']} annuli."
-                    if head_pri["ANNULI"] > 1
-                    else head_pri["MODE"]
-                )
-
-                # Set the inner and outer working angle and compute the
-                # resolution element. Account for possible blurring.
-                iwa = 1  # pix
-                owa = data.shape[1] // 2  # pix
-
-                # 2. Extract instrument-level configurations safely
-                telescop = self.database.red[key]["TELESCOP"][j]
-                exp_type = self.database.red[key]["EXP_TYPE"][j]
-                cwave_um = self.database.red[key]["CWAVEL"][j]
-                blur_fwhm = self.database.obs[key]["BLURFWHM"][j]
-
-                # 3. Call the standardized resolution tracking function
-                spatial_resolution_pix = calculate_spatial_resolution_pix(
-                    wavelength_um=cwave_um,
-                    pixel_scale_rad=pxsc_rad,  # Directly matching your linear baseline scale variable
-                    telescope_name=telescop,
-                    exposure_type=exp_type,
-                    blur_fwhm_pix=blur_fwhm,
-                )
-
-                print(
-                    f"Standardized Resolution tracking element: {spatial_resolution_pix:.4f} pixels"
-                )
-
-                # keep original config
-                resolution = spatial_resolution_pix
-
-                # Get the star position.
-                if overwrite_crpix is None:
-                    center = (
-                        head_pri["CRPIX1"] - 1.0,
-                        head_pri["CRPIX2"] - 1.0,
-                    )  # pix (0-indexed)
-                else:
-                    center = (
-                        overwrite_crpix[0] - 1.0,
-                        overwrite_crpix[1] - 1.0,
-                    )  # pix (0-indexed)
-
-                # Mask coronagraph spiders, 4QPM edges, etc.
-                debug_bar_mask = True
-                print(" --------- I am here -------")
-                if self.database.red[key]["EXP_TYPE"][j] in ["NRC_CORON"]:
-                    # NOTES: TB I am not sure what this is suppose to look like.
-                    # The test/code I have for this produces a result but I do not have
-                    # a reference to compare it too.
-                    if "WB" in self.database.red[key]["CORONMSK"][j]:
-                        log.info("  Masking out areas for NIRCam bar coronagraph")
-                        xr = np.arange(data.shape[-1]) - center[0]
-                        yr = np.arange(data.shape[-2]) - center[1]
-                        xx, yy = np.meshgrid(xr, yr)
-                        pa = -np.rad2deg(np.arctan2(xx, yy))
-                        pa[pa < 0.0] += 360.0
-                        ww_sci = np.where(self.database.obs[key]["TYPE"] == "SCI")[0]
-                        for ww in ww_sci:
-                            roll_ref = self.database.obs[key]["ROLL_REF"][ww]  # deg
-                            pa1 = (90.0 - 15.0 + roll_ref) % 360.0
-                            pa2 = (90.0 + 15.0 + roll_ref) % 360.0
-                            if pa1 > pa2:
-                                temp = (pa > pa1) | (pa < pa2)
-                            else:
-                                temp = (pa > pa1) & (pa < pa2)
-                            data[:, temp] = np.nan
-                            pa1 = (270.0 - 15.0 + roll_ref) % 360.0
-                            pa2 = (270.0 + 15.0 + roll_ref) % 360.0
-                            if pa1 > pa2:
-                                temp = (pa > pa1) | (pa < pa2)
-                            else:
-                                temp = (pa > pa1) & (pa < pa2)
-                            if debug_bar_mask:
-                                plt.figure()
-                                plt.title("NIRCam Bar Mask")
-                                plt.imshow(temp)
-                                plt.show()
-                                debug_bar_mask = False
-
-                            data[:, temp] = np.nan
-                elif self.database.red[key]["EXP_TYPE"][j] in ["MIR_4QPM"]:
-                    # This is MIRI 4QPM data, want to mask edges. However, close
-                    # to the center you don't have a choice. So, want to use
-                    # rectangles with a gap in the center.
-                    log.info("  Masking out areas for MIRI 4QPM coronagraph")
-
-                    # Create array and pad slightly
-                    nanmask = np.zeros_like(data[0])
-                    pad = 5
-                    nanmask = np.pad(nanmask, pad)
-
-                    # Upsample array to improve centering.
-                    samp = 1  # Upsampling factor
-                    nanmask = nanmask.repeat(samp, axis=0).repeat(samp, axis=1)
-
-                    # Define rectangle edges
-                    rect_width = 10 * samp  # pixels
-                    thinrect_width = 2 * samp  # pixels
-
-                    cent_rect = [
-                        (center[0] + pad) * samp,
-                        (center[0] + pad) * samp,
-                        (center[1] + pad) * samp,
-                        (center[1] + pad) * samp,
-                    ]
-                    rect = [
-                        int(cent_rect[i] - (rect_width / 2 * (-1) ** (i % 2)))
-                        for i in range(4)
-                    ]
-                    thinrect = [
-                        int(cent_rect[i] - (thinrect_width / 2 * (-1) ** (i % 2)))
-                        for i in range(4)
-                    ]
-
-                    # Define circle mask for center
-                    circ_rad = 15 * samp  # pixels
-                    yarr, xarr = np.ogrid[: nanmask.shape[0], : nanmask.shape[1]]
-                    rad_dist = np.sqrt(
-                        (xarr - (center[0] + pad) * samp) ** 2
-                        + (yarr - (center[1] + pad) * samp) ** 2
-                    )
-                    circ = rad_dist < circ_rad
-
-                    # Loop over images
-                    ww_sci = np.where(self.database.obs[key]["TYPE"] == "SCI")[0]
-                    for ww in ww_sci:
-                        # Apply cross
-                        roll_ref = self.database.obs[key]["ROLL_REF"][ww]  # deg
-                        temp = np.zeros_like(nanmask)
-                        temp[:, rect[0] : rect[1]] = 1  # Vertical
-                        temp[rect[2] : rect[3], :] = 1  # Horizontal
-
-                        # Now ensure center isn't completely masked
-                        temp[circ] = 0
-
-                        # Apply thin cross
-                        temp[:, thinrect[0] : thinrect[1]] = 1  # Vertical
-                        temp[thinrect[2] : thinrect[3], :] = 1  # Horizontal
-
-                        # Rotate the array, include fixed rotation of FQPM edges
-                        temp = rotate(temp, 90 - roll_ref + 4.83544897, reshape=False)
-                        nanmask += temp
-
-                    # If pixel value too high, should be masked, else set to 1.
-                    nanmask[nanmask >= 0.5] = np.nan
-                    nanmask[nanmask < 0.5] = 1
-
-                    # Downsample, remove padding, and mask data
-                    nanmask = nanmask[::samp, ::samp]
-                    nanmask = nanmask[pad:-pad, pad:-pad]
-                    nanmask = set_surrounded_pixels(nanmask)
-
-                    ####################
-                    # MIRI mask (This works I just need to fold it in)
-                    ####################
-
-                    # print("running new miri mask")
-                    # roll_angles = self.database.obs[key]["ROLL_REF"][ww_sci]
-                    # nanmask = generate_miri_4qpm_mask(
-                    #     detector_shape=data[0].shape,
-                    #     coronagraph_center_pix=center,
-                    #     roll_reference_angles_deg=roll_angles,
-                    #     padding_pix=pad,
-                    #     upsample_factor=samp,
-                    # )
-
-                    #
-                    print(f"data shape: {data.shape}")
-                    print(f"center: {center}")
-                    plt.figure()
-                    plt.title("MIRI - 4PQM - MASK")
-                    plt.imshow(nanmask)
-                    plt.axvline(center[0])
-                    plt.axhline(center[1])
-                    plt.show()
-
-                    data *= nanmask
-                elif self.database.red[key]["EXP_TYPE"][j] in ["MIR_LYOT"]:
-                    raise NotImplementedError()
-
-                ####################
-                # Mask companions Step
-                ####################
-                if companions is not None:
-                    log.info(
-                        f"  Masking out {len(companions)} known companions using provided parameters."
-                    )
-                    print(f"Resolution: {resolution}")
-                    print(f"pixel Scale (arcsec): {pxsc_arcsec}")
-                    companion_mask = generate_companion_spatial_mask(
-                        spatial_shape=data.shape[1:],
-                        center_pix=center,
-                        pixscale_arcsec=pxsc_arcsec,
-                        spatial_resolution_pix=resolution,
-                        companions=companions,
-                    )
-                    # apply the mask and fill with nans
-                    data[:, companion_mask] = np.nan
-
-                ####################
-                # injecting new contrast calculations:
-                ####################
-                log.info("  Measuring raw contrast in annuli")
-                contrast_results = compute_contrast_curves(
-                    data_cube=data,
-                    pixel_area_sr=pxar,
-                    stellar_flux_peak=fstar,
-                    spatial_resolution_pix=resolution,
-                    center_pix=center,
-                    inner_working_angle_pix=iwa,
-                    outer_working_angle_pix=owa,
-                    coronagraph_transmission_mask=mask,
-                )
-
-                (
-                    radial_separations_pix,
-                    raw_contrast_curves,
-                    throughput_corrected_array,
-                ) = contrast_results
-
-                # NOTES: The raw contrast calculation like should be migrated to a table
-                # or dataclass result structure rather than floating variables, its a result.
-                # can keep things more orgnanized.  
-
-                # assuming pixel scale is the same between all data.
-                radial_separations_pix *= self.database.red[key]["PIXSCALE"][0]
-
-                # map back to orignal setup
-                # ideally we shouldnt need this because we should only need one coorindate
-                # The radial separations.
-                seps = np.tile(radial_separations_pix, (len(data), 1))
-                cons = raw_contrast_curves
-                cons_mask = throughput_corrected_array
-
-                # PLOTTING DATA
-
-                # Plot masked data.
-
-                # Maksed Data plotting
-
-                klmodes = self.database.red[key]["KLMODES"][j].split(",")
-                fitsfile = os.path.join(output_dir, os.path.split(fitsfile)[1])
-
-                load_plt_style(plot_style)
-                fig = plt.figure(figsize=(6.4, 4.8))
-                ax = plt.gca()
-                xx = np.arange(data.shape[2]) - center[0]  # pix
-                yy = np.arange(data.shape[1]) - center[1]  # pix
-                extent = (
-                    -(xx[0] - 0.5) * pxsc_arcsec,
-                    -(xx[-1] + 0.5) * pxsc_arcsec,
-                    (yy[0] - 0.5) * pxsc_arcsec,
-                    (yy[-1] + 0.5) * pxsc_arcsec,
-                )
-                vmax = np.nanmax(data[-1])
-                ax.imshow(
-                    data[-1],
-                    origin="lower",
-                    cmap="inferno",
-                    norm=matplotlib.colors.SymLogNorm(
-                        vmin=-vmax, vmax=vmax, linthresh=vmax / 100
-                    ),
-                    extent=extent,
-                )
-                ax.set_xlabel(r"$\Delta$RA [arcsec]")
-                ax.set_ylabel(r"$\Delta$Dec [arcsec]")
-                ax.set_title(
-                    f"Masked data in {filt}, {psfsub_strategy} ({klmodes[-1]} KL)"
-                )
-                for r in [5, 10]:
-                    ax.add_patch(
-                        matplotlib.patches.Circle(
-                            (0, 0),
-                            r,
-                            ls="--",
-                            facecolor="none",
-                            edgecolor="cyan",
-                            clip_on=True,
-                        )
-                    )
-                    ax.text(r, 0, f" {r}''", color="cyan")
-                import textwrap
-
-                ax.text(
-                    0.01,
-                    0.99,
-                    textwrap.fill(os.path.basename(fitsfile), width=40),
-                    transform=ax.transAxes,
-                    color="black",
-                    verticalalignment="top",
-                    fontsize=9,
-                )
-                plt.colorbar(
-                    mappable=ax.images[0], label=self.database.red[key]["BUNIT"][j]
-                )
-                plt.tight_layout()
-                if save_figures:
-                    output_file = fitsfile[:-5] + "_masked.pdf"
-                    plt.savefig(output_file)
-                    log.info(f" Plot saved in {output_file}")
-                plt.show()
-                plt.close(fig)
-
-                # PLOTTING THE Raw Contrast Curves
-
-                # Plot raw contrast.
-                klmodes = self.database.red[key]["KLMODES"][j].split(",")
-                fitsfile = os.path.join(output_dir, os.path.split(fitsfile)[1])
-                colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
-                mod = len(colors)
-                load_plt_style(plot_style)
-                fig = plt.figure(figsize=(6.4, 4.8))
-                ax = plt.gca()
-                for k in range(data.shape[0]):
-                    if mask is None:
-                        ax.plot(
-                            seps[k],
-                            cons[k],
-                            color=colors[k % mod],
-                            label=klmodes[k] + " KL",
-                        )
-                    else:
-                        ax.plot(
-                            seps[k], cons[k], color=colors[k % mod], alpha=0.3, ls="--"
-                        )
-                        ax.plot(
-                            seps[k],
-                            cons_mask[k],
-                            color=colors[k % mod],
-                            label=klmodes[k] + " KL",
-                        )
-                ax.set_yscale("log")
-                ax.set_ylim([None, 1])
-                if plot_xlim is not None:
-                    ax.set_xlim(plot_xlim)
-                ax.set_xlabel("Separation [arcsec]")
-                ax.set_ylabel(r"5-$\sigma$ contrast")
-                ax.legend(
-                    loc="upper right",
-                    ncols=3,
-                    title=None
-                    if mask is None
-                    else "Dashed lines exclude coronagraph mask throughput",
-                    title_fontsize=10,
-                )
-                ax.set_title(f"Raw contrast in {filt}, {psfsub_strategy}")
-                plt.tight_layout()
-                if save_figures:
-                    output_file = fitsfile[:-5] + "_rawcon.pdf"
-                    plt.savefig(output_file)
-                    log.info(f" Plot saved in {output_file}")
-                plt.show()
-                plt.close(fig)
-
-                # Exporting Data
-
-                if output_filetype.lower() == "ecsv":
-                    # Save outputs as astropy ECSV text tables
-                    columns = [seps[0]]
-                    names = ["separation"]
-                    for i, klmode in enumerate(klmodes):
-                        columns.append(cons[i])
-                        names.append(f"contrast, N_kl={klmode}")
-                        if mask is not None:
-                            columns.append(cons_mask[i])
-                            names.append(f"contrast+mask, N_kl={klmode}")
-                    results_table = Table(columns, names=names)
-                    results_table["separation"].unit = u.arcsec
-                    # the following needs debugging:
-                    # for kw in ['TELESCOP', 'INSTRUME', 'SUBARRAY', 'FILTER', 'CORONMSK', 'EXP_TYPE', 'FITSFILE']:
-                    #    results_table.meta[kw] = self.database.red[key][kw][j]
-
-                    output_fn = fitsfile[:-5] + "_contrast.ecsv"
-                    results_table.write(output_fn, overwrite=True)
-                    print(f"Contrast results and plots saved to {output_fn}")
-                elif output_filetype.lower() == "npy":
-                    # Save outputs as numpy .npy files
-                    np.save(fitsfile[:-5] + "_seps.npy", seps)
-                    np.save(fitsfile[:-5] + "_cons.npy", cons)
-                    if mask is not None:
-                        np.save(fitsfile[:-5] + "_cons_mask.npy", cons_mask)
-                    print(
-                        f"Contrast results and plots saved to {fitsfile[:-5] + '_seps.npy'}, {fitsfile[:-5] + '_cons.npy'}"
-                    )
-                else:
-                    raise ValueError(
-                        'File save format not supported, options are "npy" or "ecsv".'
-                    )
-
-    def calibrate_contrast(
-        self,
-        subdir="calcon",
-        rawcon_subdir="rawcon",
-        rawcon_filetype="npy",
-        companions=None,
-        injection_seps="default",
-        injection_pas="default",
-        injection_flux_sigma=20,
-        multi_injection_spacing=None,
-        use_saved=False,
-        thrput_fit_method="median",
-        plot_xlim=(0, 10),
-        plot_style=None,
-        **kwargs,
-    ):
-        """
-        Compute a calibrated contrast curve relative to the host star flux.
-
-        Parameters
-        ----------
-        subdir : str, optional
-            Name of the directory where the data products shall be saved. The
-            default is 'calcon'.
-        rawcon_subdir : str, optional
-            Name of the directory where the raw contrast data products have been
-            saved. The default is 'rawcon'.
-        rawcon_filetype : str
-            Save filetype of the raw contrast files.
-        companions : list of list of three float, optional
-            List of companions to be masked before computing the raw contrast.
-            For each companion, there should be a three element list containing
-            [RA offset (arcsec), Dec offset (arcsec), mask radius (lambda/D)].
-            The default is None.
-        injection_seps : 1D-array, optional
-            List of separations to inject companions at (arcsec).
-        injection_pas : 1D-array, optional
-            List of position angles to inject companions at (degrees).
-        injection_flux_sigma : float, optional
-            The peak flux of all injected companions in units of sigma, relative
-            to the 1sigma contrast at the injected separation.
-        multi_injection_spacing : int, None, optional
-            Spacing between companions injected in a single image. If companions
-            are too close then it can pollute the recovered flux. Set to 'None'
-            to inject only one companion at a time (lambda/D).
-        use_saved : bool, optional
-            Toggle to use existing saved injected and recovered fluxes instead of
-            repeating the process.
-        thrput_fit_method : str, optional
-            Method to use when fitting/interpolating the measure KLIP throughputs
-            across all of the injection positions. 'median' for a median of PAs at
-            with the same separation. 'log_grow' for a logistic growth function.
-
-        Returns
-        -------
-        None.
-        """
-
-        # Check input.
-        companions = validate_companions(companions)
-
-        # Set output directory.
-        output_dir = os.path.join(self.database.output_dir, subdir)
-        if not os.path.exists(output_dir):
-            os.makedirs(output_dir)
-
-        # Get raw contrast directory
-        rawcon_dir = os.path.join(self.database.output_dir, rawcon_subdir)
-        if not os.path.exists(rawcon_dir):
-            raise TypeError(
-                'Raw contrast must be calculated first. "rawcon" subdirectory not found.'
-            )
-
-        # Loop through concatenations.
-        for i, key in enumerate(self.database.red.keys()):
-            log.info("--> Concatenation " + key)
-
-            # Need to generate the offset PSF we'll be injecting. Best to do
-            # this per concatenation to save time.
-            if use_saved == True:
-                # Don't need to bother generating the PSF, use dummy value
-                offsetpsf = 1
-            else:
-                offsetpsf = get_offsetpsf(self.database.obs[key])
-
-            # Loop through FITS files.
-            nfitsfiles = len(self.database.red[key])
-            for j in range(nfitsfiles):
-                # Read FITS file and PSF mask.
-                fitsfile = self.database.red[key]["FITSFILE"][j]
-                data, head_pri, head_sci, is2d = ut.read_red(fitsfile)
-                maskfile = self.database.red[key]["MASKFILE"][j]
-                mask = ut.read_msk(maskfile)
-
-                log.info("Analyzing file " + fitsfile)
-
-                # Get the raw contrast information with and without mask correction
-                file_str = fitsfile.split("/")[-1]
-                if rawcon_filetype == "npy":
-                    seps_file = file_str.replace(".fits", "_seps.npy")  # Arcseconds
-                    rawcons_file = file_str.replace(".fits", "_cons.npy")
-                    maskcons_file = file_str.replace(".fits", "_cons_mask.npy")
-
-                    rawseps = np.load(os.path.join(rawcon_dir, seps_file))
-                    rawcons = np.load(os.path.join(rawcon_dir, rawcons_file))
-                    maskcons = np.load(os.path.join(rawcon_dir, maskcons_file))
-                elif rawcon_filetype == "ecsv":
-                    raise NotImplementedError(
-                        ".ecsv save format not currently supported for \
-                        calibrated contrasts. Please use .npy raw contrasts as input."
-                    )
-                    # contrast_file = file_str.replace('.fits', '_contrast.ecsv')
-                    # contrast_path =  os.path.join(rawcon_dir, contrast_file)
-
-                    # rawcon_data = Table.read(contrast_path, format='ascii.ecsv')
-
-                # Read Stage 2 files and make pyKLIP dataset
-                filepaths, psflib_filepaths = get_pyklip_filepaths(self.database, key)
-                pop_pxar_kw(np.append(filepaths, psflib_filepaths))
-                pyklip_dataset = JWSTData(filepaths, psflib_filepaths)
-
-                # Compute the resolution element. Account for possible blurring.
-                pxsc_arcsec = self.database.red[key]["PIXSCALE"][j]  # arcsec
-                pxsc_rad = pxsc_arcsec / 3600.0 / 180.0 * np.pi  # rad
-                if self.database.red[key]["TELESCOP"][j] == "JWST":
-                    if self.database.red[key]["EXP_TYPE"][j] in [
-                        "NRC_CORON",
-                        "NRC_TACONFIRM",
-                        "NRC_TACQ",
-                    ]:
-                        diam = 5.2
-                    else:
-                        diam = JWST_CIRCUMSCRIBED_DIAMETER
-                else:
-                    raise UserWarning("Data originates from unknown telescope")
-                resolution = (
-                    1e-6 * self.database.red[key]["CWAVEL"][j] / diam / pxsc_rad
-                )  # pix
-                if not np.isnan(self.database.obs[key]["BLURFWHM"][j]):
-                    resolution *= self.database.obs[key]["BLURFWHM"][j]
-                resolution_fwhm = 1.025 * resolution
-
-                # Get stellar magnitudes and filter zero points, but use the same file as rawcon
-                ccinfo = os.path.join(rawcon_dir, "contrast_curve_info.txt")
-                with open(ccinfo) as cci:
-                    starfile, spectral_type_info = (
-                        cci.readline().strip("\n").split(" /// ")
-                    )
-                    spectral_type = spectral_type_info.split(": ")[1]
-                    starfile = os.path.join(rawcon_dir, starfile.replace("#", ""))
-                mstar, fzero = get_stellar_magnitudes(
-                    starfile,
-                    spectral_type,
-                    self.database.red[key]["INSTRUME"][j],
-                    output_dir=output_dir,
-                    **kwargs,
-                )  # vegamag, Jy
-                filt = self.database.red[key]["FILTER"][j]
-                fstar = (
-                    fzero[filt]
-                    / 10.0 ** (mstar[filt] / 2.5)
-                    / 1e6
-                    * np.nanmax(offsetpsf)
-                )  # MJy
-                fstar *= ((180.0 / np.pi) * 3600.0) ** 2 / pxsc_arcsec**2  # MJy/sr
-                # Get PSF subtraction strategy used, for use in plot labels below.
-                psfsub_strategy = (
-                    f"{head_pri['MODE']} with {head_pri['ANNULI']} annuli."
-                    if head_pri["ANNULI"] > 1
-                    else head_pri["MODE"]
-                )
-
-                ### Now want to perform the injection and recovery of companions.
-                # Define the seps and PAs to inject companions at
-                if injection_seps == "default":
-                    inj_seps = [
-                        0.1,
-                        0.2,
-                        0.3,
-                        0.4,
-                        0.5,
-                        0.6,
-                        0.7,
-                        0.8,
-                        0.9,
-                        1.0,
-                        1.2,
-                        1.4,
-                        1.6,
-                        1.8,
-                        2.0,
-                        2.5,
-                        3.0,
-                        3.5,
-                        4.0,
-                        5.0,
-                    ]
-                else:
-                    inj_seps = injection_seps
-                inj_seps_pix = inj_seps / pxsc_arcsec  # Convert separation to pixels
-
-                if injection_pas == "default":
-                    if "4QPM" in self.database.red[key]["CORONMSK"][j]:
-                        inj_pas = [57.5, 147.5, 237.5, 327.5]
-                    elif "WB" in self.database.red[key]["CORONMSK"][j]:
-                        inj_pas = [45.0, 135.0, 225.0, 315.0]
-                    else:
-                        inj_pas = [0, 60, 120, 180, 240, 300]
-                else:
-                    inj_pas = injection_pas
-
-                # Determine the fluxes we want to inject the companions at.
-                # Base it on the contrast for the desired separations. Use the
-                # contrast with the ~median KL modes.
-                median_KL_index = int(len(rawseps) / 2)
-                cons_cleaned = np.nan_to_num(rawcons[median_KL_index], nan=1)
-                contrast_interp = interp1d(
-                    rawseps[median_KL_index],
-                    cons_cleaned,
-                    kind="linear",
-                    bounds_error=False,
-                    fill_value=(1, cons_cleaned[-1]),
-                )
-                inj_cons = contrast_interp(inj_seps)
-                inj_fluxes = inj_cons * fstar  # MJy/sr
-                inj_fluxes *= injection_flux_sigma / 5  # Scale to an N sigma peak flux
-
-                # Going to redefine companion locations in terms of pixels
-                companions_pix = []
-                if companions is not None:
-                    for k in range(len(companions)):
-                        ra, dec, rad = companions[k]  # arcsec, arcsec, lambda/D
-                        ra_pix = ra / pxsc_arcsec
-                        dec_pix = dec / pxsc_arcsec
-                        rad_pix = rad * resolution  # pix
-                        companions_pix.append([ra_pix, dec_pix, rad_pix])
-                else:
-                    companions_pix = None
-
-                # Redefine the multi_injection_spacing in terms of pixels
-                if multi_injection_spacing is not None:
-                    injection_spacing_pix = multi_injection_spacing * resolution
-                else:
-                    injection_spacing_pix = multi_injection_spacing
-
-                # Need to get exactly the same KLIP arguments that were used for this subtraction.
-                klip_args = {}
-                klip_args["mode"] = self.database.red[key]["MODE"][j]
-                klip_args["annuli"] = self.database.red[key]["ANNULI"][j]
-                klip_args["subsections"] = self.database.red[key]["SUBSECTS"][j]
-                klip_args["numbasis"] = [
-                    int(nb) for nb in self.database.red[key]["KLMODES"][j].split(",")
-                ]
-                klip_args["algo"] = (
-                    "klip"  # Currently not logged, may need changing in future.
-                )
-                _, _, maxnumbasis = get_pyklip_filepaths(
-                    self.database, key, return_maxbasis=True
-                )  # ensure maxnumbasis is same as for rawcon / klipsub reduction
-                klip_args["maxnumbasis"] = maxnumbasis
-                inj_subdir = (
-                    klip_args["mode"]
-                    + "_NANNU"
-                    + str(klip_args["annuli"])
-                    + "_NSUBS"
-                    + str(klip_args["subsections"])
-                    + "_"
-                    + key
-                    + "/"
-                )
-                klip_args["movement"] = 1  # Currently not logged, fix later.
-                klip_args["calibrate_flux"] = False
-                klip_args["highpass"] = False
-                klip_args["verbose"] = False
-                inj_output_dir = os.path.join(output_dir, inj_subdir)
-                if not os.path.exists(inj_output_dir):
-                    os.makedirs(inj_output_dir)
-                klip_args["outputdir"] = inj_output_dir
-
-                save_string = output_dir + "/" + file_str[:-5]
-                if use_saved:
-                    log.info(
-                        "Retrieving saved companion injection and recovery results."
-                    )
-                    all_inj_seps = np.load(save_string + "_injrec_seps.npy")
-                    all_inj_pas = np.load(save_string + "_injrec_pas.npy")
-                    all_inj_fluxes = np.load(save_string + "_injrec_inj_fluxes.npy")
-                    all_retr_fluxes = np.load(save_string + "_injrec_retr_fluxes.npy")
-                else:
-                    # Run the injection and recovery process
-                    log.info(
-                        "Injecting and recovering synthetic companions. This may take a while..."
-                    )
-                    inj_rec = inject_and_recover(
-                        pyklip_dataset,
-                        injection_psf=offsetpsf,
-                        injection_seps=inj_seps_pix,
-                        injection_pas=inj_pas,
-                        injection_spacing=injection_spacing_pix,
-                        injection_fluxes=inj_fluxes,
-                        klip_args=klip_args,
-                        retrieve_fwhm=resolution_fwhm,
-                        true_companions=companions_pix,
-                    )
-
-                    # Unpack everything from the injection and recovery
-                    all_inj_seps, all_inj_pas, all_inj_fluxes, all_retr_fluxes = inj_rec
-
-                    # Save these arrays
-                    np.save(save_string + "_injrec_seps.npy", all_inj_seps)
-                    np.save(save_string + "_injrec_pas.npy", all_inj_pas)
-                    np.save(save_string + "_injrec_inj_fluxes.npy", all_inj_fluxes)
-                    np.save(save_string + "_injrec_retr_fluxes.npy", all_retr_fluxes)
-
-                # Need to add a point at a separation of zero pixels, assume
-                # basically no flux retrieved at zero separation.
-                all_inj_seps = np.append([0], all_inj_seps)
-                all_inj_pas = np.append([0], all_inj_pas)
-                all_inj_fluxes = np.append([1], all_inj_fluxes)
-                zero_sep_retr_flux = 1e-10 * np.ones_like(all_retr_fluxes[0])
-                all_retr_fluxes = np.vstack([zero_sep_retr_flux, all_retr_fluxes])
-
-                # Separation returned in pixels but we want arcseconds
-                all_inj_seps *= pxsc_arcsec
-
-                # Need to loop over each KL mode used to compute a correction
-                # for each.
-                rawcons_corr = []
-                maskcons_corr = []
-                all_corrections = []
-                for k in range(len(rawseps)):
-                    # Get the raw separation and contrast for this KL mode
-                    this_KL_rawseps = rawseps[k]
-                    this_KL_rawcons = rawcons[k]
-                    this_KL_maskcons = maskcons[k]
-
-                    # Get fluxes for this KL mode subtracted image
-                    this_KL_retr_fluxes = all_retr_fluxes[:, k]
-
-                    # Make a table to make things easier
-                    results = Table(
-                        [
-                            all_inj_seps,
-                            all_inj_pas,
-                            all_inj_fluxes,
-                            this_KL_retr_fluxes,
-                        ],
-                        names=("inj_seps", "inj_pas", "inj_fluxes", "retr_fluxes"),
-                    )
-
-                    # Determine throughput of klip process on the injected flux
-                    results["klip_thrputs"] = np.divide(
-                        results["retr_fluxes"], results["inj_fluxes"]
-                    )
-
-                    # Calculate the median across all position angles
-                    med_results = results.group_by("inj_seps").groups.aggregate(
-                        np.nanmedian
-                    )
-
-                    # Need to interpolate or model to determine throughput at actual
-                    # separations of the contrast curve.
-                    if thrput_fit_method == "median":
-                        med_interp = interp1d(
-                            med_results["inj_seps"],
-                            med_results["klip_thrputs"],
-                            fill_value=(1e-10, med_results["klip_thrputs"][-1]),
-                            bounds_error=False,
-                            kind="slinear",
-                        )
-                        contrast_correction = med_interp(this_KL_rawseps)
-                    elif thrput_fit_method == "log_grow":
-                        raise NotImplementedError()
-                    else:
-                        raise ValueError(
-                            "Invalid thrput_fit_method: "
-                            + "{}, options are 'median' or 'log_grow'".format(
-                                thrput_fit_method
-                            )
-                        )
-
-                    # Apply contrast correction
-                    rawcons_corr.append(rawcons[k] / contrast_correction)
-                    maskcons_corr.append(maskcons[k] / contrast_correction)
-                    all_corrections.append(contrast_correction)
-
-                all_corrections = np.squeeze(all_corrections)  # Tidy array
-                # Need to make sure its not 1D for number of different KL modes == 1 case
-                if all_corrections.ndim == 1:
-                    all_corrections = all_corrections[np.newaxis, :]
-
-                # Save the corrected contrasts, as well as the separations for convenience.
-                np.save(save_string + "_cal_seps.npy", rawseps)
-                np.save(save_string + "_cal_cons.npy", rawcons_corr)
-                np.save(save_string + "_cal_maskcons.npy", maskcons_corr)
-
-                # Define some local utilty functions for plot setup.
-                # This makes the plotting code below less repetitive and more consistent
-
-                def standardize_plots_setup(plot_style=None):
-                    # Intialize the matplotlib style.
-                    load_plt_style(plot_style)
-
-                    fig = plt.figure(figsize=(6.4, 4.8))
-                    ax = plt.gca()
-                    color = plt.cm.tab10(np.linspace(0, 1, 10))
-                    cc = cycler(linestyle=["-", ":", "--"]) * cycler(color=color)
-                    ax.set_prop_cycle(cc)
-                    return fig, ax
-
-                def standardize_plots_annotate_save(
-                    ax,
-                    title="",
-                    ylabel="Throughput",
-                    xlim=plot_xlim,
-                    filename=None,
-                    plot_style=None,
-                ):
-                    # Intialize the matplotlib style.
-                    load_plt_style(plot_style)
-
-                    ax.set_xlabel('Separation (")')
-                    ax.set_title(title, fontsize=11)
-                    if ylabel == "Throughput":
-                        ax.set_ylim(0, 1)
-                        ax.set_ylabel("Throughput")
-                    else:  # or else it's contrast on a log scale
-                        ax.set_yscale("log")
-                        ax.set_ylabel(r"5-$\sigma$ contrast")
-                        ax.set_ylim(None, 1)
-                    if xlim is not None:
-                        ax.set_xlim(*xlim)
-                    ax.grid(axis="both", alpha=0.15)
-                    if filename is not None:
-                        plt.savefig(filename, bbox_inches="tight", dpi=300)
-
-                # Plot measured KLIP throughputs, for all KL modes
-                fig, ax = standardize_plots_setup(plot_style=plot_style)
-
-                for ci, corr in enumerate(all_corrections):
-                    KLmodes = klip_args["numbasis"][ci]
-                    ax.plot(rawseps[ci], corr, label="KL = {}".format(KLmodes))
-                ax.legend(ncol=3, fontsize=10)
-                standardize_plots_annotate_save(
-                    ax,
-                    title=f"Injected companions in {filt}, {psfsub_strategy}, all KL modes",
-                    ylabel="Throughput",
-                    filename=save_string + "_allKL_throughput.pdf",
-                    plot_style=plot_style,
-                )
-                plt.close(fig)
-
-                # Plot individual measurements for median KL mode
-                fig, ax = standardize_plots_setup(plot_style=plot_style)
-
-                ax.plot(
-                    rawseps[median_KL_index],
-                    all_corrections[median_KL_index],
-                    label="Applied Correction",
-                    color="#0B5345",
-                    zorder=100,
-                )
-                ax.scatter(
-                    all_inj_seps,
-                    all_retr_fluxes[:, median_KL_index] / all_inj_fluxes,
-                    s=75,
-                    color="mediumaquamarine",
-                    alpha=0.5,
-                    label="Individual Injections",
-                )
-                ax.legend(fontsize=10)
-                standardize_plots_annotate_save(
-                    ax,
-                    title=f"Injected companions in {filt}, {psfsub_strategy}, for KL={klip_args['numbasis'][median_KL_index]}",
-                    ylabel="Throughput",
-                    filename=save_string + "_medKL_throughput.pdf",
-                    plot_style=plot_style,
-                )
-                plt.close(fig)
-
-                # Plot calibrated contrast curves
-                fig, ax = standardize_plots_setup(plot_style=plot_style)
-                for si, seps in enumerate(rawseps):
-                    KLmodes = klip_args["numbasis"][si]
-                    ax.plot(
-                        seps, maskcons_corr[si], label=f"KL = {KLmodes}", color=f"C{si}"
-                    )
-                    ax.plot(seps, rawcons_corr[si], alpha=0.3, ls="--", color=f"C{si}")
-                ax.legend(
-                    loc="upper right",
-                    ncols=3,
-                    fontsize=10,
-                    title="Dashed lines exclude coronagraph mask throughput",
-                    title_fontsize=10,
-                )
-                standardize_plots_annotate_save(
-                    ax,
-                    title=f"Calibrated contrast in {filt}, {psfsub_strategy}",
-                    ylabel="Contrast",
-                    filename=save_string + "_calcon.pdf",
-                    plot_style=plot_style,
-                )
-                plt.close(fig)
-
-                # Plot calibrated contrast curves compared to raw
-                fig, ax = standardize_plots_setup(plot_style=plot_style)
-                for si, seps in enumerate(rawseps):
-                    KLmodes = klip_args["numbasis"][si]
-                    ax.plot(
-                        seps, maskcons_corr[si], label=f"KL = {KLmodes}", color=f"C{si}"
-                    )
-                    ax.plot(seps, maskcons[si], alpha=0.3, ls=":", color=f"C{si}")
-                ax.legend(
-                    loc="upper right",
-                    ncols=3,
-                    fontsize=10,
-                    title="Solid lines = calibrated, dotted lines = raw",
-                    title_fontsize=10,
-                )
-                standardize_plots_annotate_save(
-                    ax,
-                    title=f"Calibrated contrast vs Raw contrast in {filt}, {psfsub_strategy}",
-                    ylabel="Contrast",
-                    filename=save_string + "_calcon_vs_rawcon.pdf",
-                    plot_style=plot_style,
-                )
-                plt.close(fig)
-
-    def extract_companions(
-        self,
-        companions,
-        starfile,
-        mstar_err,
-        spectral_type="G2V",
-        planetfile=None,
-        klmode="max",
-        date="auto",
-        use_fm_psf=True,
-        flip_fmpsf_xy=None,
-        highpass=False,
-        fitmethod="mcmc",
-        minmethod=None,
-        fitkernel="diag",
-        subtract=True,
-        inject=False,
-        remove_background=False,
-        save_preklip=False,
-        overwrite=True,
-        subdir="companions",
-        save_figures=True,
-        **kwargs,
-    ):
-        """
-        Extract the best fit parameters of a number of companions from each
-        reduction in the spaceKLIP reductions database.
-
-        Parameters
-        ----------
-        companions : list of list of three float, optional
-            List of companions to be extracted. For each companion, there
-            should be a three element list containing guesses for [RA offset
-            (arcsec), Dec offset (arcsec), contrast].
-        starfile : path
-            Path of VizieR VOTable containing host star photometry or two
-            column TXT file with wavelength (micron) and flux (Jy).
-        mstar_err : float or dict of float
-            Error on the host star magnitude. If float, will use the same value
-            for each filter. If dict of float, the dictionary keys must be the
-            JWST filters in use and a different value can be used for each
-            filter.
-        spectral_type : str, optional
-            Host star spectral type for the stellar model SED. The default is
-            'G2V'.
-        planetfile : path
-            Path of VizieR VOTable containing companion photometry or two
-            column TXT file with wavelength (micron) and flux (Jy).
-        klmode : int or 'max', optional
-            KL mode for which the companions shall be extracted. If 'max', then
-            the maximum possible KL mode will be used. The default is 'max'.
-        date : str, optional
-            Observation date in the format 'YYYY-MM-DDTHH:MM:SS.MMM'. Will
-            query for the wavefront measurement closest in time to the given
-            date. If 'auto', will grab date from the FITS file header. If None,
-            then the default WebbPSF OPD is used (RevAA). The default is
-            'auto'.
-        use_fm_psf : bool, optional
-            If True, use a FM PSF generated with pyKLIP, otherwise use a more
-            simple integration time-averaged model offset PSF which does not
-            incorporate any KLIP throughput losses. The default is True.
-        flip_fmpsf_xy : str, optional
-            If 'x', flip the x-axis of the FM PSF. If 'y', flip the y-axis of the FM PSF. 'xy' or 'yx' for both.
-        highpass : bool or float, optional
-            If float, will apply a high-pass filter to the FM PSF and KLIP
-            dataset. The default is False.
-        fitmethod : 'mcmc' or 'nested', optional
-            Sampling algorithm which shall be used. If None and minmethod not None, it will mock the MCMC fit results
-            using the initial guesses and perform only the Gaussian convolution fit to estimate extension.
-            The default is 'mcmc'.
-        minmethod: str, optional
-            scipy.optimize.minimize minimization method which shall be used to fit for the extension of the source.
-            The default is None.
-        fitkernel : str, optional
-            Pyklip.fitpsf.FitPSF covariance kernel which shall be used for the
-            Gaussian process regression. The default is 'diag'.
-        subtract : bool, optional
-            If True, subtract each extracted companion from the pyKLIP dataset
-            before fitting the next one in the list. The default is True.
-        inject : bool, optional
-            Instead of fitting for a companion at the guessed location and
-            contrast, inject one into the data.
-        remove_background : bool, optional
-            Remove a constant background level from the KLIP-subtracted data
-            before fitting the FM PSF. The default is False.
-        save_preklip : bool, optional
-            Save the stage 2 files when injecting/killing a companion? The
-            default is False.
-        overwrite : bool, optional
-            If True, compute a new FM PSF and overwrite any existing one,
-            otherwise try to load an existing one and only compute a new one if
-            none exists yet. The default is True.
-        subdir : str, optional
-            Name of the directory where the data products shall be saved. The
-            default is 'companions'.
-        save_figures : bool, optional
-            Save the plots in a PDF?
-
-        Returns
-        -------
-        None.
-
-        """
-
-        # Check input.
-        kwargs_temp = {}
-
-        # Set output directory.
-        output_dir = os.path.join(self.database.output_dir, subdir)
-        if not os.path.exists(output_dir):
-            os.makedirs(output_dir)
-
-        # Loop through concatenations.
-        for i, key in enumerate(self.database.red.keys()):
-            log.info("--> Concatenation " + key)
-
-            # Loop through FITS files.
-            nfitsfiles = len(self.database.red[key])
-            for j in range(nfitsfiles):
-                # Get stellar magnitudes and filter zero points.
-                mstar, fzero, fzero_si = get_stellar_magnitudes(
-                    starfile,
-                    spectral_type,
-                    self.database.red[key]["INSTRUME"][j],
-                    return_si=True,
-                    output_dir=output_dir,
-                    **kwargs,
-                )  # vegamag, Jy, erg/cm^2/s/A
-
-                # Get COM substrate throughput.
-                tp_comsubst = ut.get_tp_comsubst(
-                    self.database.red[key]["INSTRUME"][j],
-                    self.database.red[key]["SUBARRAY"][j],
-                    self.database.red[key]["FILTER"][j],
-                )
-
-                # Compute the pixel area in steradian.
-                pxsc_arcsec = self.database.red[key]["PIXSCALE"][j]  # arcsec
-                pxsc_rad = pxsc_arcsec / 3600.0 / 180.0 * np.pi  # rad
-                pxar = self.database.red[key]["PIXAR_SR"][j]  # sr
-                if np.isnan(pxar):
-                    log.warning(
-                        "PIXAR_SR not found in database, falling back to use PIXSCALE"
-                    )
-                    pxar = pxsc_rad**2  # sr
-
-                # Compute the resolution element. Account for possible
-                # blurring.
-                if self.database.red[key]["TELESCOP"][j] == "JWST":
-                    if self.database.red[key]["EXP_TYPE"][j] in ["NRC_CORON"]:
-                        diam = 5.2
-                    else:
-                        diam = JWST_CIRCUMSCRIBED_DIAMETER
-                else:
-                    raise UserWarning("Data originates from unknown telescope")
-                resolution = (
-                    1e-6 * self.database.red[key]["CWAVEL"][j] / diam / pxsc_rad
-                )  # pix
-                if not np.isnan(self.database.obs[key]["BLURFWHM"][j]):
-                    resolution = np.hypot(
-                        resolution, self.database.obs[key]["BLURFWHM"][j]
-                    )
-
-                # Find science and reference files.
-                filepaths, psflib_filepaths, maxnumbasis = get_pyklip_filepaths(
-                    self.database, key, return_maxbasis=True
-                )
-                if (
-                    "maxnumbasis" not in kwargs_temp.keys()
-                    or kwargs_temp["maxnumbasis"] is None
-                ):
-                    kwargs_temp["maxnumbasis"] = maxnumbasis
-
-                # Initialize pyKLIP dataset.
-                pop_pxar_kw(np.append(filepaths, psflib_filepaths))
-                dataset = JWSTData(filepaths, psflib_filepaths, highpass=highpass)
-                kwargs_temp["dataset"] = dataset
-                kwargs_temp["aligned_center"] = dataset._centers[0]
-                kwargs_temp["psf_library"] = dataset.psflib
-
-                # Make copy of the original pyKLIP dataset.
-                dataset_orig = copy.deepcopy(dataset)
-
-                # Get index of desired KL mode.
-                klmodes = self.database.red[key]["KLMODES"][j].split(",")
-                klmodes = np.array([int(temp) for temp in klmodes])
-                if klmode == "max":
-                    klindex = np.argmax(klmodes)
-                else:
-                    klindex = klmodes.tolist().index(klmode)
-
-                # Set output directories.
-                output_dir_kl = os.path.join(output_dir, "KL%.0f" % klmodes[klindex])
-                if not os.path.exists(output_dir_kl):
-                    os.makedirs(output_dir_kl)
-
-                # Initialize a function that can generate model offset PSFs.
-                inst = self.database.red[key]["INSTRUME"][j]
-                filt = self.database.red[key]["FILTER"][j]
-                apername = self.database.red[key]["APERNAME"][j]
-                if self.database.red[key]["TELESCOP"][j] == "JWST":
-                    if inst == "NIRCAM":
-                        pass
-                        # image_mask = self.database.red[key]['CORONMSK'][j]
-                        # image_mask = image_mask[:4] + image_mask[5:]
-                    elif inst == "NIRISS":
-                        raise NotImplementedError()
-                    elif inst == "MIRI":
-                        pass
-                        # image_mask = self.database.red[key]['CORONMSK'][j].replace('4QPM_', 'FQPM')
-                    else:
-                        raise UserWarning(
-                            "Data originates from unknown JWST instrument"
-                        )
-                else:
-                    raise UserWarning("Data originates from unknown telescope")
-                if planetfile is None:
-                    # Keep backward compatibility where planetfile was part of
-                    # the kwargs.
-                    if (
-                        "planetfile" in kwargs.keys()
-                        and kwargs["planetfile"] is not None
-                    ):
-                        planetfile = kwargs["planetfile"]
-                if planetfile is not None:
-                    sed = read_spec_file(planetfile)
-                else:
-                    sed = None
-                ww_sci = np.where(self.database.obs[key]["TYPE"] == "SCI")[0]
-                if date is not None:
-                    if date == "auto":
-                        date = fits.getheader(
-                            self.database.obs[key]["FITSFILE"][ww_sci[0]], 0
-                        )["DATE-BEG"]
-                offsetpsf_func = JWST_PSF(
-                    apername,
-                    filt,
-                    date=date,
-                    fov_pix=65,
-                    oversample=2,
-                    sp=sed,
-                    use_coeff=False,
-                )
-
-                # NOTE: if minmethod not None, it will split the fit into a fitmethod (e.g. mcmc) for the estimation
-                # of position and flux, and a minmethod (e.g. Powell) to fit the extension of the source using a
-                # psf convolved by a 2D Gaussian and a minimization approach.
-                if minmethod is not None:
-                    split_fit = True
-                else:
-                    split_fit = False
-
-                if split_fit:
-                    if not all(
-                        x in kwargs.keys()
-                        for x in [
-                            "sigma_xguess",
-                            "sigma_yguess",
-                            "scale_guess",
-                            "theta_guess",
-                        ]
-                    ):
-                        gauss_param_guesses = [0.3, 0.3, 0, 0]
-                    else:
-                        gauss_param_guesses = [
-                            kwargs["sigma_xguess"],
-                            kwargs["sigma_yguess"],
-                            kwargs["scale_guess"],
-                            kwargs["theta_guess"],
-                        ]
-
-                    # Loop through companions.
-                    tab = Table(
-                        names=(
-                            "ID",
-                            "RA",
-                            "RA_ERR",
-                            "DEC",
-                            "DEC_ERR",
-                            "FLUX_JY",
-                            "FLUX_JY_ERR",
-                            "FLUX_SI",
-                            "FLUX_SI_ERR",
-                            "FLUX_SI_ALT",
-                            "FLUX_SI_ALT_ERR",
-                            "CON",
-                            "CON_ERR",
-                            "DELMAG",
-                            "DELMAG_ERR",
-                            "APPMAG",
-                            "APPMAG_ERR",
-                            "MSTAR",
-                            "MSTAR_ERR",
-                            "SNR",
-                            "LN(Z/Z0)",
-                            "TP_CORONMSK",
-                            "TP_COMSUBST",
-                            "FITSFILE",
-                            "GSCALE",
-                            "GSCALE_ERROR",
-                            "SIGMA_X",
-                            "SIGMA_X_ERROR",
-                            "SIGMA_Y",
-                            "SIGMA_Y_ERROR",
-                            "THETA",
-                            "THETA_ERROR",
-                        ),
-                        dtype=(
-                            "int",
-                            "float",
-                            "float",
-                            "float",
-                            "float",
-                            "float",
-                            "float",
-                            "float",
-                            "float",
-                            "float",
-                            "float",
-                            "float",
-                            "float",
-                            "float",
-                            "float",
-                            "float",
-                            "float",
-                            "float",
-                            "float",
-                            "float",
-                            "float",
-                            "float",
-                            "float",
-                            "object",
-                            "float",
-                            "float",
-                            "float",
-                            "float",
-                            "float",
-                            "float",
-                            "float",
-                            "float",
-                        ),
-                    )
-                else:
-                    # Loop through companions.
-                    tab = Table(
-                        names=(
-                            "ID",
-                            "RA",
-                            "RA_ERR",
-                            "DEC",
-                            "DEC_ERR",
-                            "FLUX_JY",
-                            "FLUX_JY_ERR",
-                            "FLUX_SI",
-                            "FLUX_SI_ERR",
-                            "FLUX_SI_ALT",
-                            "FLUX_SI_ALT_ERR",
-                            "CON",
-                            "CON_ERR",
-                            "DELMAG",
-                            "DELMAG_ERR",
-                            "APPMAG",
-                            "APPMAG_ERR",
-                            "MSTAR",
-                            "MSTAR_ERR",
-                            "SNR",
-                            "LN(Z/Z0)",
-                            "TP_CORONMSK",
-                            "TP_COMSUBST",
-                            "FITSFILE",
-                        ),
-                        dtype=(
-                            "int",
-                            "float",
-                            "float",
-                            "float",
-                            "float",
-                            "float",
-                            "float",
-                            "float",
-                            "float",
-                            "float",
-                            "float",
-                            "float",
-                            "float",
-                            "float",
-                            "float",
-                            "float",
-                            "float",
-                            "float",
-                            "float",
-                            "float",
-                            "float",
-                            "float",
-                            "float",
-                            "object",
-                        ),
-                    )
-                for k in range(len(companions)):
-                    output_dir_comp = os.path.join(output_dir_kl, "C%.0f" % (k + 1))
-                    if not os.path.exists(output_dir_comp):
-                        os.makedirs(output_dir_comp)
-                    output_dir_fm = os.path.join(output_dir_comp, "KLIP_FM")
-                    if not os.path.exists(output_dir_fm):
-                        os.makedirs(output_dir_fm)
-                    if save_preklip:
-                        output_dir_pk = os.path.join(output_dir_comp, "PREKLIP")
-                        if not os.path.exists(output_dir_pk):
-                            os.makedirs(output_dir_pk)
-
-                    # Offset PSF that is not affected by the coronagraphic
-                    # mask, but only the Lyot stop.
-                    psf_no_coronmsk = offsetpsf_func.psf_off
-
-                    # Initial guesses for the fit parameters.
-                    guess_dx = companions[k][0] / pxsc_arcsec  # pix
-                    guess_dy = companions[k][1] / pxsc_arcsec  # pix
-                    guess_flux = companions[k][2]  # contrast
-                    guess_spec = np.array([1.0])
-                    guess_sep = np.sqrt(guess_dx**2 + guess_dy**2)  # pix
-                    guess_pa = np.rad2deg(np.arctan2(guess_dx, guess_dy))  # deg
-
-                    # The initial guesses are made in RA/Dec space, but the
-                    # model PSFs are defined by the offset between the
-                    # coronagraphic mask center and the companion. Hence, we
-                    # need to generate a separate model PSF for each roll.
-                    rot_offsetpsfs = []
-                    sci_totinttime = []
-                    all_offsetpsfs = []
-                    all_offsetpsfs_nohpf = []
-                    all_pas = []
-                    scale_factor_avg = []
-                    for ww in ww_sci:
-                        roll_ref = self.database.obs[key]["ROLL_REF"][ww]  # deg
-
-                        # Get shift between star and coronagraphic mask
-                        # position. If positive, the coronagraphic mask center
-                        # is to the left/bottom of the star position.
-                        _, _, _, _, _, _, _, _, _, _, maskoffs = ut.read_obs(
-                            self.database.obs[key]["FITSFILE"][ww]
-                        )
-
-                        # NIRCam.
-                        if maskoffs is not None:
-                            mask_xoff = -maskoffs[:, 0]  # pix
-                            mask_yoff = -maskoffs[:, 1]  # pix
-
-                            # Need to rotate by the roll angle (CCW) and flip
-                            # the x-axis so that positive RA is to the left.
-                            mask_raoff = -(
-                                mask_xoff * np.cos(np.deg2rad(roll_ref))
-                                - mask_yoff * np.sin(np.deg2rad(roll_ref))
-                            )  # pix
-                            mask_deoff = mask_xoff * np.sin(
-                                np.deg2rad(roll_ref)
-                            ) + mask_yoff * np.cos(np.deg2rad(roll_ref))  # pix
-
-                            # Compute the true offset between the companion and
-                            # the coronagraphic mask center.
-                            sim_dx = guess_dx - mask_raoff  # pix
-                            sim_dy = guess_dy - mask_deoff  # pix
-                            sim_sep = (
-                                np.sqrt(sim_dx**2 + sim_dy**2) * pxsc_arcsec
-                            )  # arcsec
-                            sim_pa = np.rad2deg(np.arctan2(sim_dx, sim_dy))  # deg
-
-                            # Take median of observation. Typically, each
-                            # dither position is a separate observation.
-                            sim_sep = np.median(sim_sep)
-                            sim_pa = np.median(sim_pa)
-
-                        # Otherwise.
-                        else:
-                            sim_sep = (
-                                np.sqrt(guess_dx**2 + guess_dy**2) * pxsc_arcsec
-                            )  # arcsec
-                            sim_pa = np.rad2deg(np.arctan2(guess_dx, guess_dy))  # deg
-
-                        # Generate offset PSF for this roll angle. Do not add
-                        # the V3Yidl angle as it has already been added to the
-                        # roll angle by spaceKLIP. This is only for estimating
-                        # the coronagraphic mask throughput!
-                        offsetpsf_coronmsk = offsetpsf_func.gen_psf(
-                            [sim_sep, sim_pa],
-                            mode="rth",
-                            PA_V3=roll_ref,
-                            do_shift=False,
-                            quick=True,
-                            addV3Yidl=False,
-                        )
-
-                        # Coronagraphic mask throughput is not incorporated
-                        # into the flux calibration of the JWST pipeline so
-                        # that the companion flux from the detector pixels will
-                        # be underestimated. Therefore, we need to scale the
-                        # model offset PSF to account for the coronagraphic
-                        # mask throughput (it becomes fainter). Compute scale
-                        # factor by comparing a model PSF with and without
-                        # coronagraphic mask.
-                        scale_factor = np.sum(offsetpsf_coronmsk) / np.sum(
-                            psf_no_coronmsk
-                        )
-                        scale_factor_avg += [scale_factor]
-
-                        # Normalize model offset PSF to a total integrated flux
-                        # of 1 at infinity. Generates a new webbpsf model with
-                        # PSF normalization set to 'exit_pupil'.
-                        offsetpsf = offsetpsf_func.gen_psf(
-                            [sim_sep, sim_pa],
-                            mode="rth",
-                            PA_V3=roll_ref,
-                            do_shift=False,
-                            quick=False,
-                            addV3Yidl=False,
-                            normalize="exit_pupil",
-                        )
-
-                        # Normalize model offset PSF by the flux of the star.
-                        offsetpsf *= (
-                            fzero[filt] / 10 ** (mstar[filt] / 2.5) / 1e6 / pxar
-                        )  # MJy/sr
-
-                        # Apply scale factor to incorporate the coronagraphic
-                        # mask througput.
-                        # NOTE: There is no need to apply a correction for the substrate
-                        # as this is accounted for by the pipeline.
-                        offsetpsf *= scale_factor
-
-                        # Flip model PSF in x or y direction if requested
-                        if flip_fmpsf_xy is not None:
-                            if flip_fmpsf_xy == "x":
-                                offsetpsf = np.fliplr(offsetpsf)
-                            elif flip_fmpsf_xy == "y":
-                                offsetpsf = np.flipud(offsetpsf)
-                            elif flip_fmpsf_xy == "xy" or flip_fmpsf_xy == "yx":
-                                offsetpsf = np.flipud(np.fliplr(offsetpsf))
-                            else:
-                                raise ValueError(
-                                    'flip_fmpsf_xy must be "x", "y", "xy", or "yx".'
-                                )
-
-                        # Blur frames with a Gaussian filter.
-                        if not np.isnan(self.database.obs[key]["BLURFWHM"][ww]):
-                            gauss_sigma = self.database.obs[key]["BLURFWHM"][
-                                j
-                            ] / np.sqrt(8.0 * np.log(2.0))
-                            offsetpsf = gaussian_filter(offsetpsf, gauss_sigma)
-
-                        # Apply high-pass filter.
-                        offsetpsf_nohpf = copy.deepcopy(offsetpsf)
-                        if not isinstance(highpass, bool):
-                            highpass = float(highpass)
-                            fourier_sigma_size = (offsetpsf.shape[0] / highpass) / (
-                                2.0 * np.sqrt(2.0 * np.log(2.0))
-                            )
-                            offsetpsf = parallelized.high_pass_filter_imgs(
-                                np.array([offsetpsf]),
-                                numthreads=None,
-                                filtersize=fourier_sigma_size,
-                            )[0]
-                        else:
-                            if highpass:
-                                raise NotImplementedError()
-
-                        # Save rotated model offset PSFs in case we do not end
-                        # up using FM.
-                        nints = self.database.obs[key]["NINTS"][ww]
-                        effinttm = self.database.obs[key]["EFFINTTM"][ww]
-                        rot_offsetpsf = rotate(
-                            offsetpsf,
-                            -roll_ref,
-                            reshape=False,
-                            mode="constant",
-                            cval=0.0,
-                        )
-                        rot_offsetpsfs.extend([rot_offsetpsf])  # do not duplicate
-                        sci_totinttime.extend([nints * effinttm])
-
-                        # Save non-rotated model offset PSFs for the FM.
-                        all_offsetpsfs.extend([offsetpsf for ni in range(nints)])
-                        all_offsetpsfs_nohpf.extend(
-                            [offsetpsf_nohpf for ni in range(nints)]
-                        )
-                        all_pas.extend([roll_ref for ni in range(nints)])
-                    scale_factor_avg = np.sum(
-                        [
-                            scale_factor_avg[l]
-                            * sci_totinttime[l]
-                            / np.sum(sci_totinttime)
-                            for l in range(len(scale_factor_avg))
-                        ]
-                    )
-
-                    # Compute the FM dataset if it does not exist yet, or if
-                    # overwrite is True.
-                    # Compute the FM dataset.
-                    mode = self.database.red[key]["MODE"][j]
-                    annuli = int(self.database.red[key]["ANNULI"][j])
-                    subsections = int(self.database.red[key]["SUBSECTS"][j])
-                    fmdataset = os.path.join(
-                        output_dir_fm,
-                        "FM-"
-                        + mode
-                        + "_NANNU"
-                        + str(annuli)
-                        + "_NSUBS"
-                        + str(subsections)
-                        + "_"
-                        + key
-                        + "-fmpsf-KLmodes-all.fits",
-                    )
-                    klipdataset = os.path.join(
-                        output_dir_fm,
-                        "FM-"
-                        + mode
-                        + "_NANNU"
-                        + str(annuli)
-                        + "_NSUBS"
-                        + str(subsections)
-                        + "_"
-                        + key
-                        + "-klipped-KLmodes-all.fits",
-                    )
-                    if overwrite or (
-                        not os.path.exists(fmdataset) or not os.path.exists(klipdataset)
-                    ):
-                        # Initialize the pyKLIP FM class. Use sep/pa relative
-                        # to the star and not the coronagraphic mask center.
-                        input_wvs = np.unique(dataset.wvs)
-                        if len(input_wvs) != 1:
-                            raise NotImplementedError(
-                                "Only implemented for broadband photometry"
-                            )
-                        fm_class = fmpsf.FMPlanetPSF(
-                            inputs_shape=dataset.input.shape,
-                            numbasis=klmodes,
-                            sep=guess_sep,
-                            pa=guess_pa,
-                            dflux=guess_flux,
-                            input_psfs=np.array(all_offsetpsfs),
-                            input_wvs=input_wvs,
-                            spectrallib=[guess_spec],
-                            spectrallib_units="contrast",
-                            field_dependent_correction=None,
-                            input_psfs_pas=all_pas,
-                        )
-
-                        if not isinstance(highpass, bool):
-                            if k == 0:
-                                highpass_temp = float(highpass)
-                            else:
-                                highpass_temp = False
-                        else:
-                            if highpass:
-                                raise NotImplementedError()
-                            else:
-                                highpass_temp = False
-                        fm.klip_dataset(
-                            dataset=dataset,
-                            fm_class=fm_class,
-                            mode=mode,
-                            outputdir=output_dir_fm,
-                            fileprefix="FM-"
-                            + mode
-                            + "_NANNU"
-                            + str(annuli)
-                            + "_NSUBS"
-                            + str(subsections)
-                            + "_"
-                            + key,
-                            annuli=annuli,
-                            subsections=subsections,
-                            movement=1.0,
-                            numbasis=klmodes,
-                            maxnumbasis=maxnumbasis,
-                            calibrate_flux=False,
-                            aligned_center=dataset._centers[0],
-                            psf_library=dataset.psflib,
-                            highpass=highpass_temp,
-                            mute_progression=True,
-                        )
-
-                    # Open the FM dataset.
-                    with fits.open(fmdataset) as hdul:
-                        fm_frame = hdul[0].data[klindex]
-                        fm_centx = hdul[0].header["PSFCENTX"]
-                        fm_centy = hdul[0].header["PSFCENTY"]
-                    with fits.open(klipdataset) as hdul:
-                        data_frame = hdul[0].data[klindex]
-                        data_centx = hdul[0].header["PSFCENTX"]
-                        data_centy = hdul[0].header["PSFCENTY"]
-
-                    # If use_fm_psf is False, then replace the FM PSF in the
-                    # fm_frame with an integration time-averaged model offset
-                    # PSF.
-                    if use_fm_psf == False:
-                        av_offsetpsf = np.average(
-                            rot_offsetpsfs, weights=sci_totinttime, axis=0
-                        )
-                        sx = av_offsetpsf.shape[1]
-                        sy = av_offsetpsf.shape[0]
-
-                        # Make sure that the model offset PSF has odd shape and
-                        # perform the required subpixel shift before inserting
-                        # it into the fm_frame.
-                        if (sx % 2 != 1) or (sy % 2 != 1):
-                            raise UserWarning("Model offset PSF must be of odd shape")
-                        xshift = (fm_centx - int(fm_centx)) - (guess_dx - int(guess_dx))
-                        yshift = (fm_centy - int(fm_centy)) + (guess_dy - int(guess_dy))
-                        stamp = spline_shift(
-                            av_offsetpsf,
-                            (yshift, xshift),
-                            order=3,
-                            mode="constant",
-                            cval=0.0,
-                        )
-
-                        # Also need to scale the model offset PSF by the
-                        # guessed flux.
-                        stamp *= guess_flux
-
-                        # Insert the model offset PSF into the fm_frame.
-                        fm_frame[:, :] = 0.0
-                        fm_frame[
-                            int(fm_centy) + int(guess_dy) - sy // 2 : int(fm_centy)
-                            + int(guess_dy)
-                            + sy // 2
-                            + 1,
-                            int(fm_centx) - int(guess_dx) - sx // 2 : int(fm_centx)
-                            - int(guess_dx)
-                            + sx // 2
-                            + 1,
-                        ] = stamp
-
-                    # assign forward model kwargs
-                    if "boxsize" not in kwargs.keys() or kwargs["boxsize"] is None:
-                        boxsize = 35
-                    else:
-                        boxsize = kwargs["boxsize"]
-                    if "dr" not in kwargs.keys() or kwargs["dr"] is None:
-                        dr = 5
-                    else:
-                        dr = kwargs["dr"]
-                    if "exclr" not in kwargs.keys() or kwargs["exclr"] is None:
-                        exclr = 3 * resolution
-                    else:
-                        exclr = kwargs["exclr"] * resolution
-                    if "xrange" not in kwargs.keys() or kwargs["xrange"] is None:
-                        xrange = 3.0
-                    else:
-                        xrange = kwargs["xrange"]
-                    if "yrange" not in kwargs.keys() or kwargs["yrange"] is None:
-                        yrange = 3.0
-                    else:
-                        yrange = kwargs["yrange"]
-                    if "frange" not in kwargs.keys() or kwargs["frange"] is None:
-                        frange = 2.0  # i.e. bounds=[guess_flux/(10.**frange),guess_flux*(10**frange)]
-                    else:
-                        frange = kwargs["frange"]
-                    if (
-                        "corr_len_range" not in kwargs.keys()
-                        or kwargs["corr_len_range"] is None
-                    ):
-                        corr_len_range = 1.0
-                    else:
-                        corr_len_range = kwargs["corr_len_range"]
-                    if (
-                        "corr_len_guess" not in kwargs.keys()
-                        or kwargs["corr_len_guess"] is None
-                    ):
-                        corr_len_guess = 3.0
-                    else:
-                        corr_len_guess = kwargs["corr_len_guess"]
-
-                    # Fit the FM PSF to the KLIP-subtracted data.
-                    if inject == False:
-                        # Remove a constant background level from the
-                        # KLIP-subtracted data before fitting the FM PSF?
-                        if remove_background:
-                            # Initialize pyKLIP FMAstrometry class.
-                            fma = fitpsf.FMAstrometry(
-                                guess_sep=guess_sep,
-                                guess_pa=guess_pa,
-                                fitboxsize=boxsize,
-                            )
-                            fma.generate_fm_stamp(
-                                fm_image=fm_frame,
-                                fm_center=[fm_centx, fm_centy],
-                                padding=5,
-                            )
-                            fma.generate_data_stamp(
-                                data=data_frame,
-                                data_center=[data_centx, data_centy],
-                                dr=dr,
-                                exclusion_radius=exclr,
-                            )
-                            corr_len_label = r"$l$"
-                            fma.set_kernel(
-                                fitkernel, [corr_len_guess], [corr_len_label]
-                            )
-                            fma.set_bounds(xrange, yrange, frange, [corr_len_range])
-
-                            # Make sure that the noise map is invertible.
-                            noise_map_max = np.nanmax(fma.noise_map)
-                            fma.noise_map[np.isnan(fma.noise_map)] = noise_map_max
-                            fma.noise_map[fma.noise_map == 0.0] = noise_map_max
-
-                            # Set MCMC parameters from kwargs.
-                            if (
-                                "nwalkers" not in kwargs.keys()
-                                or kwargs["nwalkers"] is None
-                            ):
-                                nwalkers = 50
-                            else:
-                                nwalkers = kwargs["nwalkers"]
-                            if "nburn" not in kwargs.keys() or kwargs["nburn"] is None:
-                                nburn = 100
-                            else:
-                                nburn = kwargs["nburn"]
-                            if (
-                                "nsteps" not in kwargs.keys()
-                                or kwargs["nsteps"] is None
-                            ):
-                                nsteps = 100
-                            else:
-                                nsteps = kwargs["nsteps"]
-                            if (
-                                "nthreads" not in kwargs.keys()
-                                or kwargs["nthreads"] is None
-                            ):
-                                nthreads = 4
-                            else:
-                                nthreads = kwargs["nthreads"]
-
-                            # Run the MCMC fit.
-                            chain_output = os.path.join(
-                                output_dir_comp,
-                                mode
-                                + "_NANNU"
-                                + str(annuli)
-                                + "_NSUBS"
-                                + str(subsections)
-                                + "_"
-                                + key
-                                + "-bka_chain_c%.0f" % (k + 1)
-                                + ".pkl",
-                            )
-                            fma.fit_astrometry(
-                                nwalkers=nwalkers,
-                                nburn=nburn,
-                                nsteps=nsteps,
-                                numthreads=nthreads,
-                                chain_output=chain_output,
-                            )
-
-                            # Estimate the background level from those pixels
-                            # in the KLIP-subtracted data which have a small
-                            # flux in the best fit FM PSF.
-                            if "hsz" not in kwargs.keys() or kwargs["hsz"] is None:
-                                hsz = 35
-                            else:
-                                hsz = kwargs["hsz"]
-                            stamp = data_frame.copy()
-                            xp = int(round(data_centx - guess_dx))
-                            yp = int(round(data_centy + guess_dy))
-                            stamp = stamp[
-                                yp - hsz : yp + hsz + 1, xp - hsz : xp + hsz + 1
-                            ]
-                            psf = fm_frame.copy()
-                            xp = int(round(fm_centx - guess_dx))
-                            yp = int(round(fm_centy + guess_dy))
-                            psf = psf[yp - hsz : yp + hsz + 1, xp - hsz : xp + hsz + 1]
-                            xshift = -(fma.raw_RA_offset.bestfit - guess_dx)
-                            yshift = fma.raw_Dec_offset.bestfit - guess_dy
-                            yxshift = np.array([yshift, xshift])
-                            psf_shift = np.fft.ifftn(
-                                fourier_shift(np.fft.fftn(psf), yxshift)
-                            ).real
-                            con = fma.fit_flux.bestfit * guess_flux
-                            res = stamp - fma.fit_flux.bestfit * psf_shift
-                            thresh = np.nanmax(psf_shift) / 150.0
-                            bg = np.nanmedian(stamp[np.abs(psf_shift) < thresh])
-                            data_frame -= bg
-
-                        # MCMC.
-                        if fitmethod == "mcmc":
-                            # Initialize pyKLIP FMAstrometry class.
-                            fma = fitpsf.FMAstrometry(
-                                guess_sep=guess_sep,
-                                guess_pa=guess_pa,
-                                fitboxsize=boxsize,
-                            )
-                            fma.generate_fm_stamp(
-                                fm_image=fm_frame,
-                                fm_center=[fm_centx, fm_centy],
-                                padding=5,
-                            )
-                            fma.generate_data_stamp(
-                                data=data_frame,
-                                data_center=[data_centx, data_centy],
-                                dr=dr,
-                                exclusion_radius=exclr,
-                            )
-                            corr_len_label = r"$l$"
-                            fma.set_kernel(
-                                fitkernel, [corr_len_guess], [corr_len_label]
-                            )
-                            fma.set_bounds(xrange, yrange, frange, [corr_len_range])
-
-                            # Make sure that the noise map is invertible.
-                            noise_map_max = np.nanmax(fma.noise_map)
-                            fma.noise_map[np.isnan(fma.noise_map)] = noise_map_max
-                            fma.noise_map[fma.noise_map == 0.0] = noise_map_max
-
-                            # Set MCMC parameters from kwargs.
-                            if (
-                                "nwalkers" not in kwargs.keys()
-                                or kwargs["nwalkers"] is None
-                            ):
-                                nwalkers = 50
-                            else:
-                                nwalkers = kwargs["nwalkers"]
-                            if "nburn" not in kwargs.keys() or kwargs["nburn"] is None:
-                                nburn = 100
-                            else:
-                                nburn = kwargs["nburn"]
-                            if (
-                                "nsteps" not in kwargs.keys()
-                                or kwargs["nsteps"] is None
-                            ):
-                                nsteps = 100
-                            else:
-                                nsteps = kwargs["nsteps"]
-                            if (
-                                "nthreads" not in kwargs.keys()
-                                or kwargs["nthreads"] is None
-                            ):
-                                nthreads = 4
-                            else:
-                                nthreads = kwargs["nthreads"]
-
-                            # Run the MCMC fit.
-                            chain_output = os.path.join(
-                                output_dir_comp,
-                                mode
-                                + "_NANNU"
-                                + str(annuli)
-                                + "_NSUBS"
-                                + str(subsections)
-                                + "_"
-                                + key
-                                + "-bka_chain_c%.0f" % (k + 1)
-                                + ".pkl",
-                            )
-                            fma.fit_astrometry(
-                                nwalkers=nwalkers,
-                                nburn=nburn,
-                                nsteps=nsteps,
-                                numthreads=nthreads,
-                                chain_output=chain_output,
-                            )
-
-                            # Plot the MCMC fit results.
-                            fig = fma.make_corner_plot()
-                            if save_figures:
-                                path = os.path.join(
-                                    output_dir_comp,
-                                    mode
-                                    + "_NANNU"
-                                    + str(annuli)
-                                    + "_NSUBS"
-                                    + str(subsections)
-                                    + "_"
-                                    + key
-                                    + "-corner_c%.0f" % (k + 1)
-                                    + ".pdf",
-                                )
-                                fig.suptitle(
-                                    mode
-                                    + "_NANNU"
-                                    + str(annuli)
-                                    + "_NSUBS"
-                                    + str(subsections)
-                                    + "_"
-                                    + key
-                                )
-                                fig.savefig(path)
-                            plt.show()
-                            plt.close(fig)
-                            fig = fma.best_fit_and_residuals()
-                            if save_figures:
-                                path = os.path.join(
-                                    output_dir_comp,
-                                    mode
-                                    + "_NANNU"
-                                    + str(annuli)
-                                    + "_NSUBS"
-                                    + str(subsections)
-                                    + "_"
-                                    + key
-                                    + "-model_c%.0f" % (k + 1)
-                                    + ".pdf",
-                                )
-                                fig.suptitle(
-                                    mode
-                                    + "_NANNU"
-                                    + str(annuli)
-                                    + "_NSUBS"
-                                    + str(subsections)
-                                    + "_"
-                                    + key
-                                )
-                                fig.savefig(path)
-                            plt.show()
-                            plt.close(fig)
-
-                            # Write the MCMC fit results into a table.
-                            flux_jy = fma.fit_flux.bestfit * guess_flux
-                            flux_jy *= fzero[filt] / 10 ** (mstar[filt] / 2.5)  # Jy
-                            flux_jy_err = fma.fit_flux.error * guess_flux
-                            flux_jy_err *= fzero[filt] / 10 ** (mstar[filt] / 2.5)  # Jy
-                            flux_si = fma.fit_flux.bestfit * guess_flux
-                            flux_si *= fzero_si[filt] / 10 ** (
-                                mstar[filt] / 2.5
-                            )  # erg/cm^2/s/A
-                            flux_si *= 1e-7 * 1e4 * 1e4  # W/m^2/um
-                            flux_si_err = fma.fit_flux.error * guess_flux
-                            flux_si_err *= fzero_si[filt] / 10 ** (
-                                mstar[filt] / 2.5
-                            )  # erg/cm^2/s/A
-                            flux_si_err *= 1e-7 * 1e4 * 1e4  # W/m^2/um
-                            flux_si_alt = (
-                                flux_jy
-                                * 1e-26
-                                * 299792458.0
-                                / (1e-6 * self.database.red[key]["CWAVEL"][j]) ** 2
-                                * 1e-6
-                            )  # W/m^2/um
-                            flux_si_alt_err = (
-                                flux_jy_err
-                                * 1e-26
-                                * 299792458.0
-                                / (1e-6 * self.database.red[key]["CWAVEL"][j]) ** 2
-                                * 1e-6
-                            )  # W/m^2/um
-                            delmag = -2.5 * np.log10(
-                                fma.fit_flux.bestfit * guess_flux
-                            )  # mag
-                            delmag_err = (
-                                2.5
-                                / np.log(10.0)
-                                * fma.fit_flux.error
-                                / fma.fit_flux.bestfit
-                            )  # mag
-                            if isinstance(mstar_err, dict):
-                                mstar_err_temp = mstar_err[filt]
-                            else:
-                                mstar_err_temp = mstar_err
-                            appmag = mstar[filt] + delmag  # vegamag
-                            appmag_err = np.sqrt(mstar_err_temp**2 + delmag_err**2)
-                            fitsfile = os.path.join(
-                                output_dir_comp,
-                                mode
-                                + "_NANNU"
-                                + str(annuli)
-                                + "_NSUBS"
-                                + str(subsections)
-                                + "_"
-                                + key
-                                + "-fitpsf_c%.0f" % (k + 1)
-                                + ".fits",
-                            )
-
-                            if split_fit:
-                                # fit the sources with a 2D gaussian only to evaluate the sigma_x, sigma_y and theta
-                                fig, result = best_convfit_and_residuals(
-                                    fma,
-                                    minmethod=minmethod,
-                                    initial_params=gauss_param_guesses,
-                                )
-
-                                if save_figures:
-                                    path = os.path.join(
-                                        output_dir_comp,
-                                        mode
-                                        + "_NANNU"
-                                        + str(annuli)
-                                        + "_NSUBS"
-                                        + str(subsections)
-                                        + "_"
-                                        + key
-                                        + "-model_conv_c%.0f" % (k + 1)
-                                        + ".pdf",
-                                    )
-                                    fig.suptitle(
-                                        mode
-                                        + "_NANNU"
-                                        + str(annuli)
-                                        + "_NSUBS"
-                                        + str(subsections)
-                                        + "_"
-                                        + key
-                                    )
-                                    fig.savefig(path)
-                                plt.show()
-                                plt.close(fig)
-
-                                tab.add_row(
-                                    (
-                                        k + 1,
-                                        fma.raw_RA_offset.bestfit
-                                        * pxsc_arcsec,  # arcsec
-                                        fma.raw_RA_offset.error * pxsc_arcsec,  # arcsec
-                                        fma.raw_Dec_offset.bestfit
-                                        * pxsc_arcsec,  # arcsec
-                                        fma.raw_Dec_offset.error
-                                        * pxsc_arcsec,  # arcsec
-                                        flux_jy,
-                                        flux_jy_err,
-                                        flux_si,
-                                        flux_si_err,
-                                        flux_si_alt,
-                                        flux_si_alt_err,
-                                        fma.raw_flux.bestfit * guess_flux,
-                                        fma.raw_flux.error * guess_flux,
-                                        delmag,  # mag
-                                        delmag_err,  # mag
-                                        appmag,  # mag
-                                        appmag_err,  # mag
-                                        mstar[filt],  # mag
-                                        mstar_err_temp,  # mag
-                                        np.nan,
-                                        np.nan,
-                                        scale_factor_avg,
-                                        tp_comsubst,
-                                        fitsfile,
-                                        result.x[3],
-                                        np.nan,
-                                        result.x[0],
-                                        np.nan,
-                                        result.x[1],
-                                        np.nan,
-                                        result.x[2],
-                                        np.nan,
-                                    )
-                                )
-                            else:
-                                tab.add_row(
-                                    (
-                                        k + 1,
-                                        fma.raw_RA_offset.bestfit
-                                        * pxsc_arcsec,  # arcsec
-                                        fma.raw_RA_offset.error * pxsc_arcsec,  # arcsec
-                                        fma.raw_Dec_offset.bestfit
-                                        * pxsc_arcsec,  # arcsec
-                                        fma.raw_Dec_offset.error
-                                        * pxsc_arcsec,  # arcsec
-                                        flux_jy,
-                                        flux_jy_err,
-                                        flux_si,
-                                        flux_si_err,
-                                        flux_si_alt,
-                                        flux_si_alt_err,
-                                        fma.raw_flux.bestfit * guess_flux,
-                                        fma.raw_flux.error * guess_flux,
-                                        delmag,  # mag
-                                        delmag_err,  # mag
-                                        appmag,  # mag
-                                        appmag_err,  # mag
-                                        mstar[filt],  # mag
-                                        mstar_err_temp,  # mag
-                                        np.nan,
-                                        np.nan,
-                                        scale_factor_avg,
-                                        tp_comsubst,
-                                        fitsfile,
-                                    )
-                                )
-
-                            # Write the FM PSF to a file for future plotting.
-                            ut.write_fitpsf_images(fma, fitsfile, tab[-1])
-
-                        # Nested sampling.
-                        elif fitmethod == "nested":
-                            output_dir_ns = os.path.join(
-                                output_dir_comp, "temp-multinest/"
-                            )
-
-                            # Initialize PlanetEvidence module.
-                            try:
-                                fit = fitpsf.PlanetEvidence(
-                                    guess_sep, guess_pa, boxsize, output_dir_ns
-                                )
-                            except ModuleNotFoundError:
-                                raise ModuleNotFoundError(
-                                    'Pymultinest is not installed, try\n"conda install -c conda-forge pymultinest"'
-                                )
-                            log.info("  --> Initialized PlanetEvidence module")
-
-                            # Generate FM and data stamps.
-                            fit.generate_fm_stamp(
-                                fm_frame, [fm_centx, fm_centy], padding=5
-                            )
-                            fit.generate_data_stamp(
-                                data_frame,
-                                [data_centx, data_centy],
-                                dr=dr,
-                                exclusion_radius=exclr,
-                            )
-                            log.info("  --> Generated FM and data stamps")
-
-                            # Set fit kernel.
-                            corr_len_label = "l"
-                            fit.set_kernel(
-                                fitkernel, [corr_len_guess], [corr_len_label]
-                            )
-                            log.info("  --> Set fit kernel to " + fitkernel)
-
-                            # Set fit bounds.
-                            fit.set_bounds(xrange, yrange, frange, [corr_len_range])
-                            log.info("  --> Set fit bounds")
-
-                            # Run the pymultinest fit.
-                            fit.multifit()
-                            log.info("  --> Finished pymultinest fit")
-
-                            # Get model evidence and posteriors.
-                            evidence = fit.fit_stats()
-                            fm_evidence = evidence[0][
-                                "nested sampling global log-evidence"
-                            ]  # FM evidence
-                            fm_posteriors = evidence[0]["marginals"]  # FM posteriors
-                            null_evidence = evidence[1][
-                                "nested sampling global log-evidence"
-                            ]  # null evidence
-                            null_posteriors = evidence[1][
-                                "marginals"
-                            ]  # null posteriors
-                            evidence_ratio = fm_evidence - null_evidence
-
-                            # Plot the pymultinest fit results.
-                            H1, H0 = fit.fit_plots()
-                            if save_figures:
-                                path = os.path.join(
-                                    output_dir_comp,
-                                    mode
-                                    + "_NANNU"
-                                    + str(annuli)
-                                    + "_NSUBS"
-                                    + str(subsections)
-                                    + "_"
-                                    + key
-                                    + "-corner_c%.0f" % (k + 1)
-                                    + ".pdf",
-                                )
-                                H1.savefig(path)
-                                path = os.path.join(
-                                    output_dir_comp,
-                                    mode
-                                    + "_NANNU"
-                                    + str(annuli)
-                                    + "_NSUBS"
-                                    + str(subsections)
-                                    + "_"
-                                    + key
-                                    + "-noise_corner_c%.0f" % (k + 1)
-                                    + ".pdf",
-                                )
-                                H0.savefig(path)
-                            plt.show()
-                            plt.close(H1)
-                            plt.close(H0)
-
-                            fig, _ = fit.fm_residuals()
-                            if save_figures:
-                                path = os.path.join(
-                                    output_dir_comp,
-                                    mode
-                                    + "_NANNU"
-                                    + str(annuli)
-                                    + "_NSUBS"
-                                    + str(subsections)
-                                    + "_"
-                                    + key
-                                    + "-model_c%.0f" % (k + 1)
-                                    + ".pdf",
-                                )
-                                plt.savefig(path)
-                            plt.show()
-                            plt.close(fig)
-
-                            # Write the pymultinest fit results into a table.
-                            flux_jy = fit.fit_flux.bestfit * guess_flux
-                            flux_jy *= fzero[filt] / 10 ** (mstar[filt] / 2.5)  # Jy
-                            flux_jy_err = fit.fit_flux.error * guess_flux
-                            flux_jy_err *= fzero[filt] / 10 ** (mstar[filt] / 2.5)  # Jy
-                            flux_si = fit.fit_flux.bestfit * guess_flux
-                            flux_si *= fzero_si[filt] / 10 ** (
-                                mstar[filt] / 2.5
-                            )  # erg/cm^2/s/A
-                            flux_si *= 1e-7 * 1e4 * 1e4  # W/m^2/um
-                            flux_si_err = fit.fit_flux.error * guess_flux
-                            flux_si_err *= fzero_si[filt] / 10 ** (
-                                mstar[filt] / 2.5
-                            )  # erg/cm^2/s/A
-                            flux_si_err *= 1e-7 * 1e4 * 1e4  # W/m^2/um
-                            flux_si_alt = (
-                                flux_jy
-                                * 1e-26
-                                * 299792458.0
-                                / (1e-6 * self.database.red[key]["CWAVEL"][j]) ** 2
-                                * 1e-6
-                            )  # W/m^2/um
-                            flux_si_alt_err = (
-                                flux_jy_err
-                                * 1e-26
-                                * 299792458.0
-                                / (1e-6 * self.database.red[key]["CWAVEL"][j]) ** 2
-                                * 1e-6
-                            )  # W/m^2/um
-                            delmag = -2.5 * np.log10(
-                                fit.fit_flux.bestfit * guess_flux
-                            )  # mag
-                            delmag_err = (
-                                2.5
-                                / np.log(10.0)
-                                * fit.fit_flux.error
-                                / fit.fit_flux.bestfit
-                            )  # mag
-                            if isinstance(mstar_err, dict):
-                                mstar_err_temp = mstar_err[filt]
-                            else:
-                                mstar_err_temp = mstar_err
-                            appmag = mstar[filt] + delmag  # vegamag
-                            appmag_err = np.sqrt(mstar_err_temp**2 + delmag_err**2)
-                            fitsfile = os.path.join(
-                                output_dir_comp,
-                                mode
-                                + "_NANNU"
-                                + str(annuli)
-                                + "_NSUBS"
-                                + str(subsections)
-                                + "_"
-                                + key
-                                + "-fitpsf_c%.0f" % (k + 1)
-                                + ".fits",
-                            )
-                            tab.add_row(
-                                (
-                                    k + 1,
-                                    -(fit.fit_x.bestfit - data_centx)
-                                    * pxsc_arcsec,  # arcsec
-                                    fit.fit_x.error * pxsc_arcsec,  # arcsec
-                                    (fit.fit_y.bestfit - data_centy)
-                                    * pxsc_arcsec,  # arcsec
-                                    fit.fit_y.error * pxsc_arcsec,  # arcsec
-                                    flux_jy,
-                                    flux_jy_err,
-                                    flux_si,
-                                    flux_si_err,
-                                    flux_si_alt,
-                                    flux_si_alt_err,
-                                    fit.fit_flux.bestfit * guess_flux,
-                                    fit.fit_flux.error * guess_flux,
-                                    delmag,  # mag
-                                    delmag_err,  # mag
-                                    appmag,  # mag
-                                    appmag_err,  # mag
-                                    mstar[filt],  # mag
-                                    mstar_err_temp,  # mag
-                                    np.nan,
-                                    evidence_ratio,
-                                    scale_factor_avg,
-                                    tp_comsubst,
-                                    fitsfile,
-                                )
-                            )
-
-                            # Write the FM PSF to a file for future plotting.
-                            ut.write_fitpsf_images(fit, fitsfile, tab[-1])
-
-                        # Otherwise.
-                        else:
-                            if split_fit:
-                                # Mocking the MCMC fit results using the initial guesses and perform only the Gaussian fit.
-                                log.info(
-                                    "  --> Skipping  mcmc and pymultinest fit, just fitting for extended source."
-                                )
-                                # Initialize pyKLIP FMAstrometry class.
-                                fma = fitpsf.FMAstrometry(
-                                    guess_sep=guess_sep,
-                                    guess_pa=guess_pa,
-                                    fitboxsize=boxsize,
-                                )
-                                fma.generate_fm_stamp(
-                                    fm_image=fm_frame,
-                                    fm_center=[fm_centx, fm_centy],
-                                    padding=5,
-                                )
-                                fma.generate_data_stamp(
-                                    data=data_frame,
-                                    data_center=[data_centx, data_centy],
-                                    dr=dr,
-                                    exclusion_radius=exclr,
-                                )
-
-                                fma.fit_flux = fitpsf.ParamRange(1, [0, 0])
-                                fma.fit_x = fitpsf.ParamRange(
-                                    fma.data_stamp_x_center, [0, 0]
-                                )
-                                fma.fit_y = fitpsf.ParamRange(
-                                    fma.data_stamp_y_center, [0, 0]
-                                )
-                                fma.raw_RA_offset = fitpsf.ParamRange(
-                                    -(fma.fit_x.bestfit - fma.data_center[0]),
-                                    fma.fit_x.error_2sided[::-1],
-                                )
-                                fma.raw_Dec_offset = fitpsf.ParamRange(
-                                    fma.fit_y.bestfit - fma.data_center[1],
-                                    fma.fit_y.error_2sided[::-1],
-                                )
-                                fma.raw_flux = fma.fit_flux
-
-                                flux_jy = fma.fit_flux.bestfit * guess_flux
-                                flux_jy *= fzero[filt] / 10 ** (mstar[filt] / 2.5)  # Jy
-                                flux_jy_err = fma.fit_flux.error * guess_flux
-                                flux_jy_err *= fzero[filt] / 10 ** (
-                                    mstar[filt] / 2.5
-                                )  # Jy
-                                flux_si = fma.fit_flux.bestfit * guess_flux
-                                flux_si *= fzero_si[filt] / 10 ** (
-                                    mstar[filt] / 2.5
-                                )  # erg/cm^2/s/A
-                                flux_si *= 1e-7 * 1e4 * 1e4  # W/m^2/um
-                                flux_si_err = fma.fit_flux.error * guess_flux
-                                flux_si_err *= fzero_si[filt] / 10 ** (
-                                    mstar[filt] / 2.5
-                                )  # erg/cm^2/s/A
-                                flux_si_err *= 1e-7 * 1e4 * 1e4  # W/m^2/um
-                                flux_si_alt = (
-                                    flux_jy
-                                    * 1e-26
-                                    * 299792458.0
-                                    / (1e-6 * self.database.red[key]["CWAVEL"][j]) ** 2
-                                    * 1e-6
-                                )  # W/m^2/um
-                                flux_si_alt_err = (
-                                    flux_jy_err
-                                    * 1e-26
-                                    * 299792458.0
-                                    / (1e-6 * self.database.red[key]["CWAVEL"][j]) ** 2
-                                    * 1e-6
-                                )  # W/m^2/um
-                                delmag = -2.5 * np.log10(
-                                    fma.fit_flux.bestfit * guess_flux
-                                )  # mag
-                                delmag_err = (
-                                    2.5
-                                    / np.log(10.0)
-                                    * fma.fit_flux.error
-                                    / fma.fit_flux.bestfit
-                                )  # mag
-                                if isinstance(mstar_err, dict):
-                                    mstar_err_temp = mstar_err[filt]
-                                else:
-                                    mstar_err_temp = mstar_err
-                                appmag = mstar[filt] + delmag  # vegamag
-                                appmag_err = np.sqrt(mstar_err_temp**2 + delmag_err**2)
-                                fitsfile = os.path.join(
-                                    output_dir_comp,
-                                    mode
-                                    + "_NANNU"
-                                    + str(annuli)
-                                    + "_NSUBS"
-                                    + str(subsections)
-                                    + "_"
-                                    + key
-                                    + "-fitpsf_c%.0f" % (k + 1)
-                                    + ".fits",
-                                )
-
-                                # fit the sources with a 2D gaussian only to evaluate the sigma_x, sigma_y and theta
-                                fig, result = best_convfit_and_residuals(
-                                    fma,
-                                    minmethod=minmethod,
-                                    initial_params=gauss_param_guesses,
-                                )
-
-                                if save_figures:
-                                    path = os.path.join(
-                                        output_dir_comp,
-                                        mode
-                                        + "_NANNU"
-                                        + str(annuli)
-                                        + "_NSUBS"
-                                        + str(subsections)
-                                        + "_"
-                                        + key
-                                        + "-model_conv_c%.0f" % (k + 1)
-                                        + ".pdf",
-                                    )
-                                    fig.suptitle(
-                                        mode
-                                        + "_NANNU"
-                                        + str(annuli)
-                                        + "_NSUBS"
-                                        + str(subsections)
-                                        + "_"
-                                        + key
-                                    )
-                                    fig.savefig(path)
-                                plt.show()
-                                plt.close(fig)
-
-                                tab.add_row(
-                                    (
-                                        k + 1,
-                                        fma.raw_RA_offset.bestfit
-                                        * pxsc_arcsec,  # arcsec
-                                        fma.raw_RA_offset.error * pxsc_arcsec,  # arcsec
-                                        fma.raw_Dec_offset.bestfit
-                                        * pxsc_arcsec,  # arcsec
-                                        fma.raw_Dec_offset.error
-                                        * pxsc_arcsec,  # arcsec
-                                        flux_jy,
-                                        flux_jy_err,
-                                        flux_si,
-                                        flux_si_err,
-                                        flux_si_alt,
-                                        flux_si_alt_err,
-                                        fma.raw_flux.bestfit * guess_flux,
-                                        fma.raw_flux.error * guess_flux,
-                                        delmag,  # mag
-                                        delmag_err,  # mag
-                                        appmag,  # mag
-                                        appmag_err,  # mag
-                                        mstar[filt],  # mag
-                                        mstar_err_temp,  # mag
-                                        np.nan,
-                                        np.nan,
-                                        scale_factor_avg,
-                                        tp_comsubst,
-                                        fitsfile,
-                                        result.x[3],
-                                        np.nan,
-                                        result.x[0],
-                                        np.nan,
-                                        result.x[1],
-                                        np.nan,
-                                        result.x[2],
-                                        np.nan,
-                                    )
-                                )
-                            else:
-                                raise NotImplementedError()
-
-                        # Plot estimated background level.
-                        if remove_background:
-                            f, ax = plt.subplots(1, 4, figsize=(4 * 6.4, 4.8))
-                            p0 = ax[0].imshow(res, origin="lower")
-                            c0 = plt.colorbar(p0, ax=ax[0])
-                            c0.set_label(
-                                "Flux (arbitrary units)", rotation=270, labelpad=20
-                            )
-                            text = ax[0].text(
-                                0.99,
-                                0.99,
-                                "Contrast = %.3e" % con,
-                                ha="right",
-                                va="top",
-                                transform=ax[0].transAxes,
-                            )
-                            text.set_path_effects(
-                                [
-                                    PathEffects.withStroke(
-                                        linewidth=3, foreground="white"
-                                    )
-                                ]
-                            )
-                            ax[0].set_title("Residuals before bg. subtraction")
-                            p1 = ax[1].imshow(
-                                np.abs(psf_shift) < thresh, origin="lower"
-                            )
-                            c1 = plt.colorbar(p1, ax=ax[1])
-                            ax[1].set_title("Pixels used for bg. estimation")
-                            ax[2].hist(stamp[np.abs(psf_shift) < thresh], bins=20)
-                            ax[2].axvline(
-                                bg, ls="--", color="black", label="bg. = %.2f" % bg
-                            )
-                            ax[2].set_xlabel("Pixel value")
-                            ax[2].set_ylabel("Occurrence")
-                            ax[2].legend(loc="upper right")
-                            ax[2].set_title("Distribution of bg. pixels")
-                            con = fma.fit_flux.bestfit * guess_flux
-                            res = stamp - fma.fit_flux.bestfit * psf_shift
-                            imgs = ax[0].get_images()
-                            if len(imgs) > 0:
-                                vmin, vmax = imgs[0].get_clim()
-                            p3 = ax[3].imshow(res, origin="lower", vmin=vmin, vmax=vmax)
-                            c3 = plt.colorbar(p3, ax=ax[3])
-                            c3.set_label(
-                                "Flux (arbitrary units)", rotation=270, labelpad=20
-                            )
-                            text = ax[3].text(
-                                0.99,
-                                0.99,
-                                "Contrast = %.3e" % con,
-                                ha="right",
-                                va="top",
-                                transform=ax[3].transAxes,
-                            )
-                            text.set_path_effects(
-                                [
-                                    PathEffects.withStroke(
-                                        linewidth=3, foreground="white"
-                                    )
-                                ]
-                            )
-                            ax[3].set_title("Residuals after bg. subtraction")
-                            plt.show()
-                            if save_figures:
-                                path = os.path.join(
-                                    output_dir_comp,
-                                    mode
-                                    + "_NANNU"
-                                    + str(annuli)
-                                    + "_NSUBS"
-                                    + str(subsections)
-                                    + "_"
-                                    + key
-                                    + "-bgest_c%.0f" % (k + 1)
-                                    + ".pdf",
-                                )
-                                plt.savefig(path)
-                                log.info(f" Plot saved in {path}")
-                                plt.close()
-
-                    # Subtract companion before fitting the next one.
-                    if subtract or inject:
-                        # Subtract companion from pyKLIP dataset. Use offset
-                        # PSFs w/o high-pass filtering because this will be
-                        # applied by the klip_dataset routine below.
-                        if inject:
-                            ra = companions[k][0]  # arcsec
-                            dec = companions[k][1]  # arcsec
-                            con = companions[k][2]
-                            inputflux = con * np.array(
-                                all_offsetpsfs_nohpf
-                            )  # positive to inject companion
-                            fileprefix = (
-                                "INJECTED-"
-                                + mode
-                                + "_NANNU"
-                                + str(annuli)
-                                + "_NSUBS"
-                                + str(subsections)
-                                + "_"
-                                + key
-                            )
-                        else:
-                            ra = tab[-1]["RA"]  # arcsec
-                            dec = tab[-1]["DEC"]  # arcsec
-                            con = tab[-1]["CON"]
-                            inputflux = -con * np.array(
-                                all_offsetpsfs_nohpf
-                            )  # negative to remove companion
-                            fileprefix = (
-                                "KILLED-"
-                                + mode
-                                + "_NANNU"
-                                + str(annuli)
-                                + "_NSUBS"
-                                + str(subsections)
-                                + "_"
-                                + key
-                            )
-                        sep = np.sqrt(ra**2 + dec**2) / pxsc_arcsec  # pix
-                        pa = np.rad2deg(np.arctan2(ra, dec))  # deg
-                        thetas = [pa + 90.0 - all_pa for all_pa in all_pas]
-                        fakes.inject_planet(
-                            frames=dataset_orig.input,
-                            centers=dataset_orig.centers,
-                            inputflux=inputflux,
-                            astr_hdrs=dataset_orig.wcs,
-                            radius=sep,
-                            pa=pa,
-                            thetas=np.array(thetas),
-                            field_dependent_correction=None,
-                        )
-
-                        if save_preklip:
-                            # Copy pre-KLIP files.
-                            for filepath in filepaths:
-                                src = filepath
-                                dst = os.path.join(output_dir_pk, os.path.split(src)[1])
-                                shutil.copy(src, dst)
-                            for psflib_filepath in psflib_filepaths:
-                                src = psflib_filepath
-                                dst = os.path.join(output_dir_pk, os.path.split(src)[1])
-                                shutil.copy(src, dst)
-
-                            # Update content of pre-KLIP files.
-                            filenames = dataset_orig.filenames.copy()
-                            for l, filename in enumerate(filenames):
-                                filenames[l] = filename[: filename.find("_INT")]
-                            for filepath in filepaths:
-                                ww_file = filenames == os.path.split(filepath)[1]
-                                file = os.path.join(
-                                    output_dir_pk, os.path.split(filepath)[1]
-                                )
-                                hdul = fits.open(file)
-                                hdul["SCI"].data = dataset_orig.input[ww_file]
-                                hdul.writeto(file, output_verify="fix", overwrite=True)
-                                hdul.close()
-
-                            # Update and write observations database.
-                            temp = self.database.obs.copy()
-                            for l in range(len(self.database.obs[key])):
-                                file = os.path.split(
-                                    self.database.obs[key]["FITSFILE"][l]
-                                )[1]
-                                self.database.obs[key]["FITSFILE"][l] = os.path.join(
-                                    output_dir_pk, file
-                                )
-                            file = os.path.split(self.database.red[key]["FITSFILE"][j])[
-                                1
-                            ]
-                            file = file[file.find("JWST") : file.find("-KLmodes-all")]
-                            file = os.path.join(output_dir_fm, file + ".dat")
-                            self.database.obs[key].write(
-                                file, format="ascii", overwrite=True
-                            )
-                            self.database.obs = temp
-
-                        # Reduce companion-subtracted data.
-                        mode = self.database.red[key]["MODE"][j]
-                        annuli = self.database.red[key]["ANNULI"][j]
-                        subsections = self.database.red[key]["SUBSECTS"][j]
-                        parallelized.klip_dataset(
-                            dataset=dataset_orig,
-                            mode=mode,
-                            outputdir=output_dir_fm,
-                            fileprefix=fileprefix,
-                            annuli=annuli,
-                            subsections=subsections,
-                            movement=1.0,
-                            numbasis=klmodes,
-                            maxnumbasis=maxnumbasis,
-                            calibrate_flux=False,
-                            aligned_center=dataset_orig._centers[0],
-                            psf_library=dataset_orig.psflib,
-                            highpass=highpass_temp,
-                            verbose=False,
-                        )
-                        head = fits.getheader(self.database.red[key]["FITSFILE"][j], 0)
-                        temp = os.path.join(
-                            output_dir_fm, fileprefix + "-KLmodes-all.fits"
-                        )
-                        hdul = fits.open(temp)
-                        hdul[0].header = head
-                        hdul.writeto(temp, output_verify="fix", overwrite=True)
-                        hdul.close()
-
-                    # Restore original pyKLIP dataset.
-                    if subtract:
-                        dataset = dataset_orig
-
-                # Update source database.
-                self.database.update_src(key, j, tab)
-
-                # Save the results table.
-                output_ecsv_path = os.path.join(
-                    output_dir_comp,
-                    mode
-                    + "_NANNU"
-                    + str(annuli)
-                    + "_NSUBS"
-                    + str(subsections)
-                    + "_"
-                    + key
-                    + "-results_c%.0f" % (k + 1)
-                    + ".ecsv",
-                )
-                tab.write(output_ecsv_path, format="ascii.ecsv", overwrite=True)
-                print(f"Table saved to {output_ecsv_path}")
-        pass
-
-
-def loss_function(params, offset_psf, target_array):
-    """
-    Loss function for the minimization process in fit_for_extended_sources.
-    """
-    sigma_x, sigma_y, theta_degrees, scale = params
-    kernel = gaussian_kernel(
-        sigma_x=sigma_x, sigma_y=sigma_y, theta_degrees=theta_degrees, n=6
-    )
-    convolved_image = convolve(offset_psf * 10**scale, kernel)
-
-    # mse = np.nanmean((target_array - convolved_image) ** 2)
-    mse = np.nanmean((target_array - convolved_image) ** 2 * (target_array))
-    return mse
-
-
-def best_convfit_and_residuals(
-    fma, minmethod="Powell", bounds=None, initial_params=None, fig=None
-):
-    """
-    Fit the companion with a 2D Gaussian using a minimization algorithm and evaluate the sigma_x, sigma_y and theta.
-    Then, generate a plot of the best fit FM compared with the data_stamp and also the residuals
-
-    Parameters
-    ----------
-    fma: fitpsf.FMAstrometry
-        FMAstronomy object with the desired properties
-    method: str
-        Minimization method. Default is 'Powell'.
-    bounds: list of 2-D arrays.
-        list of 3 elements, containing the min, max values for the sigma_x, sigma_y and theta_degrees parameters
-        for the 2-D gaussian kernel. Default is None.
-    initial_params: list of floats
-        list of initial guesses for the sigma_x, sigma_y and theta_degrees parameters
-        for the 2-D gaussian kernel. Default is None.
-    fig: matplotlib.Figure
-        if not None, a matplotlib Figure object, function will make a new one. Default is None.
-
-
-    Returns
-    -------
-    fig: matplotlib.Figure
-        the Figure object. If input fig is None, function will make a new one
-    result: array
-        Array containing the fitted  parameters from the minimization process
-    """
-    if fig is None:
-        fig = plt.figure(figsize=(12, 4))
-
-    # create best fit FM
-    dx = fma.fit_x.bestfit - fma.data_stamp_x_center
-    dy = fma.fit_y.bestfit - fma.data_stamp_y_center
-
-    fm_bestfit = fma.fit_flux.bestfit * sinterp.shift(fma.fm_stamp, [dy, dx])
-
-    if fma.padding > 0:
-        fm_bestfit = fm_bestfit[fma.padding : -fma.padding, fma.padding : -fma.padding]
-
-    if minmethod is not None:
-        result = estimate_extended(
-            fma.data_stamp,
-            fm_bestfit,
-            bounds=bounds,
-            initial_params=initial_params,
-            method=minmethod,
-        )
-        # Convolve the PSF by a 2D gaussian
-        kernel = gaussian_kernel(
-            sigma_x=result.x[0], sigma_y=result.x[1], theta_degrees=result.x[2], n=6
-        )
-        fm_bestfit_convolved = convolve(fm_bestfit * 10 ** result.x[3], kernel)
-    else:
-        result = None
-        # Convolve the PSF by a 2D gaussian
-        kernel = gaussian_kernel(
-            sigma_x=fma.fit_sigma_x.bestfit,
-            sigma_y=fma.fit_sigma_y.bestfit,
-            theta_degrees=fma.fit_theta.bestfit,
-            n=6,
-        )
-        fm_bestfit_convolved = convolve(fm_bestfit * fma.fit_flux.bestfit, kernel)
-
-    # make residual map
-    residual_map = fma.data_stamp - fm_bestfit_convolved
-
-    # normalize all images to same scale
-    colornorm = matplotlib.colors.Normalize(
-        vmin=np.nanpercentile(fma.data_stamp, 0.03),
-        vmax=np.nanpercentile(fma.data_stamp, 99.7),
-    )
-
-    # plot the data_stamp
-    ax1 = fig.add_subplot(131)
-    im1 = ax1.imshow(
-        fma.data_stamp, interpolation="nearest", cmap="cubehelix", norm=colornorm
-    )
-    ax1.invert_yaxis()
-    ax1.set_title("Data")
-    ax1.set_xlabel("X (pixels)")
-    ax1.set_ylabel("Y (pixels)")
-
-    ax2 = fig.add_subplot(132)
-    im2 = ax2.imshow(
-        fm_bestfit_convolved, interpolation="nearest", cmap="cubehelix", norm=colornorm
-    )
-    ax2.invert_yaxis()
-    ax2.set_title("Best-fit Model convolved\nby a 2D Gaussian")
-    ax2.set_xlabel("X (pixels)")
-
-    ax3 = fig.add_subplot(133)
-    im3 = ax3.imshow(
-        residual_map, interpolation="nearest", cmap="cubehelix", norm=colornorm
-    )
-    ax3.invert_yaxis()
-    ax3.set_title("Residuals")
-    ax3.set_xlabel("X (pixels)")
-
-    fig.subplots_adjust(right=0.82)
-    fig.subplots_adjust(hspace=0.4)
-    ax_pos = ax3.get_position()
-
-    cbar_ax = fig.add_axes([0.84, ax_pos.y0, 0.02, ax_pos.height])
-    cb = fig.colorbar(im1, cax=cbar_ax)
-    cb.set_label("Counts (DN)")
-
-    return fig, result
-
-
-def estimate_extended(
-    target, offset_psf, bounds=None, initial_params=None, method="Powell"
-):
-    """
-    Fit for extended sources with a 2D gaussian kernel.
-
-    Parameters
-    ----------
-    target: 2-D array.
-        The target tile containing the companion to be fitted.
-    offset_psf: 2-D array.
-        The PSF of the companion to be used for the fit.
-    bounds: list of 2-D arrays.
-        list of 3 elements, containing the min, max values for the sigma_x, sigma_y and theta_degrees parameters
-        for the 2-D gaussian kernel. If None, use default bounds = [(0.01, 20),(0.01, 20),(-180, 180)]
-    initial_params: list of floats
-        list of initial guesses for the sigma_x, sigma_y and theta_degrees parameters
-        for the 2-D gaussian kernel. If None, use default initial_params = [0.1, 0.1, 0]
-    method: str
-        Minimization method. Default is 'Powell'.
-
-    Returns
-    -------
-    result: array
-        Array containing the fitted  parameters from the minimization process
-
-    """
-    if initial_params is None:
-        initial_params = [0.1, 0.1, 0, 0]
-
-    if bounds is None:
-        # Bounds for parameters (sigma_x, sigma_y, theta, intensity)
-        bounds = [
-            (0.01, 5),  # sigma_x should be positive and within a reasonable range
-            (0.01, 5),  # sigma_y should be positive and within a reasonable range
-            (-180, 180),  # theta should be between -180 and 180 degrees
-            (-1, 1),
-        ]  # log flux range should be positive and within a reasonable range
-
-    # Use partial to pass target_array as a fixed argument to the loss function
-    loss_with_target = partial(
-        loss_function, offset_psf=offset_psf, target_array=target
-    )
-    result = minimize(loss_with_target, initial_params, method=method, bounds=bounds)
-    return result
-
-
-def inject_and_recover(
-    raw_dataset,
-    injection_psf,
-    injection_seps,
-    injection_pas,
-    injection_spacing,
-    injection_fluxes,
-    klip_args,
-    retrieve_fwhm,
-    true_companions=None,
-):
-    """
-    Function to inject synthetic PSFs into a pyKLIP dataset, then perform
-    KLIP subtraction, then calculate the flux losses from the KLIP process.
-
-    Parameters
-    ----------
-    raw_dataset : pyKLIP dataset
-        A pyKLIP dataset which companions will be injected into and KLIP
-        will be performed on.
-    injection_psf : 2D-array
-        The PSF of the companion to be injected.
-    injection_seps : 1D-array
-        List of separations to inject companions at (pixels).
-    injection_pas : 1D-array
-        List of position angles to inject companions at (degrees).
-    injection_spacing : int, None
-        Spacing between companions injected in a single image. If companions
-        are too close then it can pollute the recovered flux. Set to 'None'
-        to inject only one companion at a time (pixels).
-    injection_fluxes : 1D-array
-        Same size as injection_seps, units should correspond to the image
-        units. This is the *peak* flux of the injection.
-    klip_args : dict
-        Arguments to be passed into the KLIP subtraction process
-    retrieve_fwhm : float
-        Full-Width Half-Maximum value to estimate the 2D gaussian fit when
-        retrieving the companion fluxes.
-    true_companions : list of list of three float, optional
-        List of real companions to be masked before computing the raw contrast.
-        For each companion, there should be a three element list containing
-        [RA offset (pixels), Dec offset (pixels), mask radius (pixels)].
-        The default is None.
-
-    Returns
-    -------
-    all_seps : np.array
-        Array containing the separations of all injected
-        companions across all images.
-    all_pas : np.array
-        Array containing the position angles of all injected
-        companions across all images.
-    all_inj_fluxes : np.array
-        Array containing the injected peak fluxes of all injected
-        companions across all images.
-    all_retr_fluxes : np.array
-        Array containing the retrieved peak fluxes of all injected
-        companions across all images.
-    """
-
-    # Initialise some arrays and quantities
-    Nsep = len(injection_seps)
-    Npa = len(injection_pas)
-    list_of_injected = []
-    all_injected = False
-    all_seps = []
-    all_pas = []
-    all_inj_fluxes = []
-    all_retr_fluxes = []
-
-    # Ensure provided PSF is normalised to a peak intensity of 1
-    injection_psf_norm = injection_psf / np.max(injection_psf)
-
-    # Don't want to inject near any known companions, eliminate any
-    # of these positions straight away.
-    if true_companions is not None:
-        for tcomp in true_companions:
-            tcomp_ra, tcomp_de, tcomp_rad = tcomp
-            for i in range(Nsep):
-                for j in range(Npa):
-                    pos_id = i * Npa + j
-                    # Convert position to x-y (RA-DEC) offset in pixels
-                    inj_ra = injection_seps[i] * np.sin(
-                        np.deg2rad(injection_pas[j])
-                    )  # pixels
-                    inj_de = injection_seps[i] * np.cos(
-                        np.deg2rad(injection_pas[j])
-                    )  # pixels
-                    # Calculate distance to companion
-                    dist = np.sqrt((tcomp_ra - inj_ra) ** 2 + (tcomp_de - inj_de) ** 2)
-                    # Check if too close, if so, lie to the code and say its already injected
-                    if dist < tcomp_rad:
-                        list_of_injected += [pos_id]
-    if len(list_of_injected) != 0:
-        log.info(
-            "--> {}/{} source positions not suitable for injection.".format(
-                len(list_of_injected), Nsep * Npa
-            )
-        )
-    else:
-        log.info(
-            "--> All {} source positions suitable for injection.".format(Nsep * Npa)
-        )
-
-    # Want to keep going until a companion has been injected and recovered
-    # at each given separation and position angle.
-    counter = 1
-    remaining_to_inject = (Nsep * Npa) - len(list_of_injected)
-    with trange(remaining_to_inject, position=0, leave=True) as t:
-        while all_injected == False:
-            # Make a copy of the dataset
-            dataset = copy.deepcopy(raw_dataset)
-            # Define array to keep track of currently injected positions
-            current_injected = []
-            # Loop over separations
-            for i in range(Nsep):
-                new_sep = injection_seps[i]
-                new_flux = injection_fluxes[i]
-                # Loop over position angles
-                for j in range(Npa):
-                    new_pa = injection_pas[j]
-
-                    # Get specific id for this position
-                    pos_id = i * Npa + j
-                    if pos_id in list_of_injected:
-                        # Already injected at this position, skip
-                        continue
-
-                    # Need to check if this position is too close to already
-                    # injected positions. By default, assume we want to inject.
-                    inject_flag = True
-                    for inj_id in current_injected:
-                        # If we don't want to inject more than one companion
-                        # per image, then flag to not inject.
-                        if injection_spacing == None:
-                            inject_flag = False
-                            break
-
-                        # Get separation and PA for injected position
-                        inj_j = inj_id % Npa
-                        inj_i = (inj_id - inj_j) // Npa
-                        inj_sep = injection_seps[inj_i]
-                        inj_pa = injection_pas[inj_j]
-                        inj_flux = injection_fluxes[inj_i]
-
-                        # If something was injected close to the coronagraph
-                        # don't inject anything else in this image.
-                        if inj_sep < 5:
-                            inject_flag = False
-                            break
-
-                        # Calculate distance between this injected position
-                        # and the new position we'd also like to inject at.
-                        # If object is too close to something that's already
-                        # injected, we don't want to inject.
-                        dist = np.sqrt(
-                            new_sep**2
-                            + inj_sep**2
-                            - 2
-                            * new_sep
-                            * inj_sep
-                            * np.cos(np.deg2rad(inj_pa - new_pa))
-                        )
-                        if dist < injection_spacing:
-                            inject_flag = False
-                            break
-
-                        # If the difference in fluxes is too large, don't inject
-                        # as this can really affect things.
-                        flux_factor = max(inj_flux, new_flux) / min(inj_flux, new_flux)
-                        if flux_factor > 10:
-                            inject_flag = False
-                            break
-
-                    # If this position survived the filtering, inject into images
-                    if inject_flag == True:
-                        # Mark as injected in this dataset and overall.
-                        current_injected += [pos_id]
-                        list_of_injected += [pos_id]
-
-                        # Injected PSF needs to be a 3D array that matches dataset
-                        inj_psf_3d = np.array(
-                            [
-                                injection_psf_norm * new_flux
-                                for k in range(dataset.input.shape[0])
-                            ]
-                        )
-
-                        # Inject the PSF
-                        fakes.inject_planet(
-                            frames=dataset.input,
-                            centers=dataset.centers,
-                            inputflux=inj_psf_3d,
-                            astr_hdrs=dataset.wcs,
-                            radius=new_sep,
-                            pa=new_pa,
-                            stampsize=65,
-                        )
-
-            # Figure out how many sources were injected
-            Ninjected = len(current_injected)
-            t.update(Ninjected)
-
-            # Reroute KLIP printing for our own progress bar
-            original_stdout = sys.stdout
-            original_stderr = sys.stderr
-            sys.stdout = StringIO()
-            sys.stderr = StringIO()
-
-            # Still in the while loop, need to run KLIP on the dataset we
-            # have injected companions into.
-            fileprefix = "INJ_ITER{}_{}COMP".format(counter, Ninjected)
-            parallelized.klip_dataset(
-                dataset=dataset,
-                psf_library=dataset.psflib,
-                fileprefix=fileprefix,
-                **klip_args,
-            )
-
-            # Restore printing
-            sys.stdout = original_stdout
-            sys.stderr = original_stderr
-
-            # Now need to recover the flux by fitting a 2D Gaussian, mainly interested in the peak
-            # flux so this is an okay approximation. Could improve in the future.
-            klipped_file = klip_args["outputdir"] + fileprefix + "-KLmodes-all.fits"
-            with fits.open(klipped_file) as hdul:
-                klipped_data = hdul[0].data
-                frame_ids = range(klipped_data.shape[0])
-                centers = [
-                    [hdul[0].header["PSFCENTX"], hdul[0].header["PSFCENTY"]]
-                    for c in frame_ids
-                ]
-                # Get fluxes for all companions that were injected, for all KL modes used.
-                for inj_id in current_injected:
-                    inj_j = inj_id % Npa
-                    inj_i = (inj_id - inj_j) // Npa
-                    inj_sep = injection_seps[inj_i]
-                    inj_pa = injection_pas[inj_j]
-                    inj_flux = injection_fluxes[inj_i]
-
-                    # Need to loop over each KL mode individually due to pyKLIP subtleties,
-                    # basically the same as what pyKLIP would be doing anyway.
-                    retrieved_fluxes = []
-                    for img_i in range(klipped_data.shape[0]):
-                        retrieved_flux = fakes.retrieve_planet_flux(
-                            frames=klipped_data[img_i],
-                            centers=centers[img_i],
-                            astr_hdrs=dataset.output_wcs[0],
-                            sep=inj_sep,
-                            pa=inj_pa,
-                            searchrad=5,
-                            guessfwhm=retrieve_fwhm,
-                            guesspeak=inj_flux,
-                            refinefit=True,
-                        )
-                        retrieved_fluxes.append(retrieved_flux)
-                    retrieved_fluxes = np.array(
-                        retrieved_fluxes
-                    )  # Convert to numpy array
-
-                    # Flux should never be negative, if it is, assume ~=zero flux retrieved
-                    neg_mask = np.where(retrieved_fluxes < 0)
-                    retrieved_fluxes[neg_mask] = 1e-10
-
-                    # Need to save things to some arrays
-                    all_seps += [inj_sep]
-                    all_pas += [inj_pa]
-                    all_inj_fluxes += [inj_flux]
-                    all_retr_fluxes += [retrieved_fluxes]
-
-            # If a companion has been injected and retrieved at every input position then
-            # flag to exit the loop. If not increment the counter and continue.
-            if len(list_of_injected) == Nsep * Npa:
-                all_injected = True
-            else:
-                counter += 1
-
-    # Return as numpy arrays
-    all_seps = np.array(all_seps)
-    all_pas = np.array(all_pas)
-    all_inj_fluxes = np.array(all_inj_fluxes)
-    all_retr_fluxes = np.squeeze(all_retr_fluxes)
-
-    # Ensure dimensions are correct for all_retr_fluxes if # of different KL modes == 1
-    if all_retr_fluxes.ndim == 1:
-        all_retr_fluxes = all_retr_fluxes[:, np.newaxis]
-
-    return all_seps, all_pas, all_inj_fluxes, all_retr_fluxes
+#     x_rotated = x_coords[None, :, :] * cos_theta - y_coords[None, :, :] * sin_theta
+
+#     y_rotated = x_coords[None, :, :] * sin_theta + y_coords[None, :, :] * cos_theta
+
+#     return x_rotated, y_rotated
+
+
+# def evaluate_cross_occultation(
+#     x_coords_pix: np.ndarray,
+#     y_coords_pix: np.ndarray,
+#     wide_bar_width_pix: float,
+#     thin_bar_width_pix: float,
+#     inner_clear_radius_pix: float,
+# ) -> np.ndarray:
+#     """
+#     Evaluate analytic 4QPM occultation geometry.
+#     """
+#     half_wide = wide_bar_width_pix / 2.0
+#     half_thin = thin_bar_width_pix / 2.0
+
+#     radius_squared = x_coords_pix**2 + y_coords_pix**2
+
+#     central_clear_region = radius_squared < inner_clear_radius_pix**2
+
+#     vertical_wide = np.abs(x_coords_pix) <= half_wide
+#     horizontal_wide = np.abs(y_coords_pix) <= half_wide
+
+#     vertical_thin = np.abs(x_coords_pix) <= half_thin
+#     horizontal_thin = np.abs(y_coords_pix) <= half_thin
+
+#     occulted_region = (vertical_wide | horizontal_wide) & ~central_clear_region
+
+#     structural_cross = vertical_thin | horizontal_thin
+
+#     return occulted_region | structural_cross
+
+
+# # =============================================================================
+# # HIGH-LEVEL DOMAIN API
+# # =============================================================================
+
+
+# def generate_miri_4qpm_mask(
+#     detector_shape: Tuple[int, int],
+#     coronagraph_center_pix: Tuple[float, float],
+#     roll_reference_angles_deg: np.ndarray,
+#     upsample_factor: int = 1,
+#     padding_pix: int = 0,
+# ) -> np.ndarray:
+#     """
+#     Generate the MIRI 4QPM occultation mask analytically.
+
+#     Parameters
+#     ----------
+#     detector_shape
+#         Detector shape as (ny, nx).
+
+#     coronagraph_center_pix
+#         Coronagraph center coordinates as (x_center, y_center).
+
+#     roll_reference_angles_deg
+#         Telescope roll angles in degrees.
+
+#     upsample_factor
+#         Integer detector upsampling factor.
+
+#     Returns
+#     -------
+#     np.ndarray
+#         Float mask where occulted pixels are NaN.
+#     """
+#     if upsample_factor < 1:
+#         raise ValueError("upsample_factor must be >= 1")
+
+#     if np.any(~np.isfinite(roll_reference_angles_deg)):
+#         raise ValueError("roll_reference_angles_deg contains NaN or Inf values.")
+
+#     ny, nx = detector_shape
+
+#     # Here we're preserving the padding and upsampling
+#     padded_ny = ny + 2 * padding_pix
+#     padded_nx = nx + 2 * padding_pix
+
+#     x_center_pix, y_center_pix = coronagraph_center_pix
+#     x_center_pix += padding_pix
+#     y_center_pix += padding_pix
+
+#     sampled_ny = padded_ny * upsample_factor
+#     sampled_nx = padded_nx * upsample_factor
+
+#     y_coords_pix = (
+#         np.arange(sampled_ny, dtype=np.float32) / upsample_factor - y_center_pix
+#     )
+
+#     x_coords_pix = (
+#         np.arange(sampled_nx, dtype=np.float32) / upsample_factor - x_center_pix
+#     )
+
+#     x_grid_pix, y_grid_pix = np.meshgrid(
+#         x_coords_pix,
+#         y_coords_pix,
+#         indexing="xy",
+#         sparse=False,
+#     )
+
+#     rotation_angles_deg = (
+#         MIRI_ROTATION_REFERENCE_DEG
+#         - roll_reference_angles_deg
+#         + MIRI_4QPM_ROTATION_OFFSET_DEG
+#     )
+
+#     x_rotated_pix, y_rotated_pix = rotate_coordinates(
+#         x_grid_pix,
+#         y_grid_pix,
+#         rotation_angles_deg,
+#     )
+
+#     occultation_stack = evaluate_cross_occultation(
+#         x_coords_pix=x_rotated_pix,
+#         y_coords_pix=y_rotated_pix,
+#         wide_bar_width_pix=MIRI_4QPM_WIDE_BAR_WIDTH_PIX,
+#         thin_bar_width_pix=MIRI_4QPM_THIN_BAR_WIDTH_PIX,
+#         inner_clear_radius_pix=MIRI_4QPM_INNER_CLEAR_RADIUS_PIX,
+#     )
+
+#     combined_occultation = np.any(occultation_stack, axis=0)
+
+#     if upsample_factor > 1:
+#         combined_occultation = combined_occultation[
+#             ::upsample_factor,
+#             ::upsample_factor,
+#         ]
+
+#     combined_occultation = combined_occultation[
+#         padding_pix : padding_pix + ny,
+#         padding_pix : padding_pix + nx,
+#     ]
+
+#     final_mask = np.ones(
+#         detector_shape,
+#         dtype=np.float32,
+#     )
+
+#     final_mask[combined_occultation] = np.nan
+
+#     return set_surrounded_pixels(final_mask)
+
+
+# # =============================================================================
+# # HIGH-LEVEL Contrast calculation API
+# # =============================================================================
+# from typing import Optional
+
+
+# def calc_single_contrast_curve(
+#     normalized_frame: np.ndarray,
+#     spatial_resolution_pix: float,
+#     center_pix: tuple[float, float],
+#     inner_working_angle_pix: int | float,
+#     outer_working_angle_pix: int | float,
+#     coronagraph_transmission_mask: Optional[np.ndarray] = None,
+#     low_pass_filter: bool = False,
+# ) -> tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
+#     """Compute raw and throughput-corrected contrast curve for single detector frame"""
+
+#     separations_pix, raw_contrast = klip.meas_contrast(
+#         dat=normalized_frame,
+#         center=center_pix,
+#         iwa=inner_working_angle_pix,
+#         owa=outer_working_angle_pix,
+#         resolution=spatial_resolution_pix,
+#         low_pass_filter=low_pass_filter,
+#     )
+
+#     corrected_contrast = None
+#     if coronagraph_transmission_mask is not None:
+#         corrected_frame = normalized_frame / coronagraph_transmission_mask
+
+#         _, corrected_contrast = klip.meas_contrast(
+#             dat=corrected_frame,
+#             center=center_pix,
+#             iwa=inner_working_angle_pix,
+#             owa=outer_working_angle_pix,
+#             resolution=spatial_resolution_pix,
+#             low_pass_filter=low_pass_filter,
+#         )
+
+#     return (separations_pix, raw_contrast, corrected_contrast)
+
+
+# MIN_CORONAGRAPH_TRANSMISSION = 1e-12
+
+
+# def normalize_contrast_frame(
+#     frame_data: np.ndarray,
+#     normalization_factor: float,
+# ) -> np.ndarray:
+#     """
+#     Normalize detector frame into contrast units.
+#     """
+#     return frame_data * normalization_factor
+
+
+# def apply_throughput_correction(
+#     normalized_frame: np.ndarray,
+#     transmission_mask: np.ndarray,
+#     minimum_transmission: float = MIN_CORONAGRAPH_TRANSMISSION,
+# ) -> np.ndarray:
+#     """
+#     Apply bounded coronagraph throughput correction.
+
+#     Pixels below minimum transmission are masked to NaN.
+#     """
+#     corrected_frame = np.full_like(
+#         normalized_frame,
+#         np.nan,
+#         dtype=np.float32,
+#     )
+
+#     valid_transmission = transmission_mask >= minimum_transmission
+
+#     np.divide(
+#         normalized_frame,
+#         transmission_mask,
+#         out=corrected_frame,
+#         where=valid_transmission,
+#     )
+
+#     return corrected_frame
+
+
+# def compute_contrast_curves(
+#     data_cube: np.ndarray,
+#     pixel_area_sr: float,
+#     stellar_flux_peak: float,
+#     spatial_resolution_pix: float,
+#     center_pix: Tuple[float, float],
+#     inner_working_angle_pix: int | float = 1,
+#     outer_working_angle_pix: Optional[int | float] = None,
+#     coronagraph_transmission_mask: Optional[np.ndarray] = None,
+# ) -> Tuple[
+#     np.ndarray,
+#     np.ndarray,
+#     Optional[np.ndarray],
+# ]:
+#     """
+#     Compute raw and throughput-corrected contrast curves.
+
+#     Parameters
+#     ----------
+#     data_cube
+#         Input detector cube with shape (n_frames, ny, nx).
+
+#     pixel_area_sr
+#         Pixel solid angle in steradians.
+
+#     stellar_flux_peak
+#         Stellar peak normalization flux.
+
+#     spatial_resolution_pix
+#         Resolution element diameter in pixels.
+
+#     center_pix
+#         PSF center coordinates as (x, y).
+
+#     inner_working_angle_pix
+#         Inner working angle in pixels.
+
+#     outer_working_angle_pix
+#         Outer working angle in pixels.
+
+#     coronagraph_transmission_mask
+#         Optional coronagraph throughput transmission map.
+
+#     Returns
+#     -------
+#     separations_pix
+#         Radial separations in pixels.
+
+#     raw_contrast_curves
+#         Raw 5-sigma contrast curves.
+
+#     throughput_corrected_contrast_curves
+#         Throughput-corrected contrast curves.
+#     """
+#     if data_cube.ndim != 3:
+#         raise ValueError("data_cube must have shape (n_frames, ny, nx)")
+
+#     if stellar_flux_peak <= 0:
+#         raise ValueError("stellar_flux_peak must be positive.")
+
+#     if coronagraph_transmission_mask is not None:
+#         if coronagraph_transmission_mask.shape != data_cube.shape[1:]:
+#             raise ValueError("coronagraph_transmission_mask shape mismatch.")
+
+#     n_frames = data_cube.shape[0]
+
+#     if outer_working_angle_pix is None:
+#         outer_working_angle_pix = min(data_cube.shape[1:]) // 2
+
+#     normalization_factor = pixel_area_sr / stellar_flux_peak
+
+#     # Precompute normalized cube
+#     normalized_cube = (data_cube * normalization_factor).astype(np.float32, copy=False)
+
+#     raw_contrast_curves = []
+#     throughput_corrected_curves = []
+
+#     radial_separations_pix = None
+
+#     contrast_kwargs = dict(
+#         inner_working_angle_pix=inner_working_angle_pix,
+#         outer_working_angle_pix=outer_working_angle_pix,
+#         spatial_resolution_pix=spatial_resolution_pix,
+#         center_pix=center_pix,
+#         low_pass_filter=False,
+#         coronagraph_transmission_mask=coronagraph_transmission_mask,
+#     )
+
+#     for normalized_frame in normalized_cube:
+#         (
+#             separations_pix,
+#             raw_contrast,
+#             corrected_contrast,
+#         ) = calc_single_contrast_curve(
+#             normalized_frame=normalized_frame, **contrast_kwargs
+#         )
+#         # shared radial separations
+#         if radial_separations_pix is None:
+#             radial_separations_pix = separations_pix
+
+#         raw_contrast_curves.append(raw_contrast)
+#         throughput_corrected_curves.append(corrected_contrast)
+
+#     # convert to arrays
+#     raw_contrast_curves = np.asarray(
+#         raw_contrast_curves,
+#         dtype=np.float32,
+#     )
+
+#     throughput_corrected_array = None
+
+#     if coronagraph_transmission_mask is not None:
+#         throughput_corrected_array = np.asarray(
+#             throughput_corrected_curves,
+#             dtype=np.float32,
+#         )
+
+#     return (
+#         radial_separations_pix,
+#         raw_contrast_curves,
+#         throughput_corrected_array,
+#     )
+
+
+# # =============================================================================
+# # Adding in the companion masks now
+# # =============================================================================
+# from typing import List, Tuple
+
+# import numpy as np
+# from numpy.typing import NDArray
+
+# # =============================================================================
+# # ATOMIC MATHEMATICAL KERNEL (Pure Point Logic)
+# # =============================================================================
+
+
+# def compute_single_companion_mask(
+#     x_grid: NDArray[np.float64],
+#     y_grid: NDArray[np.float64],
+#     center_pix: Tuple[float, float],
+#     pixscale_arcsec: float,
+#     spatial_resolution_pix: float,
+#     ra_offset_arcsec: float,
+#     dec_offset_arcsec: float,
+#     mask_radius_ld: float,
+# ) -> NDArray[np.bool_]:
+#     """
+#     Compute a 2D boolean exclusion mask for a single celestial companion.
+
+#     This function acts as a pure stateless coordinate-space kernel. It does
+#     not know about data frames, arrays of companions, or file paths.
+
+#     Parameters
+#     ----------
+#     x_grid : NDArray[np.float64]
+#         2D matrix containing the horizontal (X) pixel coordinates.
+#     y_grid : NDArray[np.float64]
+#         2D matrix containing the vertical (Y) pixel coordinates.
+#     center_pix : Tuple[float, float]
+#         0-indexed host star coordinate array (X_center, Y_center).
+#     pixscale_arcsec : float
+#         Pixel scale of the instrument detector in arcseconds/pixel.
+#     spatial_resolution_pix : float
+#         Calculated resolution element size (lambda/D) expressed in pixels.
+#     ra_offset_arcsec : float
+#         Right Ascension angular offset relative to host star in arcseconds.
+#     dec_offset_arcsec : float
+#         Declination angular offset relative to host star in arcseconds.
+#     mask_radius_ld : float
+#         Exclusion zone cutoff radius in units of lambda/D.
+
+#     Returns
+#     -------
+#     NDArray[np.bool_]
+#         A 2D boolean mask of shape matching the input grid, where True
+#         denotes coordinates inside the companion exclusion boundary.
+#     """
+#     # Transform physical angular coordinates into raw pixel displacements
+#     delta_x_pix = ra_offset_arcsec / pixscale_arcsec
+#     delta_y_pix = dec_offset_arcsec / pixscale_arcsec
+#     cutoff_radius_pix = mask_radius_ld * spatial_resolution_pix
+
+#     # Calculate radial Euclidean distance from the companion's shifted center
+#     radial_distance_map = np.sqrt(
+#         (x_grid - center_pix[0] + delta_x_pix) ** 2
+#         + (y_grid - center_pix[1] - delta_y_pix) ** 2
+#     )
+
+#     return radial_distance_map <= cutoff_radius_pix
+
+
+# # =============================================================================
+# # GEOMETRIC EXCLUSION FACTORY (State Aggregator Layer)
+# # =============================================================================
+
+
+# def generate_companion_spatial_mask(
+#     spatial_shape: Tuple[int, int],
+#     center_pix: Tuple[float, float],
+#     pixscale_arcsec: float,
+#     spatial_resolution_pix: float,
+#     companions: List[List[float]],
+# ) -> NDArray[np.bool_]:
+#     """
+#     Generate a unified 2D binary mask indicating multi-companion exclusion zones.
+
+#     Parameters
+#     ----------
+#     spatial_shape : Tuple[int, int]
+#         The (Y, X) pixel dimensions of the target frame layout.
+#     center_pix : Tuple[float, float]
+#         0-indexed target coordinate array (X_center, Y_center).
+#     pixscale_arcsec : float
+#         Pixel scale of the instrument detector in arcseconds/pixel.
+#     spatial_resolution_pix : float
+#         Calculated resolution element size (lambda/D) expressed in pixels.
+#     companions : List[List[float]]
+#         Matrix of target companions where each row represents
+#         [RA_offset, Dec_offset, radius_ld].
+
+#     Returns
+#     -------
+#     NDArray[np.bool_]
+#         2D unified spatial boolean mask layout.
+#     """
+#     ny, nx = spatial_shape
+#     y_indices, x_indices = np.indices((ny, nx), dtype=np.float64)
+
+#     # Initialize a master empty mask
+#     combined_mask = np.zeros((ny, nx), dtype=bool)
+
+#     # Map the companion list across our mathematical kernel
+#     for companion in companions:
+#         ra_off, dec_off, radius_ld = companion
+
+#         single_mask = compute_single_companion_mask(
+#             x_grid=x_indices,
+#             y_grid=y_indices,
+#             center_pix=center_pix,
+#             pixscale_arcsec=pixscale_arcsec,
+#             spatial_resolution_pix=spatial_resolution_pix,
+#             ra_offset_arcsec=ra_off,
+#             dec_offset_arcsec=dec_off,
+#             mask_radius_ld=radius_ld,
+#         )
+
+#         # Accumulate the mask footprint using bitwise OR
+#         combined_mask |= single_mask
+
+#     return combined_mask
+
+
+# # =============================================================================
+# # math
+# # =============================================================================
+# ARCSEC_PER_RADIAN = 180.0 * 3600.0 / np.pi
+
+
+# def calculate_pixel_area_sr(pixel_scale_arcsec: float) -> float:
+#     """
+#     Calculate the solid angle subtended by a single detector pixel in steradians.
+
+#     Parameters
+#     ----------
+#     pixel_scale_arcsec : float
+#         The physical size of a single detector pixel in arcseconds.
+
+#     Returns
+#     -------
+#     float
+#         The solid angle area equivalent expressed in units of steradians (sr).
+#     """
+#     if pixel_scale_arcsec <= 0:
+#         raise ValueError("pixel_scale_arcsec must be a positive non-zero value.")
+
+#     # Convert linear pixel edge dimension from arcseconds to radians
+#     pixel_scale_rad = pixel_scale_arcsec / ARCSEC_PER_RADIAN
+
+#     # Compute 2D area component (square radians is structurally equivalent to steradians)
+#     pixel_area_sr = pixel_scale_rad**2
+
+#     return float(pixel_area_sr)
+
+
+# # Official JWST Entrance Pupil/Primary Mirror Diameter Constants (Meters)
+# # JWST_CIRCUMSCRIBED_DIAMETER = 6.6  # Outer edge boundary
+# MICRON_TO_METERS = 1e-6
+# JWST_CORONAGRAPH_DIAMETER = (
+#     5.2  # Effective clearance diameter for specialized coronagraph masking
+# )
+
+
+# def calculate_spatial_resolution_pix(
+#     wavelength_um: float,
+#     pixel_scale_rad: float,
+#     telescope_name: str,
+#     exposure_type: str,
+#     blur_fwhm_pix: float = 0.0,
+#     factor: float = 1.0,
+# ) -> float:
+#     """
+#     Calculate the effective structural resolution element in pixels, accounting
+#     for optical diffraction limitations and instrument-level blurring.
+
+#     Parameters
+#     ----------
+#     wavelength_um : float
+#         The observation center wavelength in micrometers (CWAVEL).
+#     pixel_scale_rad : float
+#         The pixel scale size expressed in radians per pixel (pxsc_rad).
+#     telescope_name : str
+#         Name identifier of the origin observatory (e.g., 'JWST').
+#     exposure_type : str
+#         Telemetry exposure type block code (e.g., 'NRC_CORON').
+#     blur_fwhm_pix : float, optional
+#         Additional atmospheric/instrument blur FWHM in pixel units (BLURFWHM). Defaults to 0.0.
+#     factor : float, optional
+#         Diffraction element scaling modifier. Defaults to 1.0 (lambda/D). Change to 1.22
+#         if strictly computing a Rayleigh criteria resolution bound.
+
+#     Returns
+#     -------
+#     float
+#         The effective physical resolution element scaled into detector pixels.
+#     """
+#     # 1. Enforce strict telescope type gating
+#     if str(telescope_name).upper() != "JWST":
+#         raise ValueError(
+#             f"Unsupported or unknown telescope platform: '{telescope_name}'"
+#         )
+
+#     if wavelength_um <= 0 or pixel_scale_rad <= 0:
+#         raise ValueError(
+#             "Wavelength and pixel scale inputs must evaluate to positive non-zero floats."
+#         )
+
+#     # 2. Assign effective optical diameter based on specialized pupil masking profiles
+#     if str(exposure_type).upper() in ["NRC_CORON", "NRC_TACONFIRM", "NRC_TACQ"]:
+#         # NIRCam coronagraph masks constrain the open entrance pupil to an effective 5.2m
+#         aperture_diameter_m = JWST_CORONAGRAPH_DIAMETER
+#     else:
+#         aperture_diameter_m = JWST_CIRCUMSCRIBED_DIAMETER
+
+#     # 3. Compute structural diffraction footprint (meters to micrometers cancel via 1e-6)
+#     wavelength_m = wavelength_um * 1e-6  # MICRON_TO_METERS
+#     diffraction_limit_rad = (factor * wavelength_m) / aperture_diameter_m
+
+#     # Map the spatial angular bounds directly into detector pixel grids
+#     spatial_resolution_pix = diffraction_limit_rad / pixel_scale_rad
+
+#     # 4. Apply additional instrumental/smearing blurring adjustments via quadrature addition
+#     if not np.isnan(blur_fwhm_pix) and blur_fwhm_pix > 0:
+#         spatial_resolution_pix = np.hypot(spatial_resolution_pix, blur_fwhm_pix)
+
+#     return float(spatial_resolution_pix)
+
+
+# # =============================================================================
+# # MAIN
+# # =============================================================================
+
+
+# def validate_companions(companions):
+#     """Validation check to ensure that a list of companions (objects) have
+#     3 elements (ra, dec, size lambda/D units) want a list of lists"""
+#     if companions is None:
+#         return None
+
+#     if not companions:
+#         return []
+
+#     if not isinstance(companions[0], (list, tuple)):
+#         companions = [companions]
+
+#     if any(len(c) != 3 for c in companions):
+#         raise ValueError("Each companion must contain exactly 3 elements")
+
+#     return companions
+
+
+# class AnalysisTools:
+#     """
+#     The spaceKLIP astrophysical analysis tools class.
+
+#     """
+
+#     def __init__(self, database):
+#         """
+#         Initialize the spaceKLIP astrophysical analysis tools class.
+
+#         Parameters
+#         ----------
+#         database : spaceKLIP.Database
+#             SpaceKLIP database on which the astrophysical analysis steps shall
+#             be run.
+
+#         Returns
+#         -------
+#         None.
+
+#         """
+
+#         # Make an internal alias of the spaceKLIP database class.
+#         print("Hello")
+#         self.database = database
+
+#         pass
+
+#     def raw_contrast(
+#         self,
+#         starfile,
+#         spectral_type="G2V",
+#         companions=None,
+#         overwrite_crpix=None,
+#         subdir="rawcon",
+#         output_filetype="npy",
+#         plot_xlim=(0, 10),
+#         save_figures=True,
+#         plot_style=None,
+#         **kwargs,
+#     ):
+#         """
+#         Compute the raw contrast relative to the provided host star flux.
+
+#         Parameters
+#         ----------
+#         starfile : path
+#             Path of VizieR VOTable containing host star photometry or two
+#             column TXT file with wavelength (micron) and flux (Jy).
+#         spectral_type : str, optional
+#             Host star spectral type for the stellar model SED. The default is
+#             'G2V'.
+#         companions : list of list of three float, optional
+#             List of companions to be masked before computing the raw contrast.
+#             For each companion, there should be a three element list containing
+#             [RA offset (arcsec), Dec offset (arcsec), mask radius (lambda/D)].
+#             The default is None.
+#         overwrite_crpix : tuple of two float, optional
+#             Overwrite the PSF center with the (CRPIX1, CRPIX2) values provided
+#             here (in 1-indexed coordinates). This is required for Coron3 data!
+#             The default is None.
+#         subdir : str, optional
+#             Name of the directory where the data products shall be saved. The
+#             default is 'rawcon'.
+#         output_filetype : str
+#             File type to save the raw contrast information to. Options are 'ecsv'
+#             or 'npy'.
+#         save_figures : bool, optional
+#             Save the plots in a PDF?
+
+#         Returns
+#         -------
+#         None.
+
+#         """
+
+#         # Check input.
+#         companions = validate_companions(companions)
+
+#         # Set output directory.
+#         star_path = Path(starfile)
+#         output_dir = Path(self.database.output_dir) / subdir
+#         output_dir.mkdir(parents=True, exist_ok=True)
+
+#         # Build clean serialization files cleanly using standard pathlib
+#         new_starfile_path = output_dir / star_path.name
+#         spectype_str = (
+#             f"Spectral Type: {spectral_type}"
+#             if star_path.suffix == ".vot"
+#             else "Spectral Type: N/A"
+#         )
+
+#         contrast_curve_info_path = output_dir / "contrast_curve_info.txt"
+#         contrast_curve_info_path.write_text(
+#             f"#{star_path.name} /// {spectype_str}\n", encoding="utf-8"
+#         )
+
+#         log.info("Syncing starfile assets: %s to %s", star_path, new_starfile_path)
+#         write_starfile(str(star_path), str(new_starfile_path))
+
+#         # Loop through concatenations.
+#         for i, key in enumerate(self.database.red.keys()):
+#             log.info("--> Concatenation " + key)
+
+#             # Loop through FITS files.
+#             nfitsfiles = len(self.database.red[key])
+#             for j in range(nfitsfiles):
+#                 log.info("Analyzing file " + self.database.red[key]["FITSFILE"][j])
+
+#                 # Fetch data
+#                 instrument = self.database.red[key]["INSTRUME"][j]
+#                 subarray = self.database.red[key]["SUBARRAY"][j]
+#                 filt = self.database.red[key]["FILTER"][j]
+#                 exp_type = self.database.red[key]["EXP_TYPE"][j]
+#                 pixscale = self.database.red[key]["PIXSCALE"][j]
+#                 c_wavelength = self.database.red[key]["CWAVEL"][j]
+
+#                 # Get stellar magnitudes and filter zero points.
+#                 mstar, fzero = get_stellar_magnitudes(
+#                     str(star_path),
+#                     spectral_type,
+#                     instrument,
+#                     output_dir=str(output_dir),
+#                     **kwargs,
+#                 )  # vegamag, Jy
+
+#                 # Read FITS file and PSF mask.
+#                 fitsfile = self.database.red[key]["FITSFILE"][j]
+#                 data, head_pri, head_sci, is2d = ut.read_red(fitsfile)
+#                 maskfile = self.database.red[key]["MASKFILE"][j]
+#                 mask = ut.read_msk(maskfile)
+#                 if mask is None:
+#                     log.warning(
+#                         "No mask file provided; MASKFILE is None. This may cause problems!!"
+#                     )
+
+#                 # Compute the pixel area in steradian.
+#                 # 1. Resolve pixel scaling and solid angles uniformly
+#                 pxsc_arcsec = self.database.red[key]["PIXSCALE"][j]
+#                 pxsc_rad = pxsc_arcsec / ARCSEC_PER_RADIAN
+
+#                 # Establish a consistent, standardized tracking variable
+#                 pxar_telemetry = self.database.red[key]["PIXAR_SR"][j]
+#                 pixel_area_sr = (
+#                     pxar_telemetry
+#                     if not np.isnan(pxar_telemetry)
+#                     else calculate_pixel_area_sr(pxsc_arcsec)
+#                 )
+
+#                 # Keep old pix area variable temporarily so that things continue to work
+#                 pxar = pixel_area_sr  # self.database.red[key]["PIXAR_SR"][j]  # sr
+
+#                 # if np.isnan(pxar):
+#                 #     # log.warning(
+#                 #     #     "PIXAR_SR not found in database, falling back to use PIXSCALE"
+#                 #     # )
+#                 #     log.warning(
+#                 #         f"[{key}][Index {j}] PIXAR_SR not found in telescope telemetry database. "
+#                 #         f"Falling back to geometric pixel scale calculation."
+#                 #     )
+#                 #     pxsc_arcsec = self.database.red[key]["PIXSCALE"][j]  # arcsec
+#                 #     # pxar = pxsc_rad**2  # sr
+#                 #     # pxsc_rad = pxsc_arcsec / 3600.0 / 180.0 * np.pi  # rad
+#                 #     pixel_area_sr = calculate_pixel_area_sr(
+#                 #         pixel_scale_arcsec=pxsc_arcsec
+#                 #     )
+#                 #     print(f"DEGUG -- original: {pxar} | new: {pixel_area_sr}")
+#                 #     pxar = pixel_area_sr
+#                 # else:
+#                 #     log.info(
+#                 #         f"[{key}][Index {j}] PIXAR_SR found in telescope telemetry database. "
+#                 #     )
+
+#                 # Convert the host star brightness from vegamag to MJy. Use an
+#                 # unocculted model PSF whose integrated flux is normalized to
+#                 # one in order to obtain the theoretical peak count of the
+#                 # star.
+#                 filt = self.database.red[key]["FILTER"][j]
+#                 offsetpsf = get_offsetpsf(self.database.obs[key])
+#                 fstar = (
+#                     fzero[filt]
+#                     / 10.0 ** (mstar[filt] / 2.5)
+#                     / 1e6
+#                     * np.nanmax(offsetpsf)
+#                 )  # MJy
+
+#                 # Get PSF subtraction strategy used, for use in plot labels below.
+#                 psfsub_strategy = (
+#                     f"{head_pri['MODE']} with {head_pri['ANNULI']} annuli."
+#                     if head_pri["ANNULI"] > 1
+#                     else head_pri["MODE"]
+#                 )
+
+#                 # Set the inner and outer working angle and compute the
+#                 # resolution element. Account for possible blurring.
+#                 iwa = 1  # pix
+#                 owa = data.shape[1] // 2  # pix
+
+#                 # 2. Extract instrument-level configurations safely
+#                 telescop = self.database.red[key]["TELESCOP"][j]
+#                 exp_type = self.database.red[key]["EXP_TYPE"][j]
+#                 cwave_um = self.database.red[key]["CWAVEL"][j]
+#                 blur_fwhm = self.database.obs[key]["BLURFWHM"][j]
+
+#                 # 3. Call the standardized resolution tracking function
+#                 spatial_resolution_pix = calculate_spatial_resolution_pix(
+#                     wavelength_um=cwave_um,
+#                     pixel_scale_rad=pxsc_rad,  # Directly matching your linear baseline scale variable
+#                     telescope_name=telescop,
+#                     exposure_type=exp_type,
+#                     blur_fwhm_pix=blur_fwhm,
+#                 )
+
+#                 print(
+#                     f"Standardized Resolution tracking element: {spatial_resolution_pix:.4f} pixels"
+#                 )
+
+#                 # keep original config
+#                 resolution = spatial_resolution_pix
+
+#                 # Get the star position.
+#                 if overwrite_crpix is None:
+#                     center = (
+#                         head_pri["CRPIX1"] - 1.0,
+#                         head_pri["CRPIX2"] - 1.0,
+#                     )  # pix (0-indexed)
+#                 else:
+#                     center = (
+#                         overwrite_crpix[0] - 1.0,
+#                         overwrite_crpix[1] - 1.0,
+#                     )  # pix (0-indexed)
+
+#                 # Mask coronagraph spiders, 4QPM edges, etc.
+#                 debug_bar_mask = True
+#                 print(" --------- I am here -------")
+#                 if self.database.red[key]["EXP_TYPE"][j] in ["NRC_CORON"]:
+#                     # NOTES: TB I am not sure what this is suppose to look like.
+#                     # The test/code I have for this produces a result but I do not have
+#                     # a reference to compare it too.
+#                     if "WB" in self.database.red[key]["CORONMSK"][j]:
+#                         log.info("  Masking out areas for NIRCam bar coronagraph")
+#                         xr = np.arange(data.shape[-1]) - center[0]
+#                         yr = np.arange(data.shape[-2]) - center[1]
+#                         xx, yy = np.meshgrid(xr, yr)
+#                         pa = -np.rad2deg(np.arctan2(xx, yy))
+#                         pa[pa < 0.0] += 360.0
+#                         ww_sci = np.where(self.database.obs[key]["TYPE"] == "SCI")[0]
+#                         for ww in ww_sci:
+#                             roll_ref = self.database.obs[key]["ROLL_REF"][ww]  # deg
+#                             pa1 = (90.0 - 15.0 + roll_ref) % 360.0
+#                             pa2 = (90.0 + 15.0 + roll_ref) % 360.0
+#                             if pa1 > pa2:
+#                                 temp = (pa > pa1) | (pa < pa2)
+#                             else:
+#                                 temp = (pa > pa1) & (pa < pa2)
+#                             data[:, temp] = np.nan
+#                             pa1 = (270.0 - 15.0 + roll_ref) % 360.0
+#                             pa2 = (270.0 + 15.0 + roll_ref) % 360.0
+#                             if pa1 > pa2:
+#                                 temp = (pa > pa1) | (pa < pa2)
+#                             else:
+#                                 temp = (pa > pa1) & (pa < pa2)
+#                             if debug_bar_mask:
+#                                 plt.figure()
+#                                 plt.title("NIRCam Bar Mask")
+#                                 plt.imshow(temp)
+#                                 plt.show()
+#                                 debug_bar_mask = False
+
+#                             data[:, temp] = np.nan
+#                 elif self.database.red[key]["EXP_TYPE"][j] in ["MIR_4QPM"]:
+#                     # This is MIRI 4QPM data, want to mask edges. However, close
+#                     # to the center you don't have a choice. So, want to use
+#                     # rectangles with a gap in the center.
+#                     log.info("  Masking out areas for MIRI 4QPM coronagraph")
+
+#                     # Create array and pad slightly
+#                     nanmask = np.zeros_like(data[0])
+#                     pad = 5
+#                     nanmask = np.pad(nanmask, pad)
+
+#                     # Upsample array to improve centering.
+#                     samp = 1  # Upsampling factor
+#                     nanmask = nanmask.repeat(samp, axis=0).repeat(samp, axis=1)
+
+#                     # Define rectangle edges
+#                     rect_width = 10 * samp  # pixels
+#                     thinrect_width = 2 * samp  # pixels
+
+#                     cent_rect = [
+#                         (center[0] + pad) * samp,
+#                         (center[0] + pad) * samp,
+#                         (center[1] + pad) * samp,
+#                         (center[1] + pad) * samp,
+#                     ]
+#                     rect = [
+#                         int(cent_rect[i] - (rect_width / 2 * (-1) ** (i % 2)))
+#                         for i in range(4)
+#                     ]
+#                     thinrect = [
+#                         int(cent_rect[i] - (thinrect_width / 2 * (-1) ** (i % 2)))
+#                         for i in range(4)
+#                     ]
+
+#                     # Define circle mask for center
+#                     circ_rad = 15 * samp  # pixels
+#                     yarr, xarr = np.ogrid[: nanmask.shape[0], : nanmask.shape[1]]
+#                     rad_dist = np.sqrt(
+#                         (xarr - (center[0] + pad) * samp) ** 2
+#                         + (yarr - (center[1] + pad) * samp) ** 2
+#                     )
+#                     circ = rad_dist < circ_rad
+
+#                     # Loop over images
+#                     ww_sci = np.where(self.database.obs[key]["TYPE"] == "SCI")[0]
+#                     for ww in ww_sci:
+#                         # Apply cross
+#                         roll_ref = self.database.obs[key]["ROLL_REF"][ww]  # deg
+#                         temp = np.zeros_like(nanmask)
+#                         temp[:, rect[0] : rect[1]] = 1  # Vertical
+#                         temp[rect[2] : rect[3], :] = 1  # Horizontal
+
+#                         # Now ensure center isn't completely masked
+#                         temp[circ] = 0
+
+#                         # Apply thin cross
+#                         temp[:, thinrect[0] : thinrect[1]] = 1  # Vertical
+#                         temp[thinrect[2] : thinrect[3], :] = 1  # Horizontal
+
+#                         # Rotate the array, include fixed rotation of FQPM edges
+#                         temp = rotate(temp, 90 - roll_ref + 4.83544897, reshape=False)
+#                         nanmask += temp
+
+#                     # If pixel value too high, should be masked, else set to 1.
+#                     nanmask[nanmask >= 0.5] = np.nan
+#                     nanmask[nanmask < 0.5] = 1
+
+#                     # Downsample, remove padding, and mask data
+#                     nanmask = nanmask[::samp, ::samp]
+#                     nanmask = nanmask[pad:-pad, pad:-pad]
+#                     nanmask = set_surrounded_pixels(nanmask)
+
+#                     ####################
+#                     # MIRI mask (This works I just need to fold it in)
+#                     ####################
+
+#                     # print("running new miri mask")
+#                     # roll_angles = self.database.obs[key]["ROLL_REF"][ww_sci]
+#                     # nanmask = generate_miri_4qpm_mask(
+#                     #     detector_shape=data[0].shape,
+#                     #     coronagraph_center_pix=center,
+#                     #     roll_reference_angles_deg=roll_angles,
+#                     #     padding_pix=pad,
+#                     #     upsample_factor=samp,
+#                     # )
+
+#                     #
+#                     print(f"data shape: {data.shape}")
+#                     print(f"center: {center}")
+#                     plt.figure()
+#                     plt.title("MIRI - 4PQM - MASK")
+#                     plt.imshow(nanmask)
+#                     plt.axvline(center[0])
+#                     plt.axhline(center[1])
+#                     plt.show()
+
+#                     data *= nanmask
+#                 elif self.database.red[key]["EXP_TYPE"][j] in ["MIR_LYOT"]:
+#                     raise NotImplementedError()
+
+#                 ####################
+#                 # Mask companions Step
+#                 ####################
+#                 if companions is not None:
+#                     log.info(
+#                         f"  Masking out {len(companions)} known companions using provided parameters."
+#                     )
+#                     print(f"Resolution: {resolution}")
+#                     print(f"pixel Scale (arcsec): {pxsc_arcsec}")
+#                     companion_mask = generate_companion_spatial_mask(
+#                         spatial_shape=data.shape[1:],
+#                         center_pix=center,
+#                         pixscale_arcsec=pxsc_arcsec,
+#                         spatial_resolution_pix=resolution,
+#                         companions=companions,
+#                     )
+#                     # apply the mask and fill with nans
+#                     data[:, companion_mask] = np.nan
+
+#                 ####################
+#                 # injecting new contrast calculations:
+#                 ####################
+#                 log.info("  Measuring raw contrast in annuli")
+#                 contrast_results = compute_contrast_curves(
+#                     data_cube=data,
+#                     pixel_area_sr=pxar,
+#                     stellar_flux_peak=fstar,
+#                     spatial_resolution_pix=resolution,
+#                     center_pix=center,
+#                     inner_working_angle_pix=iwa,
+#                     outer_working_angle_pix=owa,
+#                     coronagraph_transmission_mask=mask,
+#                 )
+
+#                 (
+#                     radial_separations_pix,
+#                     raw_contrast_curves,
+#                     throughput_corrected_array,
+#                 ) = contrast_results
+
+#                 # NOTES: The raw contrast calculation like should be migrated to a table
+#                 # or dataclass result structure rather than floating variables, its a result.
+#                 # can keep things more orgnanized.
+
+#                 # assuming pixel scale is the same between all data.
+#                 radial_separations_pix *= self.database.red[key]["PIXSCALE"][0]
+
+#                 # map back to orignal setup
+#                 # ideally we shouldnt need this because we should only need one coorindate
+#                 # The radial separations.
+#                 seps = np.tile(radial_separations_pix, (len(data), 1))
+#                 cons = raw_contrast_curves
+#                 cons_mask = throughput_corrected_array
+
+#                 # PLOTTING DATA
+
+#                 # Plot masked data.
+
+#                 # Maksed Data plotting
+
+#                 klmodes = self.database.red[key]["KLMODES"][j].split(",")
+#                 fitsfile = os.path.join(output_dir, os.path.split(fitsfile)[1])
+
+#                 load_plt_style(plot_style)
+#                 fig = plt.figure(figsize=(6.4, 4.8))
+#                 ax = plt.gca()
+#                 xx = np.arange(data.shape[2]) - center[0]  # pix
+#                 yy = np.arange(data.shape[1]) - center[1]  # pix
+#                 extent = (
+#                     -(xx[0] - 0.5) * pxsc_arcsec,
+#                     -(xx[-1] + 0.5) * pxsc_arcsec,
+#                     (yy[0] - 0.5) * pxsc_arcsec,
+#                     (yy[-1] + 0.5) * pxsc_arcsec,
+#                 )
+#                 vmax = np.nanmax(data[-1])
+#                 ax.imshow(
+#                     data[-1],
+#                     origin="lower",
+#                     cmap="inferno",
+#                     norm=matplotlib.colors.SymLogNorm(
+#                         vmin=-vmax, vmax=vmax, linthresh=vmax / 100
+#                     ),
+#                     extent=extent,
+#                 )
+#                 ax.set_xlabel(r"$\Delta$RA [arcsec]")
+#                 ax.set_ylabel(r"$\Delta$Dec [arcsec]")
+#                 ax.set_title(
+#                     f"Masked data in {filt}, {psfsub_strategy} ({klmodes[-1]} KL)"
+#                 )
+#                 for r in [5, 10]:
+#                     ax.add_patch(
+#                         matplotlib.patches.Circle(
+#                             (0, 0),
+#                             r,
+#                             ls="--",
+#                             facecolor="none",
+#                             edgecolor="cyan",
+#                             clip_on=True,
+#                         )
+#                     )
+#                     ax.text(r, 0, f" {r}''", color="cyan")
+#                 import textwrap
+
+#                 ax.text(
+#                     0.01,
+#                     0.99,
+#                     textwrap.fill(os.path.basename(fitsfile), width=40),
+#                     transform=ax.transAxes,
+#                     color="black",
+#                     verticalalignment="top",
+#                     fontsize=9,
+#                 )
+#                 plt.colorbar(
+#                     mappable=ax.images[0], label=self.database.red[key]["BUNIT"][j]
+#                 )
+#                 plt.tight_layout()
+#                 if save_figures:
+#                     output_file = fitsfile[:-5] + "_masked.pdf"
+#                     plt.savefig(output_file)
+#                     log.info(f" Plot saved in {output_file}")
+#                 plt.show()
+#                 plt.close(fig)
+
+#                 # PLOTTING THE Raw Contrast Curves
+
+#                 # Plot raw contrast.
+#                 klmodes = self.database.red[key]["KLMODES"][j].split(",")
+#                 fitsfile = os.path.join(output_dir, os.path.split(fitsfile)[1])
+#                 colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+#                 mod = len(colors)
+#                 load_plt_style(plot_style)
+#                 fig = plt.figure(figsize=(6.4, 4.8))
+#                 ax = plt.gca()
+#                 for k in range(data.shape[0]):
+#                     if mask is None:
+#                         ax.plot(
+#                             seps[k],
+#                             cons[k],
+#                             color=colors[k % mod],
+#                             label=klmodes[k] + " KL",
+#                         )
+#                     else:
+#                         ax.plot(
+#                             seps[k], cons[k], color=colors[k % mod], alpha=0.3, ls="--"
+#                         )
+#                         ax.plot(
+#                             seps[k],
+#                             cons_mask[k],
+#                             color=colors[k % mod],
+#                             label=klmodes[k] + " KL",
+#                         )
+#                 ax.set_yscale("log")
+#                 ax.set_ylim([None, 1])
+#                 if plot_xlim is not None:
+#                     ax.set_xlim(plot_xlim)
+#                 ax.set_xlabel("Separation [arcsec]")
+#                 ax.set_ylabel(r"5-$\sigma$ contrast")
+#                 ax.legend(
+#                     loc="upper right",
+#                     ncols=3,
+#                     title=None
+#                     if mask is None
+#                     else "Dashed lines exclude coronagraph mask throughput",
+#                     title_fontsize=10,
+#                 )
+#                 ax.set_title(f"Raw contrast in {filt}, {psfsub_strategy}")
+#                 plt.tight_layout()
+#                 if save_figures:
+#                     output_file = fitsfile[:-5] + "_rawcon.pdf"
+#                     plt.savefig(output_file)
+#                     log.info(f" Plot saved in {output_file}")
+#                 plt.show()
+#                 plt.close(fig)
+
+#                 # Exporting Data
+
+#                 if output_filetype.lower() == "ecsv":
+#                     # Save outputs as astropy ECSV text tables
+#                     columns = [seps[0]]
+#                     names = ["separation"]
+#                     for i, klmode in enumerate(klmodes):
+#                         columns.append(cons[i])
+#                         names.append(f"contrast, N_kl={klmode}")
+#                         if mask is not None:
+#                             columns.append(cons_mask[i])
+#                             names.append(f"contrast+mask, N_kl={klmode}")
+#                     results_table = Table(columns, names=names)
+#                     results_table["separation"].unit = u.arcsec
+#                     # the following needs debugging:
+#                     # for kw in ['TELESCOP', 'INSTRUME', 'SUBARRAY', 'FILTER', 'CORONMSK', 'EXP_TYPE', 'FITSFILE']:
+#                     #    results_table.meta[kw] = self.database.red[key][kw][j]
+
+#                     output_fn = fitsfile[:-5] + "_contrast.ecsv"
+#                     results_table.write(output_fn, overwrite=True)
+#                     print(f"Contrast results and plots saved to {output_fn}")
+#                 elif output_filetype.lower() == "npy":
+#                     # Save outputs as numpy .npy files
+#                     np.save(fitsfile[:-5] + "_seps.npy", seps)
+#                     np.save(fitsfile[:-5] + "_cons.npy", cons)
+#                     if mask is not None:
+#                         np.save(fitsfile[:-5] + "_cons_mask.npy", cons_mask)
+#                     print(
+#                         f"Contrast results and plots saved to {fitsfile[:-5] + '_seps.npy'}, {fitsfile[:-5] + '_cons.npy'}"
+#                     )
+#                 else:
+#                     raise ValueError(
+#                         'File save format not supported, options are "npy" or "ecsv".'
+#                     )
+
+#     def calibrate_contrast(
+#         self,
+#         subdir="calcon",
+#         rawcon_subdir="rawcon",
+#         rawcon_filetype="npy",
+#         companions=None,
+#         injection_seps="default",
+#         injection_pas="default",
+#         injection_flux_sigma=20,
+#         multi_injection_spacing=None,
+#         use_saved=False,
+#         thrput_fit_method="median",
+#         plot_xlim=(0, 10),
+#         plot_style=None,
+#         **kwargs,
+#     ):
+#         """
+#         Compute a calibrated contrast curve relative to the host star flux.
+
+#         Parameters
+#         ----------
+#         subdir : str, optional
+#             Name of the directory where the data products shall be saved. The
+#             default is 'calcon'.
+#         rawcon_subdir : str, optional
+#             Name of the directory where the raw contrast data products have been
+#             saved. The default is 'rawcon'.
+#         rawcon_filetype : str
+#             Save filetype of the raw contrast files.
+#         companions : list of list of three float, optional
+#             List of companions to be masked before computing the raw contrast.
+#             For each companion, there should be a three element list containing
+#             [RA offset (arcsec), Dec offset (arcsec), mask radius (lambda/D)].
+#             The default is None.
+#         injection_seps : 1D-array, optional
+#             List of separations to inject companions at (arcsec).
+#         injection_pas : 1D-array, optional
+#             List of position angles to inject companions at (degrees).
+#         injection_flux_sigma : float, optional
+#             The peak flux of all injected companions in units of sigma, relative
+#             to the 1sigma contrast at the injected separation.
+#         multi_injection_spacing : int, None, optional
+#             Spacing between companions injected in a single image. If companions
+#             are too close then it can pollute the recovered flux. Set to 'None'
+#             to inject only one companion at a time (lambda/D).
+#         use_saved : bool, optional
+#             Toggle to use existing saved injected and recovered fluxes instead of
+#             repeating the process.
+#         thrput_fit_method : str, optional
+#             Method to use when fitting/interpolating the measure KLIP throughputs
+#             across all of the injection positions. 'median' for a median of PAs at
+#             with the same separation. 'log_grow' for a logistic growth function.
+
+#         Returns
+#         -------
+#         None.
+#         """
+
+#         # Check input.
+#         companions = validate_companions(companions)
+
+#         # Set output directory.
+#         output_dir = os.path.join(self.database.output_dir, subdir)
+#         if not os.path.exists(output_dir):
+#             os.makedirs(output_dir)
+
+#         # Get raw contrast directory
+#         rawcon_dir = os.path.join(self.database.output_dir, rawcon_subdir)
+#         if not os.path.exists(rawcon_dir):
+#             raise TypeError(
+#                 'Raw contrast must be calculated first. "rawcon" subdirectory not found.'
+#             )
+
+#         # Loop through concatenations.
+#         for i, key in enumerate(self.database.red.keys()):
+#             log.info("--> Concatenation " + key)
+
+#             # Need to generate the offset PSF we'll be injecting. Best to do
+#             # this per concatenation to save time.
+#             if use_saved == True:
+#                 # Don't need to bother generating the PSF, use dummy value
+#                 offsetpsf = 1
+#             else:
+#                 offsetpsf = get_offsetpsf(self.database.obs[key])
+
+#             # Loop through FITS files.
+#             nfitsfiles = len(self.database.red[key])
+#             for j in range(nfitsfiles):
+#                 # Read FITS file and PSF mask.
+#                 fitsfile = self.database.red[key]["FITSFILE"][j]
+#                 data, head_pri, head_sci, is2d = ut.read_red(fitsfile)
+#                 maskfile = self.database.red[key]["MASKFILE"][j]
+#                 mask = ut.read_msk(maskfile)
+
+#                 log.info("Analyzing file " + fitsfile)
+
+#                 # Get the raw contrast information with and without mask correction
+#                 file_str = fitsfile.split("/")[-1]
+#                 if rawcon_filetype == "npy":
+#                     seps_file = file_str.replace(".fits", "_seps.npy")  # Arcseconds
+#                     rawcons_file = file_str.replace(".fits", "_cons.npy")
+#                     maskcons_file = file_str.replace(".fits", "_cons_mask.npy")
+
+#                     rawseps = np.load(os.path.join(rawcon_dir, seps_file))
+#                     rawcons = np.load(os.path.join(rawcon_dir, rawcons_file))
+#                     maskcons = np.load(os.path.join(rawcon_dir, maskcons_file))
+#                 elif rawcon_filetype == "ecsv":
+#                     raise NotImplementedError(
+#                         ".ecsv save format not currently supported for \
+#                         calibrated contrasts. Please use .npy raw contrasts as input."
+#                     )
+#                     # contrast_file = file_str.replace('.fits', '_contrast.ecsv')
+#                     # contrast_path =  os.path.join(rawcon_dir, contrast_file)
+
+#                     # rawcon_data = Table.read(contrast_path, format='ascii.ecsv')
+
+#                 # Read Stage 2 files and make pyKLIP dataset
+#                 filepaths, psflib_filepaths = get_pyklip_filepaths(self.database, key)
+#                 pop_pxar_kw(np.append(filepaths, psflib_filepaths))
+#                 pyklip_dataset = JWSTData(filepaths, psflib_filepaths)
+
+#                 # Compute the resolution element. Account for possible blurring.
+#                 pxsc_arcsec = self.database.red[key]["PIXSCALE"][j]  # arcsec
+#                 pxsc_rad = pxsc_arcsec / 3600.0 / 180.0 * np.pi  # rad
+#                 if self.database.red[key]["TELESCOP"][j] == "JWST":
+#                     if self.database.red[key]["EXP_TYPE"][j] in [
+#                         "NRC_CORON",
+#                         "NRC_TACONFIRM",
+#                         "NRC_TACQ",
+#                     ]:
+#                         diam = 5.2
+#                     else:
+#                         diam = JWST_CIRCUMSCRIBED_DIAMETER
+#                 else:
+#                     raise UserWarning("Data originates from unknown telescope")
+#                 resolution = (
+#                     1e-6 * self.database.red[key]["CWAVEL"][j] / diam / pxsc_rad
+#                 )  # pix
+#                 if not np.isnan(self.database.obs[key]["BLURFWHM"][j]):
+#                     resolution *= self.database.obs[key]["BLURFWHM"][j]
+#                 resolution_fwhm = 1.025 * resolution
+
+#                 # Get stellar magnitudes and filter zero points, but use the same file as rawcon
+#                 ccinfo = os.path.join(rawcon_dir, "contrast_curve_info.txt")
+#                 with open(ccinfo) as cci:
+#                     starfile, spectral_type_info = (
+#                         cci.readline().strip("\n").split(" /// ")
+#                     )
+#                     spectral_type = spectral_type_info.split(": ")[1]
+#                     starfile = os.path.join(rawcon_dir, starfile.replace("#", ""))
+#                 mstar, fzero = get_stellar_magnitudes(
+#                     starfile,
+#                     spectral_type,
+#                     self.database.red[key]["INSTRUME"][j],
+#                     output_dir=output_dir,
+#                     **kwargs,
+#                 )  # vegamag, Jy
+#                 filt = self.database.red[key]["FILTER"][j]
+#                 fstar = (
+#                     fzero[filt]
+#                     / 10.0 ** (mstar[filt] / 2.5)
+#                     / 1e6
+#                     * np.nanmax(offsetpsf)
+#                 )  # MJy
+#                 fstar *= ((180.0 / np.pi) * 3600.0) ** 2 / pxsc_arcsec**2  # MJy/sr
+#                 # Get PSF subtraction strategy used, for use in plot labels below.
+#                 psfsub_strategy = (
+#                     f"{head_pri['MODE']} with {head_pri['ANNULI']} annuli."
+#                     if head_pri["ANNULI"] > 1
+#                     else head_pri["MODE"]
+#                 )
+
+#                 ### Now want to perform the injection and recovery of companions.
+#                 # Define the seps and PAs to inject companions at
+#                 if injection_seps == "default":
+#                     inj_seps = [
+#                         0.1,
+#                         0.2,
+#                         0.3,
+#                         0.4,
+#                         0.5,
+#                         0.6,
+#                         0.7,
+#                         0.8,
+#                         0.9,
+#                         1.0,
+#                         1.2,
+#                         1.4,
+#                         1.6,
+#                         1.8,
+#                         2.0,
+#                         2.5,
+#                         3.0,
+#                         3.5,
+#                         4.0,
+#                         5.0,
+#                     ]
+#                 else:
+#                     inj_seps = injection_seps
+#                 inj_seps_pix = inj_seps / pxsc_arcsec  # Convert separation to pixels
+
+#                 if injection_pas == "default":
+#                     if "4QPM" in self.database.red[key]["CORONMSK"][j]:
+#                         inj_pas = [57.5, 147.5, 237.5, 327.5]
+#                     elif "WB" in self.database.red[key]["CORONMSK"][j]:
+#                         inj_pas = [45.0, 135.0, 225.0, 315.0]
+#                     else:
+#                         inj_pas = [0, 60, 120, 180, 240, 300]
+#                 else:
+#                     inj_pas = injection_pas
+
+#                 # Determine the fluxes we want to inject the companions at.
+#                 # Base it on the contrast for the desired separations. Use the
+#                 # contrast with the ~median KL modes.
+#                 median_KL_index = int(len(rawseps) / 2)
+#                 cons_cleaned = np.nan_to_num(rawcons[median_KL_index], nan=1)
+#                 contrast_interp = interp1d(
+#                     rawseps[median_KL_index],
+#                     cons_cleaned,
+#                     kind="linear",
+#                     bounds_error=False,
+#                     fill_value=(1, cons_cleaned[-1]),
+#                 )
+#                 inj_cons = contrast_interp(inj_seps)
+#                 inj_fluxes = inj_cons * fstar  # MJy/sr
+#                 inj_fluxes *= injection_flux_sigma / 5  # Scale to an N sigma peak flux
+
+#                 # Going to redefine companion locations in terms of pixels
+#                 companions_pix = []
+#                 if companions is not None:
+#                     for k in range(len(companions)):
+#                         ra, dec, rad = companions[k]  # arcsec, arcsec, lambda/D
+#                         ra_pix = ra / pxsc_arcsec
+#                         dec_pix = dec / pxsc_arcsec
+#                         rad_pix = rad * resolution  # pix
+#                         companions_pix.append([ra_pix, dec_pix, rad_pix])
+#                 else:
+#                     companions_pix = None
+
+#                 # Redefine the multi_injection_spacing in terms of pixels
+#                 if multi_injection_spacing is not None:
+#                     injection_spacing_pix = multi_injection_spacing * resolution
+#                 else:
+#                     injection_spacing_pix = multi_injection_spacing
+
+#                 # Need to get exactly the same KLIP arguments that were used for this subtraction.
+#                 klip_args = {}
+#                 klip_args["mode"] = self.database.red[key]["MODE"][j]
+#                 klip_args["annuli"] = self.database.red[key]["ANNULI"][j]
+#                 klip_args["subsections"] = self.database.red[key]["SUBSECTS"][j]
+#                 klip_args["numbasis"] = [
+#                     int(nb) for nb in self.database.red[key]["KLMODES"][j].split(",")
+#                 ]
+#                 klip_args["algo"] = (
+#                     "klip"  # Currently not logged, may need changing in future.
+#                 )
+#                 _, _, maxnumbasis = get_pyklip_filepaths(
+#                     self.database, key, return_maxbasis=True
+#                 )  # ensure maxnumbasis is same as for rawcon / klipsub reduction
+#                 klip_args["maxnumbasis"] = maxnumbasis
+#                 inj_subdir = (
+#                     klip_args["mode"]
+#                     + "_NANNU"
+#                     + str(klip_args["annuli"])
+#                     + "_NSUBS"
+#                     + str(klip_args["subsections"])
+#                     + "_"
+#                     + key
+#                     + "/"
+#                 )
+#                 klip_args["movement"] = 1  # Currently not logged, fix later.
+#                 klip_args["calibrate_flux"] = False
+#                 klip_args["highpass"] = False
+#                 klip_args["verbose"] = False
+#                 inj_output_dir = os.path.join(output_dir, inj_subdir)
+#                 if not os.path.exists(inj_output_dir):
+#                     os.makedirs(inj_output_dir)
+#                 klip_args["outputdir"] = inj_output_dir
+
+#                 save_string = output_dir + "/" + file_str[:-5]
+#                 if use_saved:
+#                     log.info(
+#                         "Retrieving saved companion injection and recovery results."
+#                     )
+#                     all_inj_seps = np.load(save_string + "_injrec_seps.npy")
+#                     all_inj_pas = np.load(save_string + "_injrec_pas.npy")
+#                     all_inj_fluxes = np.load(save_string + "_injrec_inj_fluxes.npy")
+#                     all_retr_fluxes = np.load(save_string + "_injrec_retr_fluxes.npy")
+#                 else:
+#                     # Run the injection and recovery process
+#                     log.info(
+#                         "Injecting and recovering synthetic companions. This may take a while..."
+#                     )
+#                     inj_rec = inject_and_recover(
+#                         pyklip_dataset,
+#                         injection_psf=offsetpsf,
+#                         injection_seps=inj_seps_pix,
+#                         injection_pas=inj_pas,
+#                         injection_spacing=injection_spacing_pix,
+#                         injection_fluxes=inj_fluxes,
+#                         klip_args=klip_args,
+#                         retrieve_fwhm=resolution_fwhm,
+#                         true_companions=companions_pix,
+#                     )
+
+#                     # Unpack everything from the injection and recovery
+#                     all_inj_seps, all_inj_pas, all_inj_fluxes, all_retr_fluxes = inj_rec
+
+#                     # Save these arrays
+#                     np.save(save_string + "_injrec_seps.npy", all_inj_seps)
+#                     np.save(save_string + "_injrec_pas.npy", all_inj_pas)
+#                     np.save(save_string + "_injrec_inj_fluxes.npy", all_inj_fluxes)
+#                     np.save(save_string + "_injrec_retr_fluxes.npy", all_retr_fluxes)
+
+#                 # Need to add a point at a separation of zero pixels, assume
+#                 # basically no flux retrieved at zero separation.
+#                 all_inj_seps = np.append([0], all_inj_seps)
+#                 all_inj_pas = np.append([0], all_inj_pas)
+#                 all_inj_fluxes = np.append([1], all_inj_fluxes)
+#                 zero_sep_retr_flux = 1e-10 * np.ones_like(all_retr_fluxes[0])
+#                 all_retr_fluxes = np.vstack([zero_sep_retr_flux, all_retr_fluxes])
+
+#                 # Separation returned in pixels but we want arcseconds
+#                 all_inj_seps *= pxsc_arcsec
+
+#                 # Need to loop over each KL mode used to compute a correction
+#                 # for each.
+#                 rawcons_corr = []
+#                 maskcons_corr = []
+#                 all_corrections = []
+#                 for k in range(len(rawseps)):
+#                     # Get the raw separation and contrast for this KL mode
+#                     this_KL_rawseps = rawseps[k]
+#                     this_KL_rawcons = rawcons[k]
+#                     this_KL_maskcons = maskcons[k]
+
+#                     # Get fluxes for this KL mode subtracted image
+#                     this_KL_retr_fluxes = all_retr_fluxes[:, k]
+
+#                     # Make a table to make things easier
+#                     results = Table(
+#                         [
+#                             all_inj_seps,
+#                             all_inj_pas,
+#                             all_inj_fluxes,
+#                             this_KL_retr_fluxes,
+#                         ],
+#                         names=("inj_seps", "inj_pas", "inj_fluxes", "retr_fluxes"),
+#                     )
+
+#                     # Determine throughput of klip process on the injected flux
+#                     results["klip_thrputs"] = np.divide(
+#                         results["retr_fluxes"], results["inj_fluxes"]
+#                     )
+
+#                     # Calculate the median across all position angles
+#                     med_results = results.group_by("inj_seps").groups.aggregate(
+#                         np.nanmedian
+#                     )
+
+#                     # Need to interpolate or model to determine throughput at actual
+#                     # separations of the contrast curve.
+#                     if thrput_fit_method == "median":
+#                         med_interp = interp1d(
+#                             med_results["inj_seps"],
+#                             med_results["klip_thrputs"],
+#                             fill_value=(1e-10, med_results["klip_thrputs"][-1]),
+#                             bounds_error=False,
+#                             kind="slinear",
+#                         )
+#                         contrast_correction = med_interp(this_KL_rawseps)
+#                     elif thrput_fit_method == "log_grow":
+#                         raise NotImplementedError()
+#                     else:
+#                         raise ValueError(
+#                             "Invalid thrput_fit_method: "
+#                             + "{}, options are 'median' or 'log_grow'".format(
+#                                 thrput_fit_method
+#                             )
+#                         )
+
+#                     # Apply contrast correction
+#                     rawcons_corr.append(rawcons[k] / contrast_correction)
+#                     maskcons_corr.append(maskcons[k] / contrast_correction)
+#                     all_corrections.append(contrast_correction)
+
+#                 all_corrections = np.squeeze(all_corrections)  # Tidy array
+#                 # Need to make sure its not 1D for number of different KL modes == 1 case
+#                 if all_corrections.ndim == 1:
+#                     all_corrections = all_corrections[np.newaxis, :]
+
+#                 # Save the corrected contrasts, as well as the separations for convenience.
+#                 np.save(save_string + "_cal_seps.npy", rawseps)
+#                 np.save(save_string + "_cal_cons.npy", rawcons_corr)
+#                 np.save(save_string + "_cal_maskcons.npy", maskcons_corr)
+
+#                 # Define some local utilty functions for plot setup.
+#                 # This makes the plotting code below less repetitive and more consistent
+
+#                 def standardize_plots_setup(plot_style=None):
+#                     # Intialize the matplotlib style.
+#                     load_plt_style(plot_style)
+
+#                     fig = plt.figure(figsize=(6.4, 4.8))
+#                     ax = plt.gca()
+#                     color = plt.cm.tab10(np.linspace(0, 1, 10))
+#                     cc = cycler(linestyle=["-", ":", "--"]) * cycler(color=color)
+#                     ax.set_prop_cycle(cc)
+#                     return fig, ax
+
+#                 def standardize_plots_annotate_save(
+#                     ax,
+#                     title="",
+#                     ylabel="Throughput",
+#                     xlim=plot_xlim,
+#                     filename=None,
+#                     plot_style=None,
+#                 ):
+#                     # Intialize the matplotlib style.
+#                     load_plt_style(plot_style)
+
+#                     ax.set_xlabel('Separation (")')
+#                     ax.set_title(title, fontsize=11)
+#                     if ylabel == "Throughput":
+#                         ax.set_ylim(0, 1)
+#                         ax.set_ylabel("Throughput")
+#                     else:  # or else it's contrast on a log scale
+#                         ax.set_yscale("log")
+#                         ax.set_ylabel(r"5-$\sigma$ contrast")
+#                         ax.set_ylim(None, 1)
+#                     if xlim is not None:
+#                         ax.set_xlim(*xlim)
+#                     ax.grid(axis="both", alpha=0.15)
+#                     if filename is not None:
+#                         plt.savefig(filename, bbox_inches="tight", dpi=300)
+
+#                 # Plot measured KLIP throughputs, for all KL modes
+#                 fig, ax = standardize_plots_setup(plot_style=plot_style)
+
+#                 for ci, corr in enumerate(all_corrections):
+#                     KLmodes = klip_args["numbasis"][ci]
+#                     ax.plot(rawseps[ci], corr, label="KL = {}".format(KLmodes))
+#                 ax.legend(ncol=3, fontsize=10)
+#                 standardize_plots_annotate_save(
+#                     ax,
+#                     title=f"Injected companions in {filt}, {psfsub_strategy}, all KL modes",
+#                     ylabel="Throughput",
+#                     filename=save_string + "_allKL_throughput.pdf",
+#                     plot_style=plot_style,
+#                 )
+#                 plt.close(fig)
+
+#                 # Plot individual measurements for median KL mode
+#                 fig, ax = standardize_plots_setup(plot_style=plot_style)
+
+#                 ax.plot(
+#                     rawseps[median_KL_index],
+#                     all_corrections[median_KL_index],
+#                     label="Applied Correction",
+#                     color="#0B5345",
+#                     zorder=100,
+#                 )
+#                 ax.scatter(
+#                     all_inj_seps,
+#                     all_retr_fluxes[:, median_KL_index] / all_inj_fluxes,
+#                     s=75,
+#                     color="mediumaquamarine",
+#                     alpha=0.5,
+#                     label="Individual Injections",
+#                 )
+#                 ax.legend(fontsize=10)
+#                 standardize_plots_annotate_save(
+#                     ax,
+#                     title=f"Injected companions in {filt}, {psfsub_strategy}, for KL={klip_args['numbasis'][median_KL_index]}",
+#                     ylabel="Throughput",
+#                     filename=save_string + "_medKL_throughput.pdf",
+#                     plot_style=plot_style,
+#                 )
+#                 plt.close(fig)
+
+#                 # Plot calibrated contrast curves
+#                 fig, ax = standardize_plots_setup(plot_style=plot_style)
+#                 for si, seps in enumerate(rawseps):
+#                     KLmodes = klip_args["numbasis"][si]
+#                     ax.plot(
+#                         seps, maskcons_corr[si], label=f"KL = {KLmodes}", color=f"C{si}"
+#                     )
+#                     ax.plot(seps, rawcons_corr[si], alpha=0.3, ls="--", color=f"C{si}")
+#                 ax.legend(
+#                     loc="upper right",
+#                     ncols=3,
+#                     fontsize=10,
+#                     title="Dashed lines exclude coronagraph mask throughput",
+#                     title_fontsize=10,
+#                 )
+#                 standardize_plots_annotate_save(
+#                     ax,
+#                     title=f"Calibrated contrast in {filt}, {psfsub_strategy}",
+#                     ylabel="Contrast",
+#                     filename=save_string + "_calcon.pdf",
+#                     plot_style=plot_style,
+#                 )
+#                 plt.close(fig)
+
+#                 # Plot calibrated contrast curves compared to raw
+#                 fig, ax = standardize_plots_setup(plot_style=plot_style)
+#                 for si, seps in enumerate(rawseps):
+#                     KLmodes = klip_args["numbasis"][si]
+#                     ax.plot(
+#                         seps, maskcons_corr[si], label=f"KL = {KLmodes}", color=f"C{si}"
+#                     )
+#                     ax.plot(seps, maskcons[si], alpha=0.3, ls=":", color=f"C{si}")
+#                 ax.legend(
+#                     loc="upper right",
+#                     ncols=3,
+#                     fontsize=10,
+#                     title="Solid lines = calibrated, dotted lines = raw",
+#                     title_fontsize=10,
+#                 )
+#                 standardize_plots_annotate_save(
+#                     ax,
+#                     title=f"Calibrated contrast vs Raw contrast in {filt}, {psfsub_strategy}",
+#                     ylabel="Contrast",
+#                     filename=save_string + "_calcon_vs_rawcon.pdf",
+#                     plot_style=plot_style,
+#                 )
+#                 plt.close(fig)
+
+#     def extract_companions(
+#         self,
+#         companions,
+#         starfile,
+#         mstar_err,
+#         spectral_type="G2V",
+#         planetfile=None,
+#         klmode="max",
+#         date="auto",
+#         use_fm_psf=True,
+#         flip_fmpsf_xy=None,
+#         highpass=False,
+#         fitmethod="mcmc",
+#         minmethod=None,
+#         fitkernel="diag",
+#         subtract=True,
+#         inject=False,
+#         remove_background=False,
+#         save_preklip=False,
+#         overwrite=True,
+#         subdir="companions",
+#         save_figures=True,
+#         **kwargs,
+#     ):
+#         """
+#         Extract the best fit parameters of a number of companions from each
+#         reduction in the spaceKLIP reductions database.
+
+#         Parameters
+#         ----------
+#         companions : list of list of three float, optional
+#             List of companions to be extracted. For each companion, there
+#             should be a three element list containing guesses for [RA offset
+#             (arcsec), Dec offset (arcsec), contrast].
+#         starfile : path
+#             Path of VizieR VOTable containing host star photometry or two
+#             column TXT file with wavelength (micron) and flux (Jy).
+#         mstar_err : float or dict of float
+#             Error on the host star magnitude. If float, will use the same value
+#             for each filter. If dict of float, the dictionary keys must be the
+#             JWST filters in use and a different value can be used for each
+#             filter.
+#         spectral_type : str, optional
+#             Host star spectral type for the stellar model SED. The default is
+#             'G2V'.
+#         planetfile : path
+#             Path of VizieR VOTable containing companion photometry or two
+#             column TXT file with wavelength (micron) and flux (Jy).
+#         klmode : int or 'max', optional
+#             KL mode for which the companions shall be extracted. If 'max', then
+#             the maximum possible KL mode will be used. The default is 'max'.
+#         date : str, optional
+#             Observation date in the format 'YYYY-MM-DDTHH:MM:SS.MMM'. Will
+#             query for the wavefront measurement closest in time to the given
+#             date. If 'auto', will grab date from the FITS file header. If None,
+#             then the default WebbPSF OPD is used (RevAA). The default is
+#             'auto'.
+#         use_fm_psf : bool, optional
+#             If True, use a FM PSF generated with pyKLIP, otherwise use a more
+#             simple integration time-averaged model offset PSF which does not
+#             incorporate any KLIP throughput losses. The default is True.
+#         flip_fmpsf_xy : str, optional
+#             If 'x', flip the x-axis of the FM PSF. If 'y', flip the y-axis of the FM PSF. 'xy' or 'yx' for both.
+#         highpass : bool or float, optional
+#             If float, will apply a high-pass filter to the FM PSF and KLIP
+#             dataset. The default is False.
+#         fitmethod : 'mcmc' or 'nested', optional
+#             Sampling algorithm which shall be used. If None and minmethod not None, it will mock the MCMC fit results
+#             using the initial guesses and perform only the Gaussian convolution fit to estimate extension.
+#             The default is 'mcmc'.
+#         minmethod: str, optional
+#             scipy.optimize.minimize minimization method which shall be used to fit for the extension of the source.
+#             The default is None.
+#         fitkernel : str, optional
+#             Pyklip.fitpsf.FitPSF covariance kernel which shall be used for the
+#             Gaussian process regression. The default is 'diag'.
+#         subtract : bool, optional
+#             If True, subtract each extracted companion from the pyKLIP dataset
+#             before fitting the next one in the list. The default is True.
+#         inject : bool, optional
+#             Instead of fitting for a companion at the guessed location and
+#             contrast, inject one into the data.
+#         remove_background : bool, optional
+#             Remove a constant background level from the KLIP-subtracted data
+#             before fitting the FM PSF. The default is False.
+#         save_preklip : bool, optional
+#             Save the stage 2 files when injecting/killing a companion? The
+#             default is False.
+#         overwrite : bool, optional
+#             If True, compute a new FM PSF and overwrite any existing one,
+#             otherwise try to load an existing one and only compute a new one if
+#             none exists yet. The default is True.
+#         subdir : str, optional
+#             Name of the directory where the data products shall be saved. The
+#             default is 'companions'.
+#         save_figures : bool, optional
+#             Save the plots in a PDF?
+
+#         Returns
+#         -------
+#         None.
+
+#         """
+
+#         # Check input.
+#         kwargs_temp = {}
+
+#         # Set output directory.
+#         output_dir = os.path.join(self.database.output_dir, subdir)
+#         if not os.path.exists(output_dir):
+#             os.makedirs(output_dir)
+
+#         # Loop through concatenations.
+#         for i, key in enumerate(self.database.red.keys()):
+#             log.info("--> Concatenation " + key)
+
+#             # Loop through FITS files.
+#             nfitsfiles = len(self.database.red[key])
+#             for j in range(nfitsfiles):
+#                 # Get stellar magnitudes and filter zero points.
+#                 mstar, fzero, fzero_si = get_stellar_magnitudes(
+#                     starfile,
+#                     spectral_type,
+#                     self.database.red[key]["INSTRUME"][j],
+#                     return_si=True,
+#                     output_dir=output_dir,
+#                     **kwargs,
+#                 )  # vegamag, Jy, erg/cm^2/s/A
+
+#                 # Get COM substrate throughput.
+#                 tp_comsubst = ut.get_tp_comsubst(
+#                     self.database.red[key]["INSTRUME"][j],
+#                     self.database.red[key]["SUBARRAY"][j],
+#                     self.database.red[key]["FILTER"][j],
+#                 )
+
+#                 # Compute the pixel area in steradian.
+#                 pxsc_arcsec = self.database.red[key]["PIXSCALE"][j]  # arcsec
+#                 pxsc_rad = pxsc_arcsec / 3600.0 / 180.0 * np.pi  # rad
+#                 pxar = self.database.red[key]["PIXAR_SR"][j]  # sr
+#                 if np.isnan(pxar):
+#                     log.warning(
+#                         "PIXAR_SR not found in database, falling back to use PIXSCALE"
+#                     )
+#                     pxar = pxsc_rad**2  # sr
+
+#                 # Compute the resolution element. Account for possible
+#                 # blurring.
+#                 if self.database.red[key]["TELESCOP"][j] == "JWST":
+#                     if self.database.red[key]["EXP_TYPE"][j] in ["NRC_CORON"]:
+#                         diam = 5.2
+#                     else:
+#                         diam = JWST_CIRCUMSCRIBED_DIAMETER
+#                 else:
+#                     raise UserWarning("Data originates from unknown telescope")
+#                 resolution = (
+#                     1e-6 * self.database.red[key]["CWAVEL"][j] / diam / pxsc_rad
+#                 )  # pix
+#                 if not np.isnan(self.database.obs[key]["BLURFWHM"][j]):
+#                     resolution = np.hypot(
+#                         resolution, self.database.obs[key]["BLURFWHM"][j]
+#                     )
+
+#                 # Find science and reference files.
+#                 filepaths, psflib_filepaths, maxnumbasis = get_pyklip_filepaths(
+#                     self.database, key, return_maxbasis=True
+#                 )
+#                 if (
+#                     "maxnumbasis" not in kwargs_temp.keys()
+#                     or kwargs_temp["maxnumbasis"] is None
+#                 ):
+#                     kwargs_temp["maxnumbasis"] = maxnumbasis
+
+#                 # Initialize pyKLIP dataset.
+#                 pop_pxar_kw(np.append(filepaths, psflib_filepaths))
+#                 dataset = JWSTData(filepaths, psflib_filepaths, highpass=highpass)
+#                 kwargs_temp["dataset"] = dataset
+#                 kwargs_temp["aligned_center"] = dataset._centers[0]
+#                 kwargs_temp["psf_library"] = dataset.psflib
+
+#                 # Make copy of the original pyKLIP dataset.
+#                 dataset_orig = copy.deepcopy(dataset)
+
+#                 # Get index of desired KL mode.
+#                 klmodes = self.database.red[key]["KLMODES"][j].split(",")
+#                 klmodes = np.array([int(temp) for temp in klmodes])
+#                 if klmode == "max":
+#                     klindex = np.argmax(klmodes)
+#                 else:
+#                     klindex = klmodes.tolist().index(klmode)
+
+#                 # Set output directories.
+#                 output_dir_kl = os.path.join(output_dir, "KL%.0f" % klmodes[klindex])
+#                 if not os.path.exists(output_dir_kl):
+#                     os.makedirs(output_dir_kl)
+
+#                 # Initialize a function that can generate model offset PSFs.
+#                 inst = self.database.red[key]["INSTRUME"][j]
+#                 filt = self.database.red[key]["FILTER"][j]
+#                 apername = self.database.red[key]["APERNAME"][j]
+#                 if self.database.red[key]["TELESCOP"][j] == "JWST":
+#                     if inst == "NIRCAM":
+#                         pass
+#                         # image_mask = self.database.red[key]['CORONMSK'][j]
+#                         # image_mask = image_mask[:4] + image_mask[5:]
+#                     elif inst == "NIRISS":
+#                         raise NotImplementedError()
+#                     elif inst == "MIRI":
+#                         pass
+#                         # image_mask = self.database.red[key]['CORONMSK'][j].replace('4QPM_', 'FQPM')
+#                     else:
+#                         raise UserWarning(
+#                             "Data originates from unknown JWST instrument"
+#                         )
+#                 else:
+#                     raise UserWarning("Data originates from unknown telescope")
+#                 if planetfile is None:
+#                     # Keep backward compatibility where planetfile was part of
+#                     # the kwargs.
+#                     if (
+#                         "planetfile" in kwargs.keys()
+#                         and kwargs["planetfile"] is not None
+#                     ):
+#                         planetfile = kwargs["planetfile"]
+#                 if planetfile is not None:
+#                     sed = read_spec_file(planetfile)
+#                 else:
+#                     sed = None
+#                 ww_sci = np.where(self.database.obs[key]["TYPE"] == "SCI")[0]
+#                 if date is not None:
+#                     if date == "auto":
+#                         date = fits.getheader(
+#                             self.database.obs[key]["FITSFILE"][ww_sci[0]], 0
+#                         )["DATE-BEG"]
+#                 offsetpsf_func = JWST_PSF(
+#                     apername,
+#                     filt,
+#                     date=date,
+#                     fov_pix=65,
+#                     oversample=2,
+#                     sp=sed,
+#                     use_coeff=False,
+#                 )
+
+#                 # NOTE: if minmethod not None, it will split the fit into a fitmethod (e.g. mcmc) for the estimation
+#                 # of position and flux, and a minmethod (e.g. Powell) to fit the extension of the source using a
+#                 # psf convolved by a 2D Gaussian and a minimization approach.
+#                 if minmethod is not None:
+#                     split_fit = True
+#                 else:
+#                     split_fit = False
+
+#                 if split_fit:
+#                     if not all(
+#                         x in kwargs.keys()
+#                         for x in [
+#                             "sigma_xguess",
+#                             "sigma_yguess",
+#                             "scale_guess",
+#                             "theta_guess",
+#                         ]
+#                     ):
+#                         gauss_param_guesses = [0.3, 0.3, 0, 0]
+#                     else:
+#                         gauss_param_guesses = [
+#                             kwargs["sigma_xguess"],
+#                             kwargs["sigma_yguess"],
+#                             kwargs["scale_guess"],
+#                             kwargs["theta_guess"],
+#                         ]
+
+#                     # Loop through companions.
+#                     tab = Table(
+#                         names=(
+#                             "ID",
+#                             "RA",
+#                             "RA_ERR",
+#                             "DEC",
+#                             "DEC_ERR",
+#                             "FLUX_JY",
+#                             "FLUX_JY_ERR",
+#                             "FLUX_SI",
+#                             "FLUX_SI_ERR",
+#                             "FLUX_SI_ALT",
+#                             "FLUX_SI_ALT_ERR",
+#                             "CON",
+#                             "CON_ERR",
+#                             "DELMAG",
+#                             "DELMAG_ERR",
+#                             "APPMAG",
+#                             "APPMAG_ERR",
+#                             "MSTAR",
+#                             "MSTAR_ERR",
+#                             "SNR",
+#                             "LN(Z/Z0)",
+#                             "TP_CORONMSK",
+#                             "TP_COMSUBST",
+#                             "FITSFILE",
+#                             "GSCALE",
+#                             "GSCALE_ERROR",
+#                             "SIGMA_X",
+#                             "SIGMA_X_ERROR",
+#                             "SIGMA_Y",
+#                             "SIGMA_Y_ERROR",
+#                             "THETA",
+#                             "THETA_ERROR",
+#                         ),
+#                         dtype=(
+#                             "int",
+#                             "float",
+#                             "float",
+#                             "float",
+#                             "float",
+#                             "float",
+#                             "float",
+#                             "float",
+#                             "float",
+#                             "float",
+#                             "float",
+#                             "float",
+#                             "float",
+#                             "float",
+#                             "float",
+#                             "float",
+#                             "float",
+#                             "float",
+#                             "float",
+#                             "float",
+#                             "float",
+#                             "float",
+#                             "float",
+#                             "object",
+#                             "float",
+#                             "float",
+#                             "float",
+#                             "float",
+#                             "float",
+#                             "float",
+#                             "float",
+#                             "float",
+#                         ),
+#                     )
+#                 else:
+#                     # Loop through companions.
+#                     tab = Table(
+#                         names=(
+#                             "ID",
+#                             "RA",
+#                             "RA_ERR",
+#                             "DEC",
+#                             "DEC_ERR",
+#                             "FLUX_JY",
+#                             "FLUX_JY_ERR",
+#                             "FLUX_SI",
+#                             "FLUX_SI_ERR",
+#                             "FLUX_SI_ALT",
+#                             "FLUX_SI_ALT_ERR",
+#                             "CON",
+#                             "CON_ERR",
+#                             "DELMAG",
+#                             "DELMAG_ERR",
+#                             "APPMAG",
+#                             "APPMAG_ERR",
+#                             "MSTAR",
+#                             "MSTAR_ERR",
+#                             "SNR",
+#                             "LN(Z/Z0)",
+#                             "TP_CORONMSK",
+#                             "TP_COMSUBST",
+#                             "FITSFILE",
+#                         ),
+#                         dtype=(
+#                             "int",
+#                             "float",
+#                             "float",
+#                             "float",
+#                             "float",
+#                             "float",
+#                             "float",
+#                             "float",
+#                             "float",
+#                             "float",
+#                             "float",
+#                             "float",
+#                             "float",
+#                             "float",
+#                             "float",
+#                             "float",
+#                             "float",
+#                             "float",
+#                             "float",
+#                             "float",
+#                             "float",
+#                             "float",
+#                             "float",
+#                             "object",
+#                         ),
+#                     )
+#                 for k in range(len(companions)):
+#                     output_dir_comp = os.path.join(output_dir_kl, "C%.0f" % (k + 1))
+#                     if not os.path.exists(output_dir_comp):
+#                         os.makedirs(output_dir_comp)
+#                     output_dir_fm = os.path.join(output_dir_comp, "KLIP_FM")
+#                     if not os.path.exists(output_dir_fm):
+#                         os.makedirs(output_dir_fm)
+#                     if save_preklip:
+#                         output_dir_pk = os.path.join(output_dir_comp, "PREKLIP")
+#                         if not os.path.exists(output_dir_pk):
+#                             os.makedirs(output_dir_pk)
+
+#                     # Offset PSF that is not affected by the coronagraphic
+#                     # mask, but only the Lyot stop.
+#                     psf_no_coronmsk = offsetpsf_func.psf_off
+
+#                     # Initial guesses for the fit parameters.
+#                     guess_dx = companions[k][0] / pxsc_arcsec  # pix
+#                     guess_dy = companions[k][1] / pxsc_arcsec  # pix
+#                     guess_flux = companions[k][2]  # contrast
+#                     guess_spec = np.array([1.0])
+#                     guess_sep = np.sqrt(guess_dx**2 + guess_dy**2)  # pix
+#                     guess_pa = np.rad2deg(np.arctan2(guess_dx, guess_dy))  # deg
+
+#                     # The initial guesses are made in RA/Dec space, but the
+#                     # model PSFs are defined by the offset between the
+#                     # coronagraphic mask center and the companion. Hence, we
+#                     # need to generate a separate model PSF for each roll.
+#                     rot_offsetpsfs = []
+#                     sci_totinttime = []
+#                     all_offsetpsfs = []
+#                     all_offsetpsfs_nohpf = []
+#                     all_pas = []
+#                     scale_factor_avg = []
+#                     for ww in ww_sci:
+#                         roll_ref = self.database.obs[key]["ROLL_REF"][ww]  # deg
+
+#                         # Get shift between star and coronagraphic mask
+#                         # position. If positive, the coronagraphic mask center
+#                         # is to the left/bottom of the star position.
+#                         _, _, _, _, _, _, _, _, _, _, maskoffs = ut.read_obs(
+#                             self.database.obs[key]["FITSFILE"][ww]
+#                         )
+
+#                         # NIRCam.
+#                         if maskoffs is not None:
+#                             mask_xoff = -maskoffs[:, 0]  # pix
+#                             mask_yoff = -maskoffs[:, 1]  # pix
+
+#                             # Need to rotate by the roll angle (CCW) and flip
+#                             # the x-axis so that positive RA is to the left.
+#                             mask_raoff = -(
+#                                 mask_xoff * np.cos(np.deg2rad(roll_ref))
+#                                 - mask_yoff * np.sin(np.deg2rad(roll_ref))
+#                             )  # pix
+#                             mask_deoff = mask_xoff * np.sin(
+#                                 np.deg2rad(roll_ref)
+#                             ) + mask_yoff * np.cos(np.deg2rad(roll_ref))  # pix
+
+#                             # Compute the true offset between the companion and
+#                             # the coronagraphic mask center.
+#                             sim_dx = guess_dx - mask_raoff  # pix
+#                             sim_dy = guess_dy - mask_deoff  # pix
+#                             sim_sep = (
+#                                 np.sqrt(sim_dx**2 + sim_dy**2) * pxsc_arcsec
+#                             )  # arcsec
+#                             sim_pa = np.rad2deg(np.arctan2(sim_dx, sim_dy))  # deg
+
+#                             # Take median of observation. Typically, each
+#                             # dither position is a separate observation.
+#                             sim_sep = np.median(sim_sep)
+#                             sim_pa = np.median(sim_pa)
+
+#                         # Otherwise.
+#                         else:
+#                             sim_sep = (
+#                                 np.sqrt(guess_dx**2 + guess_dy**2) * pxsc_arcsec
+#                             )  # arcsec
+#                             sim_pa = np.rad2deg(np.arctan2(guess_dx, guess_dy))  # deg
+
+#                         # Generate offset PSF for this roll angle. Do not add
+#                         # the V3Yidl angle as it has already been added to the
+#                         # roll angle by spaceKLIP. This is only for estimating
+#                         # the coronagraphic mask throughput!
+#                         offsetpsf_coronmsk = offsetpsf_func.gen_psf(
+#                             [sim_sep, sim_pa],
+#                             mode="rth",
+#                             PA_V3=roll_ref,
+#                             do_shift=False,
+#                             quick=True,
+#                             addV3Yidl=False,
+#                         )
+
+#                         # Coronagraphic mask throughput is not incorporated
+#                         # into the flux calibration of the JWST pipeline so
+#                         # that the companion flux from the detector pixels will
+#                         # be underestimated. Therefore, we need to scale the
+#                         # model offset PSF to account for the coronagraphic
+#                         # mask throughput (it becomes fainter). Compute scale
+#                         # factor by comparing a model PSF with and without
+#                         # coronagraphic mask.
+#                         scale_factor = np.sum(offsetpsf_coronmsk) / np.sum(
+#                             psf_no_coronmsk
+#                         )
+#                         scale_factor_avg += [scale_factor]
+
+#                         # Normalize model offset PSF to a total integrated flux
+#                         # of 1 at infinity. Generates a new webbpsf model with
+#                         # PSF normalization set to 'exit_pupil'.
+#                         offsetpsf = offsetpsf_func.gen_psf(
+#                             [sim_sep, sim_pa],
+#                             mode="rth",
+#                             PA_V3=roll_ref,
+#                             do_shift=False,
+#                             quick=False,
+#                             addV3Yidl=False,
+#                             normalize="exit_pupil",
+#                         )
+
+#                         # Normalize model offset PSF by the flux of the star.
+#                         offsetpsf *= (
+#                             fzero[filt] / 10 ** (mstar[filt] / 2.5) / 1e6 / pxar
+#                         )  # MJy/sr
+
+#                         # Apply scale factor to incorporate the coronagraphic
+#                         # mask througput.
+#                         # NOTE: There is no need to apply a correction for the substrate
+#                         # as this is accounted for by the pipeline.
+#                         offsetpsf *= scale_factor
+
+#                         # Flip model PSF in x or y direction if requested
+#                         if flip_fmpsf_xy is not None:
+#                             if flip_fmpsf_xy == "x":
+#                                 offsetpsf = np.fliplr(offsetpsf)
+#                             elif flip_fmpsf_xy == "y":
+#                                 offsetpsf = np.flipud(offsetpsf)
+#                             elif flip_fmpsf_xy == "xy" or flip_fmpsf_xy == "yx":
+#                                 offsetpsf = np.flipud(np.fliplr(offsetpsf))
+#                             else:
+#                                 raise ValueError(
+#                                     'flip_fmpsf_xy must be "x", "y", "xy", or "yx".'
+#                                 )
+
+#                         # Blur frames with a Gaussian filter.
+#                         if not np.isnan(self.database.obs[key]["BLURFWHM"][ww]):
+#                             gauss_sigma = self.database.obs[key]["BLURFWHM"][
+#                                 j
+#                             ] / np.sqrt(8.0 * np.log(2.0))
+#                             offsetpsf = gaussian_filter(offsetpsf, gauss_sigma)
+
+#                         # Apply high-pass filter.
+#                         offsetpsf_nohpf = copy.deepcopy(offsetpsf)
+#                         if not isinstance(highpass, bool):
+#                             highpass = float(highpass)
+#                             fourier_sigma_size = (offsetpsf.shape[0] / highpass) / (
+#                                 2.0 * np.sqrt(2.0 * np.log(2.0))
+#                             )
+#                             offsetpsf = parallelized.high_pass_filter_imgs(
+#                                 np.array([offsetpsf]),
+#                                 numthreads=None,
+#                                 filtersize=fourier_sigma_size,
+#                             )[0]
+#                         else:
+#                             if highpass:
+#                                 raise NotImplementedError()
+
+#                         # Save rotated model offset PSFs in case we do not end
+#                         # up using FM.
+#                         nints = self.database.obs[key]["NINTS"][ww]
+#                         effinttm = self.database.obs[key]["EFFINTTM"][ww]
+#                         rot_offsetpsf = rotate(
+#                             offsetpsf,
+#                             -roll_ref,
+#                             reshape=False,
+#                             mode="constant",
+#                             cval=0.0,
+#                         )
+#                         rot_offsetpsfs.extend([rot_offsetpsf])  # do not duplicate
+#                         sci_totinttime.extend([nints * effinttm])
+
+#                         # Save non-rotated model offset PSFs for the FM.
+#                         all_offsetpsfs.extend([offsetpsf for ni in range(nints)])
+#                         all_offsetpsfs_nohpf.extend(
+#                             [offsetpsf_nohpf for ni in range(nints)]
+#                         )
+#                         all_pas.extend([roll_ref for ni in range(nints)])
+#                     scale_factor_avg = np.sum(
+#                         [
+#                             scale_factor_avg[l]
+#                             * sci_totinttime[l]
+#                             / np.sum(sci_totinttime)
+#                             for l in range(len(scale_factor_avg))
+#                         ]
+#                     )
+
+#                     # Compute the FM dataset if it does not exist yet, or if
+#                     # overwrite is True.
+#                     # Compute the FM dataset.
+#                     mode = self.database.red[key]["MODE"][j]
+#                     annuli = int(self.database.red[key]["ANNULI"][j])
+#                     subsections = int(self.database.red[key]["SUBSECTS"][j])
+#                     fmdataset = os.path.join(
+#                         output_dir_fm,
+#                         "FM-"
+#                         + mode
+#                         + "_NANNU"
+#                         + str(annuli)
+#                         + "_NSUBS"
+#                         + str(subsections)
+#                         + "_"
+#                         + key
+#                         + "-fmpsf-KLmodes-all.fits",
+#                     )
+#                     klipdataset = os.path.join(
+#                         output_dir_fm,
+#                         "FM-"
+#                         + mode
+#                         + "_NANNU"
+#                         + str(annuli)
+#                         + "_NSUBS"
+#                         + str(subsections)
+#                         + "_"
+#                         + key
+#                         + "-klipped-KLmodes-all.fits",
+#                     )
+#                     if overwrite or (
+#                         not os.path.exists(fmdataset) or not os.path.exists(klipdataset)
+#                     ):
+#                         # Initialize the pyKLIP FM class. Use sep/pa relative
+#                         # to the star and not the coronagraphic mask center.
+#                         input_wvs = np.unique(dataset.wvs)
+#                         if len(input_wvs) != 1:
+#                             raise NotImplementedError(
+#                                 "Only implemented for broadband photometry"
+#                             )
+#                         fm_class = fmpsf.FMPlanetPSF(
+#                             inputs_shape=dataset.input.shape,
+#                             numbasis=klmodes,
+#                             sep=guess_sep,
+#                             pa=guess_pa,
+#                             dflux=guess_flux,
+#                             input_psfs=np.array(all_offsetpsfs),
+#                             input_wvs=input_wvs,
+#                             spectrallib=[guess_spec],
+#                             spectrallib_units="contrast",
+#                             field_dependent_correction=None,
+#                             input_psfs_pas=all_pas,
+#                         )
+
+#                         if not isinstance(highpass, bool):
+#                             if k == 0:
+#                                 highpass_temp = float(highpass)
+#                             else:
+#                                 highpass_temp = False
+#                         else:
+#                             if highpass:
+#                                 raise NotImplementedError()
+#                             else:
+#                                 highpass_temp = False
+#                         fm.klip_dataset(
+#                             dataset=dataset,
+#                             fm_class=fm_class,
+#                             mode=mode,
+#                             outputdir=output_dir_fm,
+#                             fileprefix="FM-"
+#                             + mode
+#                             + "_NANNU"
+#                             + str(annuli)
+#                             + "_NSUBS"
+#                             + str(subsections)
+#                             + "_"
+#                             + key,
+#                             annuli=annuli,
+#                             subsections=subsections,
+#                             movement=1.0,
+#                             numbasis=klmodes,
+#                             maxnumbasis=maxnumbasis,
+#                             calibrate_flux=False,
+#                             aligned_center=dataset._centers[0],
+#                             psf_library=dataset.psflib,
+#                             highpass=highpass_temp,
+#                             mute_progression=True,
+#                         )
+
+#                     # Open the FM dataset.
+#                     with fits.open(fmdataset) as hdul:
+#                         fm_frame = hdul[0].data[klindex]
+#                         fm_centx = hdul[0].header["PSFCENTX"]
+#                         fm_centy = hdul[0].header["PSFCENTY"]
+#                     with fits.open(klipdataset) as hdul:
+#                         data_frame = hdul[0].data[klindex]
+#                         data_centx = hdul[0].header["PSFCENTX"]
+#                         data_centy = hdul[0].header["PSFCENTY"]
+
+#                     # If use_fm_psf is False, then replace the FM PSF in the
+#                     # fm_frame with an integration time-averaged model offset
+#                     # PSF.
+#                     if use_fm_psf == False:
+#                         av_offsetpsf = np.average(
+#                             rot_offsetpsfs, weights=sci_totinttime, axis=0
+#                         )
+#                         sx = av_offsetpsf.shape[1]
+#                         sy = av_offsetpsf.shape[0]
+
+#                         # Make sure that the model offset PSF has odd shape and
+#                         # perform the required subpixel shift before inserting
+#                         # it into the fm_frame.
+#                         if (sx % 2 != 1) or (sy % 2 != 1):
+#                             raise UserWarning("Model offset PSF must be of odd shape")
+#                         xshift = (fm_centx - int(fm_centx)) - (guess_dx - int(guess_dx))
+#                         yshift = (fm_centy - int(fm_centy)) + (guess_dy - int(guess_dy))
+#                         stamp = spline_shift(
+#                             av_offsetpsf,
+#                             (yshift, xshift),
+#                             order=3,
+#                             mode="constant",
+#                             cval=0.0,
+#                         )
+
+#                         # Also need to scale the model offset PSF by the
+#                         # guessed flux.
+#                         stamp *= guess_flux
+
+#                         # Insert the model offset PSF into the fm_frame.
+#                         fm_frame[:, :] = 0.0
+#                         fm_frame[
+#                             int(fm_centy) + int(guess_dy) - sy // 2 : int(fm_centy)
+#                             + int(guess_dy)
+#                             + sy // 2
+#                             + 1,
+#                             int(fm_centx) - int(guess_dx) - sx // 2 : int(fm_centx)
+#                             - int(guess_dx)
+#                             + sx // 2
+#                             + 1,
+#                         ] = stamp
+
+#                     # assign forward model kwargs
+#                     if "boxsize" not in kwargs.keys() or kwargs["boxsize"] is None:
+#                         boxsize = 35
+#                     else:
+#                         boxsize = kwargs["boxsize"]
+#                     if "dr" not in kwargs.keys() or kwargs["dr"] is None:
+#                         dr = 5
+#                     else:
+#                         dr = kwargs["dr"]
+#                     if "exclr" not in kwargs.keys() or kwargs["exclr"] is None:
+#                         exclr = 3 * resolution
+#                     else:
+#                         exclr = kwargs["exclr"] * resolution
+#                     if "xrange" not in kwargs.keys() or kwargs["xrange"] is None:
+#                         xrange = 3.0
+#                     else:
+#                         xrange = kwargs["xrange"]
+#                     if "yrange" not in kwargs.keys() or kwargs["yrange"] is None:
+#                         yrange = 3.0
+#                     else:
+#                         yrange = kwargs["yrange"]
+#                     if "frange" not in kwargs.keys() or kwargs["frange"] is None:
+#                         frange = 2.0  # i.e. bounds=[guess_flux/(10.**frange),guess_flux*(10**frange)]
+#                     else:
+#                         frange = kwargs["frange"]
+#                     if (
+#                         "corr_len_range" not in kwargs.keys()
+#                         or kwargs["corr_len_range"] is None
+#                     ):
+#                         corr_len_range = 1.0
+#                     else:
+#                         corr_len_range = kwargs["corr_len_range"]
+#                     if (
+#                         "corr_len_guess" not in kwargs.keys()
+#                         or kwargs["corr_len_guess"] is None
+#                     ):
+#                         corr_len_guess = 3.0
+#                     else:
+#                         corr_len_guess = kwargs["corr_len_guess"]
+
+#                     # Fit the FM PSF to the KLIP-subtracted data.
+#                     if inject == False:
+#                         # Remove a constant background level from the
+#                         # KLIP-subtracted data before fitting the FM PSF?
+#                         if remove_background:
+#                             # Initialize pyKLIP FMAstrometry class.
+#                             fma = fitpsf.FMAstrometry(
+#                                 guess_sep=guess_sep,
+#                                 guess_pa=guess_pa,
+#                                 fitboxsize=boxsize,
+#                             )
+#                             fma.generate_fm_stamp(
+#                                 fm_image=fm_frame,
+#                                 fm_center=[fm_centx, fm_centy],
+#                                 padding=5,
+#                             )
+#                             fma.generate_data_stamp(
+#                                 data=data_frame,
+#                                 data_center=[data_centx, data_centy],
+#                                 dr=dr,
+#                                 exclusion_radius=exclr,
+#                             )
+#                             corr_len_label = r"$l$"
+#                             fma.set_kernel(
+#                                 fitkernel, [corr_len_guess], [corr_len_label]
+#                             )
+#                             fma.set_bounds(xrange, yrange, frange, [corr_len_range])
+
+#                             # Make sure that the noise map is invertible.
+#                             noise_map_max = np.nanmax(fma.noise_map)
+#                             fma.noise_map[np.isnan(fma.noise_map)] = noise_map_max
+#                             fma.noise_map[fma.noise_map == 0.0] = noise_map_max
+
+#                             # Set MCMC parameters from kwargs.
+#                             if (
+#                                 "nwalkers" not in kwargs.keys()
+#                                 or kwargs["nwalkers"] is None
+#                             ):
+#                                 nwalkers = 50
+#                             else:
+#                                 nwalkers = kwargs["nwalkers"]
+#                             if "nburn" not in kwargs.keys() or kwargs["nburn"] is None:
+#                                 nburn = 100
+#                             else:
+#                                 nburn = kwargs["nburn"]
+#                             if (
+#                                 "nsteps" not in kwargs.keys()
+#                                 or kwargs["nsteps"] is None
+#                             ):
+#                                 nsteps = 100
+#                             else:
+#                                 nsteps = kwargs["nsteps"]
+#                             if (
+#                                 "nthreads" not in kwargs.keys()
+#                                 or kwargs["nthreads"] is None
+#                             ):
+#                                 nthreads = 4
+#                             else:
+#                                 nthreads = kwargs["nthreads"]
+
+#                             # Run the MCMC fit.
+#                             chain_output = os.path.join(
+#                                 output_dir_comp,
+#                                 mode
+#                                 + "_NANNU"
+#                                 + str(annuli)
+#                                 + "_NSUBS"
+#                                 + str(subsections)
+#                                 + "_"
+#                                 + key
+#                                 + "-bka_chain_c%.0f" % (k + 1)
+#                                 + ".pkl",
+#                             )
+#                             fma.fit_astrometry(
+#                                 nwalkers=nwalkers,
+#                                 nburn=nburn,
+#                                 nsteps=nsteps,
+#                                 numthreads=nthreads,
+#                                 chain_output=chain_output,
+#                             )
+
+#                             # Estimate the background level from those pixels
+#                             # in the KLIP-subtracted data which have a small
+#                             # flux in the best fit FM PSF.
+#                             if "hsz" not in kwargs.keys() or kwargs["hsz"] is None:
+#                                 hsz = 35
+#                             else:
+#                                 hsz = kwargs["hsz"]
+#                             stamp = data_frame.copy()
+#                             xp = int(round(data_centx - guess_dx))
+#                             yp = int(round(data_centy + guess_dy))
+#                             stamp = stamp[
+#                                 yp - hsz : yp + hsz + 1, xp - hsz : xp + hsz + 1
+#                             ]
+#                             psf = fm_frame.copy()
+#                             xp = int(round(fm_centx - guess_dx))
+#                             yp = int(round(fm_centy + guess_dy))
+#                             psf = psf[yp - hsz : yp + hsz + 1, xp - hsz : xp + hsz + 1]
+#                             xshift = -(fma.raw_RA_offset.bestfit - guess_dx)
+#                             yshift = fma.raw_Dec_offset.bestfit - guess_dy
+#                             yxshift = np.array([yshift, xshift])
+#                             psf_shift = np.fft.ifftn(
+#                                 fourier_shift(np.fft.fftn(psf), yxshift)
+#                             ).real
+#                             con = fma.fit_flux.bestfit * guess_flux
+#                             res = stamp - fma.fit_flux.bestfit * psf_shift
+#                             thresh = np.nanmax(psf_shift) / 150.0
+#                             bg = np.nanmedian(stamp[np.abs(psf_shift) < thresh])
+#                             data_frame -= bg
+
+#                         # MCMC.
+#                         if fitmethod == "mcmc":
+#                             # Initialize pyKLIP FMAstrometry class.
+#                             fma = fitpsf.FMAstrometry(
+#                                 guess_sep=guess_sep,
+#                                 guess_pa=guess_pa,
+#                                 fitboxsize=boxsize,
+#                             )
+#                             fma.generate_fm_stamp(
+#                                 fm_image=fm_frame,
+#                                 fm_center=[fm_centx, fm_centy],
+#                                 padding=5,
+#                             )
+#                             fma.generate_data_stamp(
+#                                 data=data_frame,
+#                                 data_center=[data_centx, data_centy],
+#                                 dr=dr,
+#                                 exclusion_radius=exclr,
+#                             )
+#                             corr_len_label = r"$l$"
+#                             fma.set_kernel(
+#                                 fitkernel, [corr_len_guess], [corr_len_label]
+#                             )
+#                             fma.set_bounds(xrange, yrange, frange, [corr_len_range])
+
+#                             # Make sure that the noise map is invertible.
+#                             noise_map_max = np.nanmax(fma.noise_map)
+#                             fma.noise_map[np.isnan(fma.noise_map)] = noise_map_max
+#                             fma.noise_map[fma.noise_map == 0.0] = noise_map_max
+
+#                             # Set MCMC parameters from kwargs.
+#                             if (
+#                                 "nwalkers" not in kwargs.keys()
+#                                 or kwargs["nwalkers"] is None
+#                             ):
+#                                 nwalkers = 50
+#                             else:
+#                                 nwalkers = kwargs["nwalkers"]
+#                             if "nburn" not in kwargs.keys() or kwargs["nburn"] is None:
+#                                 nburn = 100
+#                             else:
+#                                 nburn = kwargs["nburn"]
+#                             if (
+#                                 "nsteps" not in kwargs.keys()
+#                                 or kwargs["nsteps"] is None
+#                             ):
+#                                 nsteps = 100
+#                             else:
+#                                 nsteps = kwargs["nsteps"]
+#                             if (
+#                                 "nthreads" not in kwargs.keys()
+#                                 or kwargs["nthreads"] is None
+#                             ):
+#                                 nthreads = 4
+#                             else:
+#                                 nthreads = kwargs["nthreads"]
+
+#                             # Run the MCMC fit.
+#                             chain_output = os.path.join(
+#                                 output_dir_comp,
+#                                 mode
+#                                 + "_NANNU"
+#                                 + str(annuli)
+#                                 + "_NSUBS"
+#                                 + str(subsections)
+#                                 + "_"
+#                                 + key
+#                                 + "-bka_chain_c%.0f" % (k + 1)
+#                                 + ".pkl",
+#                             )
+#                             fma.fit_astrometry(
+#                                 nwalkers=nwalkers,
+#                                 nburn=nburn,
+#                                 nsteps=nsteps,
+#                                 numthreads=nthreads,
+#                                 chain_output=chain_output,
+#                             )
+
+#                             # Plot the MCMC fit results.
+#                             fig = fma.make_corner_plot()
+#                             if save_figures:
+#                                 path = os.path.join(
+#                                     output_dir_comp,
+#                                     mode
+#                                     + "_NANNU"
+#                                     + str(annuli)
+#                                     + "_NSUBS"
+#                                     + str(subsections)
+#                                     + "_"
+#                                     + key
+#                                     + "-corner_c%.0f" % (k + 1)
+#                                     + ".pdf",
+#                                 )
+#                                 fig.suptitle(
+#                                     mode
+#                                     + "_NANNU"
+#                                     + str(annuli)
+#                                     + "_NSUBS"
+#                                     + str(subsections)
+#                                     + "_"
+#                                     + key
+#                                 )
+#                                 fig.savefig(path)
+#                             plt.show()
+#                             plt.close(fig)
+#                             fig = fma.best_fit_and_residuals()
+#                             if save_figures:
+#                                 path = os.path.join(
+#                                     output_dir_comp,
+#                                     mode
+#                                     + "_NANNU"
+#                                     + str(annuli)
+#                                     + "_NSUBS"
+#                                     + str(subsections)
+#                                     + "_"
+#                                     + key
+#                                     + "-model_c%.0f" % (k + 1)
+#                                     + ".pdf",
+#                                 )
+#                                 fig.suptitle(
+#                                     mode
+#                                     + "_NANNU"
+#                                     + str(annuli)
+#                                     + "_NSUBS"
+#                                     + str(subsections)
+#                                     + "_"
+#                                     + key
+#                                 )
+#                                 fig.savefig(path)
+#                             plt.show()
+#                             plt.close(fig)
+
+#                             # Write the MCMC fit results into a table.
+#                             flux_jy = fma.fit_flux.bestfit * guess_flux
+#                             flux_jy *= fzero[filt] / 10 ** (mstar[filt] / 2.5)  # Jy
+#                             flux_jy_err = fma.fit_flux.error * guess_flux
+#                             flux_jy_err *= fzero[filt] / 10 ** (mstar[filt] / 2.5)  # Jy
+#                             flux_si = fma.fit_flux.bestfit * guess_flux
+#                             flux_si *= fzero_si[filt] / 10 ** (
+#                                 mstar[filt] / 2.5
+#                             )  # erg/cm^2/s/A
+#                             flux_si *= 1e-7 * 1e4 * 1e4  # W/m^2/um
+#                             flux_si_err = fma.fit_flux.error * guess_flux
+#                             flux_si_err *= fzero_si[filt] / 10 ** (
+#                                 mstar[filt] / 2.5
+#                             )  # erg/cm^2/s/A
+#                             flux_si_err *= 1e-7 * 1e4 * 1e4  # W/m^2/um
+#                             flux_si_alt = (
+#                                 flux_jy
+#                                 * 1e-26
+#                                 * 299792458.0
+#                                 / (1e-6 * self.database.red[key]["CWAVEL"][j]) ** 2
+#                                 * 1e-6
+#                             )  # W/m^2/um
+#                             flux_si_alt_err = (
+#                                 flux_jy_err
+#                                 * 1e-26
+#                                 * 299792458.0
+#                                 / (1e-6 * self.database.red[key]["CWAVEL"][j]) ** 2
+#                                 * 1e-6
+#                             )  # W/m^2/um
+#                             delmag = -2.5 * np.log10(
+#                                 fma.fit_flux.bestfit * guess_flux
+#                             )  # mag
+#                             delmag_err = (
+#                                 2.5
+#                                 / np.log(10.0)
+#                                 * fma.fit_flux.error
+#                                 / fma.fit_flux.bestfit
+#                             )  # mag
+#                             if isinstance(mstar_err, dict):
+#                                 mstar_err_temp = mstar_err[filt]
+#                             else:
+#                                 mstar_err_temp = mstar_err
+#                             appmag = mstar[filt] + delmag  # vegamag
+#                             appmag_err = np.sqrt(mstar_err_temp**2 + delmag_err**2)
+#                             fitsfile = os.path.join(
+#                                 output_dir_comp,
+#                                 mode
+#                                 + "_NANNU"
+#                                 + str(annuli)
+#                                 + "_NSUBS"
+#                                 + str(subsections)
+#                                 + "_"
+#                                 + key
+#                                 + "-fitpsf_c%.0f" % (k + 1)
+#                                 + ".fits",
+#                             )
+
+#                             if split_fit:
+#                                 # fit the sources with a 2D gaussian only to evaluate the sigma_x, sigma_y and theta
+#                                 fig, result = best_convfit_and_residuals(
+#                                     fma,
+#                                     minmethod=minmethod,
+#                                     initial_params=gauss_param_guesses,
+#                                 )
+
+#                                 if save_figures:
+#                                     path = os.path.join(
+#                                         output_dir_comp,
+#                                         mode
+#                                         + "_NANNU"
+#                                         + str(annuli)
+#                                         + "_NSUBS"
+#                                         + str(subsections)
+#                                         + "_"
+#                                         + key
+#                                         + "-model_conv_c%.0f" % (k + 1)
+#                                         + ".pdf",
+#                                     )
+#                                     fig.suptitle(
+#                                         mode
+#                                         + "_NANNU"
+#                                         + str(annuli)
+#                                         + "_NSUBS"
+#                                         + str(subsections)
+#                                         + "_"
+#                                         + key
+#                                     )
+#                                     fig.savefig(path)
+#                                 plt.show()
+#                                 plt.close(fig)
+
+#                                 tab.add_row(
+#                                     (
+#                                         k + 1,
+#                                         fma.raw_RA_offset.bestfit
+#                                         * pxsc_arcsec,  # arcsec
+#                                         fma.raw_RA_offset.error * pxsc_arcsec,  # arcsec
+#                                         fma.raw_Dec_offset.bestfit
+#                                         * pxsc_arcsec,  # arcsec
+#                                         fma.raw_Dec_offset.error
+#                                         * pxsc_arcsec,  # arcsec
+#                                         flux_jy,
+#                                         flux_jy_err,
+#                                         flux_si,
+#                                         flux_si_err,
+#                                         flux_si_alt,
+#                                         flux_si_alt_err,
+#                                         fma.raw_flux.bestfit * guess_flux,
+#                                         fma.raw_flux.error * guess_flux,
+#                                         delmag,  # mag
+#                                         delmag_err,  # mag
+#                                         appmag,  # mag
+#                                         appmag_err,  # mag
+#                                         mstar[filt],  # mag
+#                                         mstar_err_temp,  # mag
+#                                         np.nan,
+#                                         np.nan,
+#                                         scale_factor_avg,
+#                                         tp_comsubst,
+#                                         fitsfile,
+#                                         result.x[3],
+#                                         np.nan,
+#                                         result.x[0],
+#                                         np.nan,
+#                                         result.x[1],
+#                                         np.nan,
+#                                         result.x[2],
+#                                         np.nan,
+#                                     )
+#                                 )
+#                             else:
+#                                 tab.add_row(
+#                                     (
+#                                         k + 1,
+#                                         fma.raw_RA_offset.bestfit
+#                                         * pxsc_arcsec,  # arcsec
+#                                         fma.raw_RA_offset.error * pxsc_arcsec,  # arcsec
+#                                         fma.raw_Dec_offset.bestfit
+#                                         * pxsc_arcsec,  # arcsec
+#                                         fma.raw_Dec_offset.error
+#                                         * pxsc_arcsec,  # arcsec
+#                                         flux_jy,
+#                                         flux_jy_err,
+#                                         flux_si,
+#                                         flux_si_err,
+#                                         flux_si_alt,
+#                                         flux_si_alt_err,
+#                                         fma.raw_flux.bestfit * guess_flux,
+#                                         fma.raw_flux.error * guess_flux,
+#                                         delmag,  # mag
+#                                         delmag_err,  # mag
+#                                         appmag,  # mag
+#                                         appmag_err,  # mag
+#                                         mstar[filt],  # mag
+#                                         mstar_err_temp,  # mag
+#                                         np.nan,
+#                                         np.nan,
+#                                         scale_factor_avg,
+#                                         tp_comsubst,
+#                                         fitsfile,
+#                                     )
+#                                 )
+
+#                             # Write the FM PSF to a file for future plotting.
+#                             ut.write_fitpsf_images(fma, fitsfile, tab[-1])
+
+#                         # Nested sampling.
+#                         elif fitmethod == "nested":
+#                             output_dir_ns = os.path.join(
+#                                 output_dir_comp, "temp-multinest/"
+#                             )
+
+#                             # Initialize PlanetEvidence module.
+#                             try:
+#                                 fit = fitpsf.PlanetEvidence(
+#                                     guess_sep, guess_pa, boxsize, output_dir_ns
+#                                 )
+#                             except ModuleNotFoundError:
+#                                 raise ModuleNotFoundError(
+#                                     'Pymultinest is not installed, try\n"conda install -c conda-forge pymultinest"'
+#                                 )
+#                             log.info("  --> Initialized PlanetEvidence module")
+
+#                             # Generate FM and data stamps.
+#                             fit.generate_fm_stamp(
+#                                 fm_frame, [fm_centx, fm_centy], padding=5
+#                             )
+#                             fit.generate_data_stamp(
+#                                 data_frame,
+#                                 [data_centx, data_centy],
+#                                 dr=dr,
+#                                 exclusion_radius=exclr,
+#                             )
+#                             log.info("  --> Generated FM and data stamps")
+
+#                             # Set fit kernel.
+#                             corr_len_label = "l"
+#                             fit.set_kernel(
+#                                 fitkernel, [corr_len_guess], [corr_len_label]
+#                             )
+#                             log.info("  --> Set fit kernel to " + fitkernel)
+
+#                             # Set fit bounds.
+#                             fit.set_bounds(xrange, yrange, frange, [corr_len_range])
+#                             log.info("  --> Set fit bounds")
+
+#                             # Run the pymultinest fit.
+#                             fit.multifit()
+#                             log.info("  --> Finished pymultinest fit")
+
+#                             # Get model evidence and posteriors.
+#                             evidence = fit.fit_stats()
+#                             fm_evidence = evidence[0][
+#                                 "nested sampling global log-evidence"
+#                             ]  # FM evidence
+#                             fm_posteriors = evidence[0]["marginals"]  # FM posteriors
+#                             null_evidence = evidence[1][
+#                                 "nested sampling global log-evidence"
+#                             ]  # null evidence
+#                             null_posteriors = evidence[1][
+#                                 "marginals"
+#                             ]  # null posteriors
+#                             evidence_ratio = fm_evidence - null_evidence
+
+#                             # Plot the pymultinest fit results.
+#                             H1, H0 = fit.fit_plots()
+#                             if save_figures:
+#                                 path = os.path.join(
+#                                     output_dir_comp,
+#                                     mode
+#                                     + "_NANNU"
+#                                     + str(annuli)
+#                                     + "_NSUBS"
+#                                     + str(subsections)
+#                                     + "_"
+#                                     + key
+#                                     + "-corner_c%.0f" % (k + 1)
+#                                     + ".pdf",
+#                                 )
+#                                 H1.savefig(path)
+#                                 path = os.path.join(
+#                                     output_dir_comp,
+#                                     mode
+#                                     + "_NANNU"
+#                                     + str(annuli)
+#                                     + "_NSUBS"
+#                                     + str(subsections)
+#                                     + "_"
+#                                     + key
+#                                     + "-noise_corner_c%.0f" % (k + 1)
+#                                     + ".pdf",
+#                                 )
+#                                 H0.savefig(path)
+#                             plt.show()
+#                             plt.close(H1)
+#                             plt.close(H0)
+
+#                             fig, _ = fit.fm_residuals()
+#                             if save_figures:
+#                                 path = os.path.join(
+#                                     output_dir_comp,
+#                                     mode
+#                                     + "_NANNU"
+#                                     + str(annuli)
+#                                     + "_NSUBS"
+#                                     + str(subsections)
+#                                     + "_"
+#                                     + key
+#                                     + "-model_c%.0f" % (k + 1)
+#                                     + ".pdf",
+#                                 )
+#                                 plt.savefig(path)
+#                             plt.show()
+#                             plt.close(fig)
+
+#                             # Write the pymultinest fit results into a table.
+#                             flux_jy = fit.fit_flux.bestfit * guess_flux
+#                             flux_jy *= fzero[filt] / 10 ** (mstar[filt] / 2.5)  # Jy
+#                             flux_jy_err = fit.fit_flux.error * guess_flux
+#                             flux_jy_err *= fzero[filt] / 10 ** (mstar[filt] / 2.5)  # Jy
+#                             flux_si = fit.fit_flux.bestfit * guess_flux
+#                             flux_si *= fzero_si[filt] / 10 ** (
+#                                 mstar[filt] / 2.5
+#                             )  # erg/cm^2/s/A
+#                             flux_si *= 1e-7 * 1e4 * 1e4  # W/m^2/um
+#                             flux_si_err = fit.fit_flux.error * guess_flux
+#                             flux_si_err *= fzero_si[filt] / 10 ** (
+#                                 mstar[filt] / 2.5
+#                             )  # erg/cm^2/s/A
+#                             flux_si_err *= 1e-7 * 1e4 * 1e4  # W/m^2/um
+#                             flux_si_alt = (
+#                                 flux_jy
+#                                 * 1e-26
+#                                 * 299792458.0
+#                                 / (1e-6 * self.database.red[key]["CWAVEL"][j]) ** 2
+#                                 * 1e-6
+#                             )  # W/m^2/um
+#                             flux_si_alt_err = (
+#                                 flux_jy_err
+#                                 * 1e-26
+#                                 * 299792458.0
+#                                 / (1e-6 * self.database.red[key]["CWAVEL"][j]) ** 2
+#                                 * 1e-6
+#                             )  # W/m^2/um
+#                             delmag = -2.5 * np.log10(
+#                                 fit.fit_flux.bestfit * guess_flux
+#                             )  # mag
+#                             delmag_err = (
+#                                 2.5
+#                                 / np.log(10.0)
+#                                 * fit.fit_flux.error
+#                                 / fit.fit_flux.bestfit
+#                             )  # mag
+#                             if isinstance(mstar_err, dict):
+#                                 mstar_err_temp = mstar_err[filt]
+#                             else:
+#                                 mstar_err_temp = mstar_err
+#                             appmag = mstar[filt] + delmag  # vegamag
+#                             appmag_err = np.sqrt(mstar_err_temp**2 + delmag_err**2)
+#                             fitsfile = os.path.join(
+#                                 output_dir_comp,
+#                                 mode
+#                                 + "_NANNU"
+#                                 + str(annuli)
+#                                 + "_NSUBS"
+#                                 + str(subsections)
+#                                 + "_"
+#                                 + key
+#                                 + "-fitpsf_c%.0f" % (k + 1)
+#                                 + ".fits",
+#                             )
+#                             tab.add_row(
+#                                 (
+#                                     k + 1,
+#                                     -(fit.fit_x.bestfit - data_centx)
+#                                     * pxsc_arcsec,  # arcsec
+#                                     fit.fit_x.error * pxsc_arcsec,  # arcsec
+#                                     (fit.fit_y.bestfit - data_centy)
+#                                     * pxsc_arcsec,  # arcsec
+#                                     fit.fit_y.error * pxsc_arcsec,  # arcsec
+#                                     flux_jy,
+#                                     flux_jy_err,
+#                                     flux_si,
+#                                     flux_si_err,
+#                                     flux_si_alt,
+#                                     flux_si_alt_err,
+#                                     fit.fit_flux.bestfit * guess_flux,
+#                                     fit.fit_flux.error * guess_flux,
+#                                     delmag,  # mag
+#                                     delmag_err,  # mag
+#                                     appmag,  # mag
+#                                     appmag_err,  # mag
+#                                     mstar[filt],  # mag
+#                                     mstar_err_temp,  # mag
+#                                     np.nan,
+#                                     evidence_ratio,
+#                                     scale_factor_avg,
+#                                     tp_comsubst,
+#                                     fitsfile,
+#                                 )
+#                             )
+
+#                             # Write the FM PSF to a file for future plotting.
+#                             ut.write_fitpsf_images(fit, fitsfile, tab[-1])
+
+#                         # Otherwise.
+#                         else:
+#                             if split_fit:
+#                                 # Mocking the MCMC fit results using the initial guesses and perform only the Gaussian fit.
+#                                 log.info(
+#                                     "  --> Skipping  mcmc and pymultinest fit, just fitting for extended source."
+#                                 )
+#                                 # Initialize pyKLIP FMAstrometry class.
+#                                 fma = fitpsf.FMAstrometry(
+#                                     guess_sep=guess_sep,
+#                                     guess_pa=guess_pa,
+#                                     fitboxsize=boxsize,
+#                                 )
+#                                 fma.generate_fm_stamp(
+#                                     fm_image=fm_frame,
+#                                     fm_center=[fm_centx, fm_centy],
+#                                     padding=5,
+#                                 )
+#                                 fma.generate_data_stamp(
+#                                     data=data_frame,
+#                                     data_center=[data_centx, data_centy],
+#                                     dr=dr,
+#                                     exclusion_radius=exclr,
+#                                 )
+
+#                                 fma.fit_flux = fitpsf.ParamRange(1, [0, 0])
+#                                 fma.fit_x = fitpsf.ParamRange(
+#                                     fma.data_stamp_x_center, [0, 0]
+#                                 )
+#                                 fma.fit_y = fitpsf.ParamRange(
+#                                     fma.data_stamp_y_center, [0, 0]
+#                                 )
+#                                 fma.raw_RA_offset = fitpsf.ParamRange(
+#                                     -(fma.fit_x.bestfit - fma.data_center[0]),
+#                                     fma.fit_x.error_2sided[::-1],
+#                                 )
+#                                 fma.raw_Dec_offset = fitpsf.ParamRange(
+#                                     fma.fit_y.bestfit - fma.data_center[1],
+#                                     fma.fit_y.error_2sided[::-1],
+#                                 )
+#                                 fma.raw_flux = fma.fit_flux
+
+#                                 flux_jy = fma.fit_flux.bestfit * guess_flux
+#                                 flux_jy *= fzero[filt] / 10 ** (mstar[filt] / 2.5)  # Jy
+#                                 flux_jy_err = fma.fit_flux.error * guess_flux
+#                                 flux_jy_err *= fzero[filt] / 10 ** (
+#                                     mstar[filt] / 2.5
+#                                 )  # Jy
+#                                 flux_si = fma.fit_flux.bestfit * guess_flux
+#                                 flux_si *= fzero_si[filt] / 10 ** (
+#                                     mstar[filt] / 2.5
+#                                 )  # erg/cm^2/s/A
+#                                 flux_si *= 1e-7 * 1e4 * 1e4  # W/m^2/um
+#                                 flux_si_err = fma.fit_flux.error * guess_flux
+#                                 flux_si_err *= fzero_si[filt] / 10 ** (
+#                                     mstar[filt] / 2.5
+#                                 )  # erg/cm^2/s/A
+#                                 flux_si_err *= 1e-7 * 1e4 * 1e4  # W/m^2/um
+#                                 flux_si_alt = (
+#                                     flux_jy
+#                                     * 1e-26
+#                                     * 299792458.0
+#                                     / (1e-6 * self.database.red[key]["CWAVEL"][j]) ** 2
+#                                     * 1e-6
+#                                 )  # W/m^2/um
+#                                 flux_si_alt_err = (
+#                                     flux_jy_err
+#                                     * 1e-26
+#                                     * 299792458.0
+#                                     / (1e-6 * self.database.red[key]["CWAVEL"][j]) ** 2
+#                                     * 1e-6
+#                                 )  # W/m^2/um
+#                                 delmag = -2.5 * np.log10(
+#                                     fma.fit_flux.bestfit * guess_flux
+#                                 )  # mag
+#                                 delmag_err = (
+#                                     2.5
+#                                     / np.log(10.0)
+#                                     * fma.fit_flux.error
+#                                     / fma.fit_flux.bestfit
+#                                 )  # mag
+#                                 if isinstance(mstar_err, dict):
+#                                     mstar_err_temp = mstar_err[filt]
+#                                 else:
+#                                     mstar_err_temp = mstar_err
+#                                 appmag = mstar[filt] + delmag  # vegamag
+#                                 appmag_err = np.sqrt(mstar_err_temp**2 + delmag_err**2)
+#                                 fitsfile = os.path.join(
+#                                     output_dir_comp,
+#                                     mode
+#                                     + "_NANNU"
+#                                     + str(annuli)
+#                                     + "_NSUBS"
+#                                     + str(subsections)
+#                                     + "_"
+#                                     + key
+#                                     + "-fitpsf_c%.0f" % (k + 1)
+#                                     + ".fits",
+#                                 )
+
+#                                 # fit the sources with a 2D gaussian only to evaluate the sigma_x, sigma_y and theta
+#                                 fig, result = best_convfit_and_residuals(
+#                                     fma,
+#                                     minmethod=minmethod,
+#                                     initial_params=gauss_param_guesses,
+#                                 )
+
+#                                 if save_figures:
+#                                     path = os.path.join(
+#                                         output_dir_comp,
+#                                         mode
+#                                         + "_NANNU"
+#                                         + str(annuli)
+#                                         + "_NSUBS"
+#                                         + str(subsections)
+#                                         + "_"
+#                                         + key
+#                                         + "-model_conv_c%.0f" % (k + 1)
+#                                         + ".pdf",
+#                                     )
+#                                     fig.suptitle(
+#                                         mode
+#                                         + "_NANNU"
+#                                         + str(annuli)
+#                                         + "_NSUBS"
+#                                         + str(subsections)
+#                                         + "_"
+#                                         + key
+#                                     )
+#                                     fig.savefig(path)
+#                                 plt.show()
+#                                 plt.close(fig)
+
+#                                 tab.add_row(
+#                                     (
+#                                         k + 1,
+#                                         fma.raw_RA_offset.bestfit
+#                                         * pxsc_arcsec,  # arcsec
+#                                         fma.raw_RA_offset.error * pxsc_arcsec,  # arcsec
+#                                         fma.raw_Dec_offset.bestfit
+#                                         * pxsc_arcsec,  # arcsec
+#                                         fma.raw_Dec_offset.error
+#                                         * pxsc_arcsec,  # arcsec
+#                                         flux_jy,
+#                                         flux_jy_err,
+#                                         flux_si,
+#                                         flux_si_err,
+#                                         flux_si_alt,
+#                                         flux_si_alt_err,
+#                                         fma.raw_flux.bestfit * guess_flux,
+#                                         fma.raw_flux.error * guess_flux,
+#                                         delmag,  # mag
+#                                         delmag_err,  # mag
+#                                         appmag,  # mag
+#                                         appmag_err,  # mag
+#                                         mstar[filt],  # mag
+#                                         mstar_err_temp,  # mag
+#                                         np.nan,
+#                                         np.nan,
+#                                         scale_factor_avg,
+#                                         tp_comsubst,
+#                                         fitsfile,
+#                                         result.x[3],
+#                                         np.nan,
+#                                         result.x[0],
+#                                         np.nan,
+#                                         result.x[1],
+#                                         np.nan,
+#                                         result.x[2],
+#                                         np.nan,
+#                                     )
+#                                 )
+#                             else:
+#                                 raise NotImplementedError()
+
+#                         # Plot estimated background level.
+#                         if remove_background:
+#                             f, ax = plt.subplots(1, 4, figsize=(4 * 6.4, 4.8))
+#                             p0 = ax[0].imshow(res, origin="lower")
+#                             c0 = plt.colorbar(p0, ax=ax[0])
+#                             c0.set_label(
+#                                 "Flux (arbitrary units)", rotation=270, labelpad=20
+#                             )
+#                             text = ax[0].text(
+#                                 0.99,
+#                                 0.99,
+#                                 "Contrast = %.3e" % con,
+#                                 ha="right",
+#                                 va="top",
+#                                 transform=ax[0].transAxes,
+#                             )
+#                             text.set_path_effects(
+#                                 [
+#                                     PathEffects.withStroke(
+#                                         linewidth=3, foreground="white"
+#                                     )
+#                                 ]
+#                             )
+#                             ax[0].set_title("Residuals before bg. subtraction")
+#                             p1 = ax[1].imshow(
+#                                 np.abs(psf_shift) < thresh, origin="lower"
+#                             )
+#                             c1 = plt.colorbar(p1, ax=ax[1])
+#                             ax[1].set_title("Pixels used for bg. estimation")
+#                             ax[2].hist(stamp[np.abs(psf_shift) < thresh], bins=20)
+#                             ax[2].axvline(
+#                                 bg, ls="--", color="black", label="bg. = %.2f" % bg
+#                             )
+#                             ax[2].set_xlabel("Pixel value")
+#                             ax[2].set_ylabel("Occurrence")
+#                             ax[2].legend(loc="upper right")
+#                             ax[2].set_title("Distribution of bg. pixels")
+#                             con = fma.fit_flux.bestfit * guess_flux
+#                             res = stamp - fma.fit_flux.bestfit * psf_shift
+#                             imgs = ax[0].get_images()
+#                             if len(imgs) > 0:
+#                                 vmin, vmax = imgs[0].get_clim()
+#                             p3 = ax[3].imshow(res, origin="lower", vmin=vmin, vmax=vmax)
+#                             c3 = plt.colorbar(p3, ax=ax[3])
+#                             c3.set_label(
+#                                 "Flux (arbitrary units)", rotation=270, labelpad=20
+#                             )
+#                             text = ax[3].text(
+#                                 0.99,
+#                                 0.99,
+#                                 "Contrast = %.3e" % con,
+#                                 ha="right",
+#                                 va="top",
+#                                 transform=ax[3].transAxes,
+#                             )
+#                             text.set_path_effects(
+#                                 [
+#                                     PathEffects.withStroke(
+#                                         linewidth=3, foreground="white"
+#                                     )
+#                                 ]
+#                             )
+#                             ax[3].set_title("Residuals after bg. subtraction")
+#                             plt.show()
+#                             if save_figures:
+#                                 path = os.path.join(
+#                                     output_dir_comp,
+#                                     mode
+#                                     + "_NANNU"
+#                                     + str(annuli)
+#                                     + "_NSUBS"
+#                                     + str(subsections)
+#                                     + "_"
+#                                     + key
+#                                     + "-bgest_c%.0f" % (k + 1)
+#                                     + ".pdf",
+#                                 )
+#                                 plt.savefig(path)
+#                                 log.info(f" Plot saved in {path}")
+#                                 plt.close()
+
+#                     # Subtract companion before fitting the next one.
+#                     if subtract or inject:
+#                         # Subtract companion from pyKLIP dataset. Use offset
+#                         # PSFs w/o high-pass filtering because this will be
+#                         # applied by the klip_dataset routine below.
+#                         if inject:
+#                             ra = companions[k][0]  # arcsec
+#                             dec = companions[k][1]  # arcsec
+#                             con = companions[k][2]
+#                             inputflux = con * np.array(
+#                                 all_offsetpsfs_nohpf
+#                             )  # positive to inject companion
+#                             fileprefix = (
+#                                 "INJECTED-"
+#                                 + mode
+#                                 + "_NANNU"
+#                                 + str(annuli)
+#                                 + "_NSUBS"
+#                                 + str(subsections)
+#                                 + "_"
+#                                 + key
+#                             )
+#                         else:
+#                             ra = tab[-1]["RA"]  # arcsec
+#                             dec = tab[-1]["DEC"]  # arcsec
+#                             con = tab[-1]["CON"]
+#                             inputflux = -con * np.array(
+#                                 all_offsetpsfs_nohpf
+#                             )  # negative to remove companion
+#                             fileprefix = (
+#                                 "KILLED-"
+#                                 + mode
+#                                 + "_NANNU"
+#                                 + str(annuli)
+#                                 + "_NSUBS"
+#                                 + str(subsections)
+#                                 + "_"
+#                                 + key
+#                             )
+#                         sep = np.sqrt(ra**2 + dec**2) / pxsc_arcsec  # pix
+#                         pa = np.rad2deg(np.arctan2(ra, dec))  # deg
+#                         thetas = [pa + 90.0 - all_pa for all_pa in all_pas]
+#                         fakes.inject_planet(
+#                             frames=dataset_orig.input,
+#                             centers=dataset_orig.centers,
+#                             inputflux=inputflux,
+#                             astr_hdrs=dataset_orig.wcs,
+#                             radius=sep,
+#                             pa=pa,
+#                             thetas=np.array(thetas),
+#                             field_dependent_correction=None,
+#                         )
+
+#                         if save_preklip:
+#                             # Copy pre-KLIP files.
+#                             for filepath in filepaths:
+#                                 src = filepath
+#                                 dst = os.path.join(output_dir_pk, os.path.split(src)[1])
+#                                 shutil.copy(src, dst)
+#                             for psflib_filepath in psflib_filepaths:
+#                                 src = psflib_filepath
+#                                 dst = os.path.join(output_dir_pk, os.path.split(src)[1])
+#                                 shutil.copy(src, dst)
+
+#                             # Update content of pre-KLIP files.
+#                             filenames = dataset_orig.filenames.copy()
+#                             for l, filename in enumerate(filenames):
+#                                 filenames[l] = filename[: filename.find("_INT")]
+#                             for filepath in filepaths:
+#                                 ww_file = filenames == os.path.split(filepath)[1]
+#                                 file = os.path.join(
+#                                     output_dir_pk, os.path.split(filepath)[1]
+#                                 )
+#                                 hdul = fits.open(file)
+#                                 hdul["SCI"].data = dataset_orig.input[ww_file]
+#                                 hdul.writeto(file, output_verify="fix", overwrite=True)
+#                                 hdul.close()
+
+#                             # Update and write observations database.
+#                             temp = self.database.obs.copy()
+#                             for l in range(len(self.database.obs[key])):
+#                                 file = os.path.split(
+#                                     self.database.obs[key]["FITSFILE"][l]
+#                                 )[1]
+#                                 self.database.obs[key]["FITSFILE"][l] = os.path.join(
+#                                     output_dir_pk, file
+#                                 )
+#                             file = os.path.split(self.database.red[key]["FITSFILE"][j])[
+#                                 1
+#                             ]
+#                             file = file[file.find("JWST") : file.find("-KLmodes-all")]
+#                             file = os.path.join(output_dir_fm, file + ".dat")
+#                             self.database.obs[key].write(
+#                                 file, format="ascii", overwrite=True
+#                             )
+#                             self.database.obs = temp
+
+#                         # Reduce companion-subtracted data.
+#                         mode = self.database.red[key]["MODE"][j]
+#                         annuli = self.database.red[key]["ANNULI"][j]
+#                         subsections = self.database.red[key]["SUBSECTS"][j]
+#                         parallelized.klip_dataset(
+#                             dataset=dataset_orig,
+#                             mode=mode,
+#                             outputdir=output_dir_fm,
+#                             fileprefix=fileprefix,
+#                             annuli=annuli,
+#                             subsections=subsections,
+#                             movement=1.0,
+#                             numbasis=klmodes,
+#                             maxnumbasis=maxnumbasis,
+#                             calibrate_flux=False,
+#                             aligned_center=dataset_orig._centers[0],
+#                             psf_library=dataset_orig.psflib,
+#                             highpass=highpass_temp,
+#                             verbose=False,
+#                         )
+#                         head = fits.getheader(self.database.red[key]["FITSFILE"][j], 0)
+#                         temp = os.path.join(
+#                             output_dir_fm, fileprefix + "-KLmodes-all.fits"
+#                         )
+#                         hdul = fits.open(temp)
+#                         hdul[0].header = head
+#                         hdul.writeto(temp, output_verify="fix", overwrite=True)
+#                         hdul.close()
+
+#                     # Restore original pyKLIP dataset.
+#                     if subtract:
+#                         dataset = dataset_orig
+
+#                 # Update source database.
+#                 self.database.update_src(key, j, tab)
+
+#                 # Save the results table.
+#                 output_ecsv_path = os.path.join(
+#                     output_dir_comp,
+#                     mode
+#                     + "_NANNU"
+#                     + str(annuli)
+#                     + "_NSUBS"
+#                     + str(subsections)
+#                     + "_"
+#                     + key
+#                     + "-results_c%.0f" % (k + 1)
+#                     + ".ecsv",
+#                 )
+#                 tab.write(output_ecsv_path, format="ascii.ecsv", overwrite=True)
+#                 print(f"Table saved to {output_ecsv_path}")
+#         pass
+
+
+# def loss_function(params, offset_psf, target_array):
+#     """
+#     Loss function for the minimization process in fit_for_extended_sources.
+#     """
+#     sigma_x, sigma_y, theta_degrees, scale = params
+#     kernel = gaussian_kernel(
+#         sigma_x=sigma_x, sigma_y=sigma_y, theta_degrees=theta_degrees, n=6
+#     )
+#     convolved_image = convolve(offset_psf * 10**scale, kernel)
+
+#     # mse = np.nanmean((target_array - convolved_image) ** 2)
+#     mse = np.nanmean((target_array - convolved_image) ** 2 * (target_array))
+#     return mse
+
+
+# def best_convfit_and_residuals(
+#     fma, minmethod="Powell", bounds=None, initial_params=None, fig=None
+# ):
+#     """
+#     Fit the companion with a 2D Gaussian using a minimization algorithm and evaluate the sigma_x, sigma_y and theta.
+#     Then, generate a plot of the best fit FM compared with the data_stamp and also the residuals
+
+#     Parameters
+#     ----------
+#     fma: fitpsf.FMAstrometry
+#         FMAstronomy object with the desired properties
+#     method: str
+#         Minimization method. Default is 'Powell'.
+#     bounds: list of 2-D arrays.
+#         list of 3 elements, containing the min, max values for the sigma_x, sigma_y and theta_degrees parameters
+#         for the 2-D gaussian kernel. Default is None.
+#     initial_params: list of floats
+#         list of initial guesses for the sigma_x, sigma_y and theta_degrees parameters
+#         for the 2-D gaussian kernel. Default is None.
+#     fig: matplotlib.Figure
+#         if not None, a matplotlib Figure object, function will make a new one. Default is None.
+
+
+#     Returns
+#     -------
+#     fig: matplotlib.Figure
+#         the Figure object. If input fig is None, function will make a new one
+#     result: array
+#         Array containing the fitted  parameters from the minimization process
+#     """
+#     if fig is None:
+#         fig = plt.figure(figsize=(12, 4))
+
+#     # create best fit FM
+#     dx = fma.fit_x.bestfit - fma.data_stamp_x_center
+#     dy = fma.fit_y.bestfit - fma.data_stamp_y_center
+
+#     fm_bestfit = fma.fit_flux.bestfit * sinterp.shift(fma.fm_stamp, [dy, dx])
+
+#     if fma.padding > 0:
+#         fm_bestfit = fm_bestfit[fma.padding : -fma.padding, fma.padding : -fma.padding]
+
+#     if minmethod is not None:
+#         result = estimate_extended(
+#             fma.data_stamp,
+#             fm_bestfit,
+#             bounds=bounds,
+#             initial_params=initial_params,
+#             method=minmethod,
+#         )
+#         # Convolve the PSF by a 2D gaussian
+#         kernel = gaussian_kernel(
+#             sigma_x=result.x[0], sigma_y=result.x[1], theta_degrees=result.x[2], n=6
+#         )
+#         fm_bestfit_convolved = convolve(fm_bestfit * 10 ** result.x[3], kernel)
+#     else:
+#         result = None
+#         # Convolve the PSF by a 2D gaussian
+#         kernel = gaussian_kernel(
+#             sigma_x=fma.fit_sigma_x.bestfit,
+#             sigma_y=fma.fit_sigma_y.bestfit,
+#             theta_degrees=fma.fit_theta.bestfit,
+#             n=6,
+#         )
+#         fm_bestfit_convolved = convolve(fm_bestfit * fma.fit_flux.bestfit, kernel)
+
+#     # make residual map
+#     residual_map = fma.data_stamp - fm_bestfit_convolved
+
+#     # normalize all images to same scale
+#     colornorm = matplotlib.colors.Normalize(
+#         vmin=np.nanpercentile(fma.data_stamp, 0.03),
+#         vmax=np.nanpercentile(fma.data_stamp, 99.7),
+#     )
+
+#     # plot the data_stamp
+#     ax1 = fig.add_subplot(131)
+#     im1 = ax1.imshow(
+#         fma.data_stamp, interpolation="nearest", cmap="cubehelix", norm=colornorm
+#     )
+#     ax1.invert_yaxis()
+#     ax1.set_title("Data")
+#     ax1.set_xlabel("X (pixels)")
+#     ax1.set_ylabel("Y (pixels)")
+
+#     ax2 = fig.add_subplot(132)
+#     im2 = ax2.imshow(
+#         fm_bestfit_convolved, interpolation="nearest", cmap="cubehelix", norm=colornorm
+#     )
+#     ax2.invert_yaxis()
+#     ax2.set_title("Best-fit Model convolved\nby a 2D Gaussian")
+#     ax2.set_xlabel("X (pixels)")
+
+#     ax3 = fig.add_subplot(133)
+#     im3 = ax3.imshow(
+#         residual_map, interpolation="nearest", cmap="cubehelix", norm=colornorm
+#     )
+#     ax3.invert_yaxis()
+#     ax3.set_title("Residuals")
+#     ax3.set_xlabel("X (pixels)")
+
+#     fig.subplots_adjust(right=0.82)
+#     fig.subplots_adjust(hspace=0.4)
+#     ax_pos = ax3.get_position()
+
+#     cbar_ax = fig.add_axes([0.84, ax_pos.y0, 0.02, ax_pos.height])
+#     cb = fig.colorbar(im1, cax=cbar_ax)
+#     cb.set_label("Counts (DN)")
+
+#     return fig, result
+
+
+# def estimate_extended(
+#     target, offset_psf, bounds=None, initial_params=None, method="Powell"
+# ):
+#     """
+#     Fit for extended sources with a 2D gaussian kernel.
+
+#     Parameters
+#     ----------
+#     target: 2-D array.
+#         The target tile containing the companion to be fitted.
+#     offset_psf: 2-D array.
+#         The PSF of the companion to be used for the fit.
+#     bounds: list of 2-D arrays.
+#         list of 3 elements, containing the min, max values for the sigma_x, sigma_y and theta_degrees parameters
+#         for the 2-D gaussian kernel. If None, use default bounds = [(0.01, 20),(0.01, 20),(-180, 180)]
+#     initial_params: list of floats
+#         list of initial guesses for the sigma_x, sigma_y and theta_degrees parameters
+#         for the 2-D gaussian kernel. If None, use default initial_params = [0.1, 0.1, 0]
+#     method: str
+#         Minimization method. Default is 'Powell'.
+
+#     Returns
+#     -------
+#     result: array
+#         Array containing the fitted  parameters from the minimization process
+
+#     """
+#     if initial_params is None:
+#         initial_params = [0.1, 0.1, 0, 0]
+
+#     if bounds is None:
+#         # Bounds for parameters (sigma_x, sigma_y, theta, intensity)
+#         bounds = [
+#             (0.01, 5),  # sigma_x should be positive and within a reasonable range
+#             (0.01, 5),  # sigma_y should be positive and within a reasonable range
+#             (-180, 180),  # theta should be between -180 and 180 degrees
+#             (-1, 1),
+#         ]  # log flux range should be positive and within a reasonable range
+
+#     # Use partial to pass target_array as a fixed argument to the loss function
+#     loss_with_target = partial(
+#         loss_function, offset_psf=offset_psf, target_array=target
+#     )
+#     result = minimize(loss_with_target, initial_params, method=method, bounds=bounds)
+#     return result
+
+
+# def inject_and_recover(
+#     raw_dataset,
+#     injection_psf,
+#     injection_seps,
+#     injection_pas,
+#     injection_spacing,
+#     injection_fluxes,
+#     klip_args,
+#     retrieve_fwhm,
+#     true_companions=None,
+# ):
+#     """
+#     Function to inject synthetic PSFs into a pyKLIP dataset, then perform
+#     KLIP subtraction, then calculate the flux losses from the KLIP process.
+
+#     Parameters
+#     ----------
+#     raw_dataset : pyKLIP dataset
+#         A pyKLIP dataset which companions will be injected into and KLIP
+#         will be performed on.
+#     injection_psf : 2D-array
+#         The PSF of the companion to be injected.
+#     injection_seps : 1D-array
+#         List of separations to inject companions at (pixels).
+#     injection_pas : 1D-array
+#         List of position angles to inject companions at (degrees).
+#     injection_spacing : int, None
+#         Spacing between companions injected in a single image. If companions
+#         are too close then it can pollute the recovered flux. Set to 'None'
+#         to inject only one companion at a time (pixels).
+#     injection_fluxes : 1D-array
+#         Same size as injection_seps, units should correspond to the image
+#         units. This is the *peak* flux of the injection.
+#     klip_args : dict
+#         Arguments to be passed into the KLIP subtraction process
+#     retrieve_fwhm : float
+#         Full-Width Half-Maximum value to estimate the 2D gaussian fit when
+#         retrieving the companion fluxes.
+#     true_companions : list of list of three float, optional
+#         List of real companions to be masked before computing the raw contrast.
+#         For each companion, there should be a three element list containing
+#         [RA offset (pixels), Dec offset (pixels), mask radius (pixels)].
+#         The default is None.
+
+#     Returns
+#     -------
+#     all_seps : np.array
+#         Array containing the separations of all injected
+#         companions across all images.
+#     all_pas : np.array
+#         Array containing the position angles of all injected
+#         companions across all images.
+#     all_inj_fluxes : np.array
+#         Array containing the injected peak fluxes of all injected
+#         companions across all images.
+#     all_retr_fluxes : np.array
+#         Array containing the retrieved peak fluxes of all injected
+#         companions across all images.
+#     """
+
+#     # Initialise some arrays and quantities
+#     Nsep = len(injection_seps)
+#     Npa = len(injection_pas)
+#     list_of_injected = []
+#     all_injected = False
+#     all_seps = []
+#     all_pas = []
+#     all_inj_fluxes = []
+#     all_retr_fluxes = []
+
+#     # Ensure provided PSF is normalised to a peak intensity of 1
+#     injection_psf_norm = injection_psf / np.max(injection_psf)
+
+#     # Don't want to inject near any known companions, eliminate any
+#     # of these positions straight away.
+#     if true_companions is not None:
+#         for tcomp in true_companions:
+#             tcomp_ra, tcomp_de, tcomp_rad = tcomp
+#             for i in range(Nsep):
+#                 for j in range(Npa):
+#                     pos_id = i * Npa + j
+#                     # Convert position to x-y (RA-DEC) offset in pixels
+#                     inj_ra = injection_seps[i] * np.sin(
+#                         np.deg2rad(injection_pas[j])
+#                     )  # pixels
+#                     inj_de = injection_seps[i] * np.cos(
+#                         np.deg2rad(injection_pas[j])
+#                     )  # pixels
+#                     # Calculate distance to companion
+#                     dist = np.sqrt((tcomp_ra - inj_ra) ** 2 + (tcomp_de - inj_de) ** 2)
+#                     # Check if too close, if so, lie to the code and say its already injected
+#                     if dist < tcomp_rad:
+#                         list_of_injected += [pos_id]
+#     if len(list_of_injected) != 0:
+#         log.info(
+#             "--> {}/{} source positions not suitable for injection.".format(
+#                 len(list_of_injected), Nsep * Npa
+#             )
+#         )
+#     else:
+#         log.info(
+#             "--> All {} source positions suitable for injection.".format(Nsep * Npa)
+#         )
+
+#     # Want to keep going until a companion has been injected and recovered
+#     # at each given separation and position angle.
+#     counter = 1
+#     remaining_to_inject = (Nsep * Npa) - len(list_of_injected)
+#     with trange(remaining_to_inject, position=0, leave=True) as t:
+#         while all_injected == False:
+#             # Make a copy of the dataset
+#             dataset = copy.deepcopy(raw_dataset)
+#             # Define array to keep track of currently injected positions
+#             current_injected = []
+#             # Loop over separations
+#             for i in range(Nsep):
+#                 new_sep = injection_seps[i]
+#                 new_flux = injection_fluxes[i]
+#                 # Loop over position angles
+#                 for j in range(Npa):
+#                     new_pa = injection_pas[j]
+
+#                     # Get specific id for this position
+#                     pos_id = i * Npa + j
+#                     if pos_id in list_of_injected:
+#                         # Already injected at this position, skip
+#                         continue
+
+#                     # Need to check if this position is too close to already
+#                     # injected positions. By default, assume we want to inject.
+#                     inject_flag = True
+#                     for inj_id in current_injected:
+#                         # If we don't want to inject more than one companion
+#                         # per image, then flag to not inject.
+#                         if injection_spacing == None:
+#                             inject_flag = False
+#                             break
+
+#                         # Get separation and PA for injected position
+#                         inj_j = inj_id % Npa
+#                         inj_i = (inj_id - inj_j) // Npa
+#                         inj_sep = injection_seps[inj_i]
+#                         inj_pa = injection_pas[inj_j]
+#                         inj_flux = injection_fluxes[inj_i]
+
+#                         # If something was injected close to the coronagraph
+#                         # don't inject anything else in this image.
+#                         if inj_sep < 5:
+#                             inject_flag = False
+#                             break
+
+#                         # Calculate distance between this injected position
+#                         # and the new position we'd also like to inject at.
+#                         # If object is too close to something that's already
+#                         # injected, we don't want to inject.
+#                         dist = np.sqrt(
+#                             new_sep**2
+#                             + inj_sep**2
+#                             - 2
+#                             * new_sep
+#                             * inj_sep
+#                             * np.cos(np.deg2rad(inj_pa - new_pa))
+#                         )
+#                         if dist < injection_spacing:
+#                             inject_flag = False
+#                             break
+
+#                         # If the difference in fluxes is too large, don't inject
+#                         # as this can really affect things.
+#                         flux_factor = max(inj_flux, new_flux) / min(inj_flux, new_flux)
+#                         if flux_factor > 10:
+#                             inject_flag = False
+#                             break
+
+#                     # If this position survived the filtering, inject into images
+#                     if inject_flag == True:
+#                         # Mark as injected in this dataset and overall.
+#                         current_injected += [pos_id]
+#                         list_of_injected += [pos_id]
+
+#                         # Injected PSF needs to be a 3D array that matches dataset
+#                         inj_psf_3d = np.array(
+#                             [
+#                                 injection_psf_norm * new_flux
+#                                 for k in range(dataset.input.shape[0])
+#                             ]
+#                         )
+
+#                         # Inject the PSF
+#                         fakes.inject_planet(
+#                             frames=dataset.input,
+#                             centers=dataset.centers,
+#                             inputflux=inj_psf_3d,
+#                             astr_hdrs=dataset.wcs,
+#                             radius=new_sep,
+#                             pa=new_pa,
+#                             stampsize=65,
+#                         )
+
+#             # Figure out how many sources were injected
+#             Ninjected = len(current_injected)
+#             t.update(Ninjected)
+
+#             # Reroute KLIP printing for our own progress bar
+#             original_stdout = sys.stdout
+#             original_stderr = sys.stderr
+#             sys.stdout = StringIO()
+#             sys.stderr = StringIO()
+
+#             # Still in the while loop, need to run KLIP on the dataset we
+#             # have injected companions into.
+#             fileprefix = "INJ_ITER{}_{}COMP".format(counter, Ninjected)
+#             parallelized.klip_dataset(
+#                 dataset=dataset,
+#                 psf_library=dataset.psflib,
+#                 fileprefix=fileprefix,
+#                 **klip_args,
+#             )
+
+#             # Restore printing
+#             sys.stdout = original_stdout
+#             sys.stderr = original_stderr
+
+#             # Now need to recover the flux by fitting a 2D Gaussian, mainly interested in the peak
+#             # flux so this is an okay approximation. Could improve in the future.
+#             klipped_file = klip_args["outputdir"] + fileprefix + "-KLmodes-all.fits"
+#             with fits.open(klipped_file) as hdul:
+#                 klipped_data = hdul[0].data
+#                 frame_ids = range(klipped_data.shape[0])
+#                 centers = [
+#                     [hdul[0].header["PSFCENTX"], hdul[0].header["PSFCENTY"]]
+#                     for c in frame_ids
+#                 ]
+#                 # Get fluxes for all companions that were injected, for all KL modes used.
+#                 for inj_id in current_injected:
+#                     inj_j = inj_id % Npa
+#                     inj_i = (inj_id - inj_j) // Npa
+#                     inj_sep = injection_seps[inj_i]
+#                     inj_pa = injection_pas[inj_j]
+#                     inj_flux = injection_fluxes[inj_i]
+
+#                     # Need to loop over each KL mode individually due to pyKLIP subtleties,
+#                     # basically the same as what pyKLIP would be doing anyway.
+#                     retrieved_fluxes = []
+#                     for img_i in range(klipped_data.shape[0]):
+#                         retrieved_flux = fakes.retrieve_planet_flux(
+#                             frames=klipped_data[img_i],
+#                             centers=centers[img_i],
+#                             astr_hdrs=dataset.output_wcs[0],
+#                             sep=inj_sep,
+#                             pa=inj_pa,
+#                             searchrad=5,
+#                             guessfwhm=retrieve_fwhm,
+#                             guesspeak=inj_flux,
+#                             refinefit=True,
+#                         )
+#                         retrieved_fluxes.append(retrieved_flux)
+#                     retrieved_fluxes = np.array(
+#                         retrieved_fluxes
+#                     )  # Convert to numpy array
+
+#                     # Flux should never be negative, if it is, assume ~=zero flux retrieved
+#                     neg_mask = np.where(retrieved_fluxes < 0)
+#                     retrieved_fluxes[neg_mask] = 1e-10
+
+#                     # Need to save things to some arrays
+#                     all_seps += [inj_sep]
+#                     all_pas += [inj_pa]
+#                     all_inj_fluxes += [inj_flux]
+#                     all_retr_fluxes += [retrieved_fluxes]
+
+#             # If a companion has been injected and retrieved at every input position then
+#             # flag to exit the loop. If not increment the counter and continue.
+#             if len(list_of_injected) == Nsep * Npa:
+#                 all_injected = True
+#             else:
+#                 counter += 1
+
+#     # Return as numpy arrays
+#     all_seps = np.array(all_seps)
+#     all_pas = np.array(all_pas)
+#     all_inj_fluxes = np.array(all_inj_fluxes)
+#     all_retr_fluxes = np.squeeze(all_retr_fluxes)
+
+#     # Ensure dimensions are correct for all_retr_fluxes if # of different KL modes == 1
+#     if all_retr_fluxes.ndim == 1:
+#         all_retr_fluxes = all_retr_fluxes[:, np.newaxis]
+
+#     return all_seps, all_pas, all_inj_fluxes, all_retr_fluxes
+
+
+"""Backward-compatible imports for analysis tools."""
+
+# from spaceKLIP.analysis.companions.extended import (
+#     best_convfit_and_residuals,
+#     estimate_extended,
+#     loss_function,
+# )
+# from spaceKLIP.analysis.contrast.injection import inject_and_recover
+from spaceKLIP.analysis.tools import AnalysisTools
+
+__all__ = [
+    "AnalysisTools",
+    # "best_convfit_and_residuals",
+    # "estimate_extended",
+    # "inject_and_recover",
+    # "loss_function",
+]
+
+print("This is the refactor changes with backward compatability")
