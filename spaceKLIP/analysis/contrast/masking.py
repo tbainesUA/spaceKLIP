@@ -1,11 +1,11 @@
-# data = apply_instrument_mask(
-#     data,
-#     center=center,
-#     exposure_type=exposure_type,
-#     coronagraph_mask=self.database.red[key]["CORONMSK"][j],
-#     observation_types=observation_type,
-#     roll_reference_angles=self.database.obs[key]["ROLL_REF"],
-# )
+# TODO: TB 2024-06-05: This module is a work in progress. The legacy implementation is
+# preserved for reference, but the new implementation is being developed to improve
+# clarity and maintainability. The legacy code is commented out, and the new functions
+# are being built incrementally.
+#
+# Masking features should return boolean/binary arrays and should not modify the input
+# data in place. A caller should be responsible for applying the mask to the data.
+
 
 import logging
 
@@ -18,119 +18,6 @@ log = logging.getLogger(__name__)
 log.setLevel(logging.INFO)
 
 
-# def apply_instrument_mask_legacy(
-#     data,
-#     center,
-#     exposure_type,
-#     coronagraph_mask,
-#     observation_type,
-#     roll_reference_angles,
-# ):
-#     # Mask coronagraph spiders, 4QPM edges, etc.
-#     if exposure_type in ["NRC_CORON"]:
-#         if "WB" in coronagraph_mask:
-#             log.info("  Masking out areas for NIRCam bar coronagraph")
-#             xr = np.arange(data.shape[-1]) - center[0]
-#             yr = np.arange(data.shape[-2]) - center[1]
-#             xx, yy = np.meshgrid(xr, yr)
-#             pa = -np.rad2deg(np.arctan2(xx, yy))
-#             pa[pa < 0.0] += 360.0
-#             ww_sci = np.where(observation_type == "SCI")[0]
-#             for ww in ww_sci:
-#                 roll_ref = roll_reference_angles[ww]  # deg
-#                 pa1 = (90.0 - 15.0 + roll_ref) % 360.0
-#                 pa2 = (90.0 + 15.0 + roll_ref) % 360.0
-#                 if pa1 > pa2:
-#                     temp = (pa > pa1) | (pa < pa2)
-#                 else:
-#                     temp = (pa > pa1) & (pa < pa2)
-#                 data[:, temp] = np.nan
-#                 pa1 = (270.0 - 15.0 + roll_ref) % 360.0
-#                 pa2 = (270.0 + 15.0 + roll_ref) % 360.0
-#                 if pa1 > pa2:
-#                     temp = (pa > pa1) | (pa < pa2)
-#                 else:
-#                     temp = (pa > pa1) & (pa < pa2)
-#                 data[:, temp] = np.nan
-#             return data
-#     elif exposure_type in ["MIR_4QPM"]:
-#         # This is MIRI 4QPM data, want to mask edges. However, close
-#         # to the center you don't have a choice. So, want to use
-#         # rectangles with a gap in the center.
-#         log.info("  Masking out areas for MIRI 4QPM coronagraph")
-
-#         # Create array and pad slightly
-#         nanmask = np.zeros_like(data[0])
-#         pad = 5
-#         nanmask = np.pad(nanmask, pad)
-
-#         # Upsample array to improve centering.
-#         samp = 1  # Upsampling factor
-#         nanmask = nanmask.repeat(samp, axis=0).repeat(samp, axis=1)
-
-#         # Define rectangle edges
-#         rect_width = 10 * samp  # pixels
-#         thinrect_width = 2 * samp  # pixels
-
-#         cent_rect = [
-#             (center[0] + pad) * samp,
-#             (center[0] + pad) * samp,
-#             (center[1] + pad) * samp,
-#             (center[1] + pad) * samp,
-#         ]
-#         rect = [
-#             int(cent_rect[i] - (rect_width / 2 * (-1) ** (i % 2))) for i in range(4)
-#         ]
-#         thinrect = [
-#             int(cent_rect[i] - (thinrect_width / 2 * (-1) ** (i % 2))) for i in range(4)
-#         ]
-
-#         # Define circle mask for center
-#         circ_rad = 15 * samp  # pixels
-#         yarr, xarr = np.ogrid[: nanmask.shape[0], : nanmask.shape[1]]
-#         rad_dist = np.sqrt(
-#             (xarr - (center[0] + pad) * samp) ** 2
-#             + (yarr - (center[1] + pad) * samp) ** 2
-#         )
-#         circ = rad_dist < circ_rad
-
-#         # Loop over images
-#         ww_sci = np.where(observation_type == "SCI")[0]
-#         for ww in ww_sci:
-#             # Apply cross
-#             roll_ref = roll_reference_angles[ww]  # deg
-#             temp = np.zeros_like(nanmask)
-#             temp[:, rect[0] : rect[1]] = 1  # Vertical
-#             temp[rect[2] : rect[3], :] = 1  # Horizontal
-
-#             # Now ensure center isn't completely masked
-#             temp[circ] = 0
-
-#             # Apply thin cross
-#             temp[:, thinrect[0] : thinrect[1]] = 1  # Vertical
-#             temp[thinrect[2] : thinrect[3], :] = 1  # Horizontal
-
-#             # Rotate the array, include fixed rotation of FQPM edges
-#             temp = rotate(temp, 90 - roll_ref + 4.83544897, reshape=False)
-#             nanmask += temp
-
-#         # If pixel value too high, should be masked, else set to 1.
-#         nanmask[nanmask >= 0.5] = np.nan
-#         nanmask[nanmask < 0.5] = 1
-
-#         # Downsample, remove padding, and mask data
-#         nanmask = nanmask[::samp, ::samp]
-#         nanmask = nanmask[pad:-pad, pad:-pad]
-#         nanmask = set_surrounded_pixels(nanmask)
-#         data *= nanmask
-#         return data
-#     elif exposure_type in ["MIR_LYOT"]:
-#         raise NotImplementedError()
-
-#     return data
-
-
-# legacy function.
 def apply_instrument_mask(
     data,
     center,
@@ -139,53 +26,73 @@ def apply_instrument_mask(
     observation_types,
     roll_reference_angles,
 ):
+    """building and applying the instrument masks to the data. This function takes the
+    legacy implementation, and extracted it contents into their own functions. Unmutated
+    data is also returned.
+    """
+
+    # Extract the roll angles of the science frames.
     science_indices = np.where(observation_types == "SCI")[0]
     science_roll_angles = roll_reference_angles[science_indices]
-    print("science_roll_angles", science_roll_angles)
+
     # Mask coronagraph spiders, 4QPM edges, etc.
     if exposure_type in ["NRC_CORON"]:
-        if "WB" in coronagraph_mask:
-            log.info("  Masking out areas for NIRCam bar coronagraph")
-            xr = np.arange(data.shape[-1]) - center[0]
-            yr = np.arange(data.shape[-2]) - center[1]
-            xx, yy = np.meshgrid(xr, yr)
-            pa = -np.rad2deg(np.arctan2(xx, yy))
-            pa[pa < 0.0] += 360.0
-            ww_sci = np.where(observation_types == "SCI")[0]
-            for ww in ww_sci:
-                roll_ref = roll_reference_angles[ww]  # deg
-                pa1 = (90.0 - 15.0 + roll_ref) % 360.0
-                pa2 = (90.0 + 15.0 + roll_ref) % 360.0
-                if pa1 > pa2:
-                    temp = (pa > pa1) | (pa < pa2)
-                else:
-                    temp = (pa > pa1) & (pa < pa2)
-                data[:, temp] = np.nan
-                pa1 = (270.0 - 15.0 + roll_ref) % 360.0
-                pa2 = (270.0 + 15.0 + roll_ref) % 360.0
-                if pa1 > pa2:
-                    temp = (pa > pa1) | (pa < pa2)
-                else:
-                    temp = (pa > pa1) & (pa < pa2)
-                data[:, temp] = np.nan
-            return data
-    elif exposure_type in ["MIR_4QPM"]:
-        log.info("  Masking out areas for MIRI 4QPM coronagraph")
-
-        instrument_mask = create_miri_4qpm_mask_legacy(
+        return build_nrc_coron_bar_mask_legacy(
             data=data,
+            coronagraph_mask=coronagraph_mask,
             center=center,
             roll_reference_angles=science_roll_angles,
         )
+    elif exposure_type in ["MIR_4QPM"]:
+        log.info("  Masking out areas for MIRI 4QPM coronagraph")
+
+        instrument_mask = build_miri_4qpm_mask_legacy(
+            data=data, center=center, roll_reference_angles=science_roll_angles
+        )
 
         data *= instrument_mask
+        return data
     elif exposure_type in ["MIR_LYOT"]:
         raise NotImplementedError()
 
     return data
 
 
-def create_miri_4qpm_mask_legacy(data, center, roll_reference_angles):
+def build_nrc_coron_bar_mask_legacy(
+    data, coronagraph_mask, center, roll_reference_angles
+):
+    """
+    Extracted from the exposure_type == "NRC_CORON" / "WB" in
+    coronagraph_mask branch, with the observation_types dependency
+    removed. Caller is responsible for passing only the roll angles
+    that should be masked (e.g. pre-filtered to SCI frames).
+    """
+    if "WB" in coronagraph_mask:
+        log.info("  Masking out areas for NIRCam bar coronagraph")
+        xr = np.arange(data.shape[-1]) - center[0]
+        yr = np.arange(data.shape[-2]) - center[1]
+        xx, yy = np.meshgrid(xr, yr)
+        pa = -np.rad2deg(np.arctan2(xx, yy))
+        pa[pa < 0.0] += 360.0
+        for roll_ref in roll_reference_angles:
+            pa1 = (90.0 - 15.0 + roll_ref) % 360.0
+            pa2 = (90.0 + 15.0 + roll_ref) % 360.0
+            if pa1 > pa2:
+                temp = (pa > pa1) | (pa < pa2)
+            else:
+                temp = (pa > pa1) & (pa < pa2)
+            data[:, temp] = np.nan
+            pa1 = (270.0 - 15.0 + roll_ref) % 360.0
+            pa2 = (270.0 + 15.0 + roll_ref) % 360.0
+            if pa1 > pa2:
+                temp = (pa > pa1) | (pa < pa2)
+            else:
+                temp = (pa > pa1) & (pa < pa2)
+            data[:, temp] = np.nan
+        return data
+
+
+def build_miri_4qpm_mask_legacy(data, center, roll_reference_angles):
     """
     Extracted as-is from the exposure_type == "MIR_4QPM" branch,
     with the observation_types dependency removed. Caller is
@@ -414,3 +321,116 @@ def create_miri_4qpm_mask_legacy(data, center, roll_reference_angles):
 #     accumulated_mask = set_surrounded_pixels(accumulated_mask)
 
 #     return accumulated_mask
+
+
+# UNCOMMENT CODE FOR LEGACY IMPLEMENTATION BELOW.
+# def apply_instrument_mask_legacy(
+#     data,
+#     center,
+#     exposure_type,
+#     coronagraph_mask,
+#     observation_type,
+#     roll_reference_angles,
+# ):
+#     # Mask coronagraph spiders, 4QPM edges, etc.
+#     if exposure_type in ["NRC_CORON"]:
+#         if "WB" in coronagraph_mask:
+#             log.info("  Masking out areas for NIRCam bar coronagraph")
+#             xr = np.arange(data.shape[-1]) - center[0]
+#             yr = np.arange(data.shape[-2]) - center[1]
+#             xx, yy = np.meshgrid(xr, yr)
+#             pa = -np.rad2deg(np.arctan2(xx, yy))
+#             pa[pa < 0.0] += 360.0
+#             ww_sci = np.where(observation_type == "SCI")[0]
+#             for ww in ww_sci:
+#                 roll_ref = roll_reference_angles[ww]  # deg
+#                 pa1 = (90.0 - 15.0 + roll_ref) % 360.0
+#                 pa2 = (90.0 + 15.0 + roll_ref) % 360.0
+#                 if pa1 > pa2:
+#                     temp = (pa > pa1) | (pa < pa2)
+#                 else:
+#                     temp = (pa > pa1) & (pa < pa2)
+#                 data[:, temp] = np.nan
+#                 pa1 = (270.0 - 15.0 + roll_ref) % 360.0
+#                 pa2 = (270.0 + 15.0 + roll_ref) % 360.0
+#                 if pa1 > pa2:
+#                     temp = (pa > pa1) | (pa < pa2)
+#                 else:
+#                     temp = (pa > pa1) & (pa < pa2)
+#                 data[:, temp] = np.nan
+#             return data
+#     elif exposure_type in ["MIR_4QPM"]:
+#         # This is MIRI 4QPM data, want to mask edges. However, close
+#         # to the center you don't have a choice. So, want to use
+#         # rectangles with a gap in the center.
+#         log.info("  Masking out areas for MIRI 4QPM coronagraph")
+
+#         # Create array and pad slightly
+#         nanmask = np.zeros_like(data[0])
+#         pad = 5
+#         nanmask = np.pad(nanmask, pad)
+
+#         # Upsample array to improve centering.
+#         samp = 1  # Upsampling factor
+#         nanmask = nanmask.repeat(samp, axis=0).repeat(samp, axis=1)
+
+#         # Define rectangle edges
+#         rect_width = 10 * samp  # pixels
+#         thinrect_width = 2 * samp  # pixels
+
+#         cent_rect = [
+#             (center[0] + pad) * samp,
+#             (center[0] + pad) * samp,
+#             (center[1] + pad) * samp,
+#             (center[1] + pad) * samp,
+#         ]
+#         rect = [
+#             int(cent_rect[i] - (rect_width / 2 * (-1) ** (i % 2))) for i in range(4)
+#         ]
+#         thinrect = [
+#             int(cent_rect[i] - (thinrect_width / 2 * (-1) ** (i % 2))) for i in range(4)
+#         ]
+
+#         # Define circle mask for center
+#         circ_rad = 15 * samp  # pixels
+#         yarr, xarr = np.ogrid[: nanmask.shape[0], : nanmask.shape[1]]
+#         rad_dist = np.sqrt(
+#             (xarr - (center[0] + pad) * samp) ** 2
+#             + (yarr - (center[1] + pad) * samp) ** 2
+#         )
+#         circ = rad_dist < circ_rad
+
+#         # Loop over images
+#         ww_sci = np.where(observation_type == "SCI")[0]
+#         for ww in ww_sci:
+#             # Apply cross
+#             roll_ref = roll_reference_angles[ww]  # deg
+#             temp = np.zeros_like(nanmask)
+#             temp[:, rect[0] : rect[1]] = 1  # Vertical
+#             temp[rect[2] : rect[3], :] = 1  # Horizontal
+
+#             # Now ensure center isn't completely masked
+#             temp[circ] = 0
+
+#             # Apply thin cross
+#             temp[:, thinrect[0] : thinrect[1]] = 1  # Vertical
+#             temp[thinrect[2] : thinrect[3], :] = 1  # Horizontal
+
+#             # Rotate the array, include fixed rotation of FQPM edges
+#             temp = rotate(temp, 90 - roll_ref + 4.83544897, reshape=False)
+#             nanmask += temp
+
+#         # If pixel value too high, should be masked, else set to 1.
+#         nanmask[nanmask >= 0.5] = np.nan
+#         nanmask[nanmask < 0.5] = 1
+
+#         # Downsample, remove padding, and mask data
+#         nanmask = nanmask[::samp, ::samp]
+#         nanmask = nanmask[pad:-pad, pad:-pad]
+#         nanmask = set_surrounded_pixels(nanmask)
+#         data *= nanmask
+#         return data
+#     elif exposure_type in ["MIR_LYOT"]:
+#         raise NotImplementedError()
+
+#     return data
