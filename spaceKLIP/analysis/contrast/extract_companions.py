@@ -12,6 +12,8 @@ import numpy as np
 import pyklip.fakes as fakes
 from pyklip import parallelized
 
+from spaceKLIP.starphot import get_stellar_magnitudes
+
 log = logging.getLogger(__name__)
 log.setLevel(logging.INFO)
 
