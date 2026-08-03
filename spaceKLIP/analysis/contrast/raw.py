@@ -885,6 +885,7 @@ def run_raw_contrast(
 
             # Mask coronagraph spiders, 4QPM edges, etc.
             debug_bar_mask = True
+            print(center)
             print(" --------- I am here -------")
             # if database.red[key]["EXP_TYPE"][j] in ["NRC_CORON"]:
             #     # NOTES: TB I am not sure what this is suppose to look like.
@@ -1020,13 +1021,13 @@ def run_raw_contrast(
             #     data *= nanmask
             # elif database.red[key]["EXP_TYPE"][j] in ["MIR_LYOT"]:
             #     raise NotImplementedError()
-
+            print("Before mask data shape:", data.shape)
             data = apply_instrument_mask(
                 data,
                 center=center,
                 exposure_type=database.red[key]["EXP_TYPE"][j],
                 coronagraph_mask=database.red[key]["CORONMSK"][j],
-                observation_type=database.obs[key]["TYPE"],
+                observation_types=database.obs[key]["TYPE"],
                 roll_reference_angles=database.obs[key]["ROLL_REF"],
             )
             print(data.shape)
@@ -1040,8 +1041,10 @@ def run_raw_contrast(
                 )
                 print(f"Resolution: {resolution}")
                 print(f"pixel Scale (arcsec): {pxsc_arcsec}")
+                print(f"After maskdata shape: {data.shape}")
                 companion_mask = generate_companion_spatial_mask(
                     spatial_shape=data.shape[1:],
+                    # spatial_shape=data.shape,
                     center_pix=center,
                     pixscale_arcsec=pxsc_arcsec,
                     spatial_resolution_pix=resolution,
