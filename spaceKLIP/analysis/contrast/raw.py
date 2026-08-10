@@ -6,11 +6,14 @@ import logging
 # IMPORTS
 # =============================================================================
 import os
+from dataclasses import dataclass
 from pathlib import Path
+from typing import List, Optional, Tuple
 
 import astropy.units as u
 import numpy as np
 from astropy.table import Table
+from numpy.typing import NDArray
 from pyklip import klip
 from stpsf.constants import JWST_CIRCUMSCRIBED_DIAMETER
 
@@ -30,7 +33,7 @@ log.setLevel(logging.INFO)
 # Helpers
 #
 
-from typing import Final, Tuple
+from typing import Final
 
 # =============================================================================
 # DOMAIN CONSTANTS
@@ -50,6 +53,46 @@ MASK_OCCUPANCY_THRESHOLD: Final[float] = 0.5
 # =============================================================================
 # LOW-LEVEL GEOMETRIC KERNELS
 # =============================================================================
+
+
+# @dataclass(frozen=True)
+# class ContrastResult:
+#     """Results from a raw contrast measurement"""
+
+#     separations: NDArray[np.floating]
+#     raw_contrast: NDArray[np.floating]
+#     throughput_corrected_contrast: NDArray[np.floating] | None
+
+
+# @dataclass(frozen=True)
+# class ContrastResult:
+#     """Raw contrast curves measured for a set of KL modes."""
+
+#     separations: NDArray[np.floating]
+#     raw_contrast: NDArray[np.floating]
+#     throughput_corrected_contrast: NDArray[np.floating] | None
+#     # klmodes: tuple[int, ...]
+
+#     # @property
+#     # def n_klmodes(self) -> int:
+#     #     return len(self.klmodes)
+
+#     @property
+#     def has_throughput_correction(self) -> bool:
+#         return self.throughput_corrected_contrast is not None
+
+
+@dataclass(frozen=True)
+class ContrastResult:
+    """Contrast curves measured from a reduced image cube."""
+
+    separations_pix: NDArray[np.floating]
+    raw_contrast: NDArray[np.floating]
+    throughput_corrected_contrast: NDArray[np.floating] | None = None
+
+    @property
+    def has_throughput_correction(self) -> bool:
+        return self.throughput_corrected_contrast is not None
 
 
 def rotate_coordinates(
@@ -221,7 +264,6 @@ def generate_miri_4qpm_mask(
 # =============================================================================
 # HIGH-LEVEL Contrast calculation API
 # =============================================================================
-from typing import Optional
 
 
 def calc_single_contrast_curve(
@@ -301,20 +343,145 @@ def apply_throughput_correction(
     return corrected_frame
 
 
+# def compute_contrast_curves(
+#     data_cube: np.ndarray,
+#     pixel_area_sr: float,
+#     stellar_flux_peak: float,
+#     spatial_resolution_pix: float,
+#     center_pix: Tuple[float, float],
+#     inner_working_angle_pix: int | float = 1,
+#     outer_working_angle_pix: Optional[int | float] = None,
+#     coronagraph_transmission_mask: Optional[np.ndarray] = None,
+# ) -> Tuple[
+#     np.ndarray,
+#     np.ndarray,
+#     Optional[np.ndarray],
+# ]:
+#     """
+#     Compute raw and throughput-corrected contrast curves.
+
+#     Parameters
+#     ----------
+#     data_cube
+#         Input detector cube with shape (n_frames, ny, nx).
+
+#     pixel_area_sr
+#         Pixel solid angle in steradians.
+
+#     stellar_flux_peak
+#         Stellar peak normalization flux.
+
+#     spatial_resolution_pix
+#         Resolution element diameter in pixels.
+
+#     center_pix
+#         PSF center coordinates as (x, y).
+
+#     inner_working_angle_pix
+#         Inner working angle in pixels.
+
+#     outer_working_angle_pix
+#         Outer working angle in pixels.
+
+#     coronagraph_transmission_mask
+#         Optional coronagraph throughput transmission map.
+
+#     Returns
+#     -------
+#     separations_pix
+#         Radial separations in pixels.
+
+#     raw_contrast_curves
+#         Raw 5-sigma contrast curves.
+
+#     throughput_corrected_contrast_curves
+#         Throughput-corrected contrast curves.
+#     """
+#     if data_cube.ndim != 3:
+#         raise ValueError("data_cube must have shape (n_frames, ny, nx)")
+
+#     if stellar_flux_peak <= 0:
+#         raise ValueError("stellar_flux_peak must be positive.")
+
+#     if coronagraph_transmission_mask is not None:
+#         if coronagraph_transmission_mask.shape != data_cube.shape[1:]:
+#             raise ValueError("coronagraph_transmission_mask shape mismatch.")
+
+#     n_frames = data_cube.shape[0]
+
+#     if outer_working_angle_pix is None:
+#         outer_working_angle_pix = min(data_cube.shape[1:]) // 2
+
+#     normalization_factor = pixel_area_sr / stellar_flux_peak
+
+#     # Precompute normalized cube
+#     normalized_cube = (data_cube * normalization_factor).astype(np.float32, copy=False)
+
+#     raw_contrast_curves = []
+#     throughput_corrected_curves = []
+
+#     radial_separations_pix = None
+
+#     contrast_kwargs = dict(
+#         inner_working_angle_pix=inner_working_angle_pix,
+#         outer_working_angle_pix=outer_working_angle_pix,
+#         spatial_resolution_pix=spatial_resolution_pix,
+#         center_pix=center_pix,
+#         low_pass_filter=False,
+#         coronagraph_transmission_mask=coronagraph_transmission_mask,
+#     )
+
+#     for normalized_frame in normalized_cube:
+#         (
+#             separations_pix,
+#             raw_contrast,
+#             corrected_contrast,
+#         ) = calc_single_contrast_curve(
+#             normalized_frame=normalized_frame, **contrast_kwargs
+#         )
+#         # shared radial separations
+#         if radial_separations_pix is None:
+#             radial_separations_pix = separations_pix
+
+#         raw_contrast_curves.append(raw_contrast)
+#         throughput_corrected_curves.append(corrected_contrast)
+
+#     # convert to arrays
+#     raw_contrast_curves = np.asarray(
+#         raw_contrast_curves,
+#         dtype=np.float32,
+#     )
+
+#     throughput_corrected_array = None
+
+#     if coronagraph_transmission_mask is not None:
+#         throughput_corrected_array = np.asarray(
+#             throughput_corrected_curves,
+#             dtype=np.float32,
+#         )
+
+#     # return (
+#     #     radial_separations_pix,
+#     #     raw_contrast_curves,
+#     #     throughput_corrected_array,
+#     # )
+#     return ContrastResult(
+#         separations=radial_separations_pix,
+#         raw_contrast=raw_contrast_curves,
+#         throughput_corrected_contrast=throughput_corrected_array,
+#     )
+
+
 def compute_contrast_curves(
     data_cube: np.ndarray,
     pixel_area_sr: float,
     stellar_flux_peak: float,
     spatial_resolution_pix: float,
-    center_pix: Tuple[float, float],
+    center_pix: tuple[float, float],
     inner_working_angle_pix: int | float = 1,
-    outer_working_angle_pix: Optional[int | float] = None,
-    coronagraph_transmission_mask: Optional[np.ndarray] = None,
-) -> Tuple[
-    np.ndarray,
-    np.ndarray,
-    Optional[np.ndarray],
-]:
+    outer_working_angle_pix: int | float | None = None,
+    coronagraph_transmission_mask: np.ndarray | None = None,
+) -> ContrastResult:
     """
     Compute raw and throughput-corrected contrast curves.
 
@@ -322,38 +489,25 @@ def compute_contrast_curves(
     ----------
     data_cube
         Input detector cube with shape (n_frames, ny, nx).
-
     pixel_area_sr
         Pixel solid angle in steradians.
-
     stellar_flux_peak
         Stellar peak normalization flux.
-
     spatial_resolution_pix
         Resolution element diameter in pixels.
-
     center_pix
         PSF center coordinates as (x, y).
-
     inner_working_angle_pix
         Inner working angle in pixels.
-
     outer_working_angle_pix
         Outer working angle in pixels.
-
     coronagraph_transmission_mask
         Optional coronagraph throughput transmission map.
 
     Returns
     -------
-    separations_pix
-        Radial separations in pixels.
-
-    raw_contrast_curves
-        Raw 5-sigma contrast curves.
-
-    throughput_corrected_contrast_curves
-        Throughput-corrected contrast curves.
+    ContrastResult
+        Contrast measurements sharing a common radial-separation grid.
     """
     if data_cube.ndim != 3:
         raise ValueError("data_cube must have shape (n_frames, ny, nx)")
@@ -361,18 +515,17 @@ def compute_contrast_curves(
     if stellar_flux_peak <= 0:
         raise ValueError("stellar_flux_peak must be positive.")
 
-    if coronagraph_transmission_mask is not None:
-        if coronagraph_transmission_mask.shape != data_cube.shape[1:]:
-            raise ValueError("coronagraph_transmission_mask shape mismatch.")
-
-    n_frames = data_cube.shape[0]
+    if (
+        coronagraph_transmission_mask is not None
+        and coronagraph_transmission_mask.shape != data_cube.shape[1:]
+    ):
+        raise ValueError("coronagraph_transmission_mask shape mismatch.")
 
     if outer_working_angle_pix is None:
         outer_working_angle_pix = min(data_cube.shape[1:]) // 2
 
     normalization_factor = pixel_area_sr / stellar_flux_peak
 
-    # Precompute normalized cube
     normalized_cube = (data_cube * normalization_factor).astype(np.float32, copy=False)
 
     raw_contrast_curves = []
@@ -380,14 +533,14 @@ def compute_contrast_curves(
 
     radial_separations_pix = None
 
-    contrast_kwargs = dict(
-        inner_working_angle_pix=inner_working_angle_pix,
-        outer_working_angle_pix=outer_working_angle_pix,
-        spatial_resolution_pix=spatial_resolution_pix,
-        center_pix=center_pix,
-        low_pass_filter=False,
-        coronagraph_transmission_mask=coronagraph_transmission_mask,
-    )
+    contrast_kwargs = {
+        "inner_working_angle_pix": inner_working_angle_pix,
+        "outer_working_angle_pix": outer_working_angle_pix,
+        "spatial_resolution_pix": spatial_resolution_pix,
+        "center_pix": center_pix,
+        "low_pass_filter": False,
+        "coronagraph_transmission_mask": coronagraph_transmission_mask,
+    }
 
     for normalized_frame in normalized_cube:
         (
@@ -397,41 +550,35 @@ def compute_contrast_curves(
         ) = calc_single_contrast_curve(
             normalized_frame=normalized_frame, **contrast_kwargs
         )
-        # shared radial separations
+
         if radial_separations_pix is None:
             radial_separations_pix = separations_pix
 
         raw_contrast_curves.append(raw_contrast)
-        throughput_corrected_curves.append(corrected_contrast)
 
-    # convert to arrays
-    raw_contrast_curves = np.asarray(
-        raw_contrast_curves,
-        dtype=np.float32,
-    )
+        if corrected_contrast is not None:
+            throughput_corrected_curves.append(corrected_contrast)
+
+    raw_contrast_array = np.asarray(raw_contrast_curves, dtype=np.float32)
 
     throughput_corrected_array = None
 
     if coronagraph_transmission_mask is not None:
         throughput_corrected_array = np.asarray(
-            throughput_corrected_curves,
-            dtype=np.float32,
+            throughput_corrected_curves, dtype=np.float32
         )
 
-    return (
-        radial_separations_pix,
-        raw_contrast_curves,
-        throughput_corrected_array,
+    return ContrastResult(
+        separations_pix=np.asarray(radial_separations_pix, dtype=np.float32),
+        raw_contrast=raw_contrast_array,
+        throughput_corrected_contrast=(throughput_corrected_array),
     )
 
 
 # =============================================================================
 # Adding in the companion masks now
 # =============================================================================
-from typing import List, Tuple
 
-import numpy as np
-from numpy.typing import NDArray
 
 # =============================================================================
 # ATOMIC MATHEMATICAL KERNEL (Pure Point Logic)
@@ -934,11 +1081,15 @@ def run_raw_contrast(
                 coronagraph_transmission_mask=mask,
             )
 
-            (
-                radial_separations_pix,
-                raw_contrast_curves,
-                throughput_corrected_array,
-            ) = contrast_results
+            # (
+            #     radial_separations_pix,
+            #     raw_contrast_curves,
+            #     throughput_corrected_array,
+            # ) = contrast_results
+
+            radial_separations_pix = contrast_results.separations_pix
+            raw_contrast_curves = contrast_results.raw_contrast
+            throughput_corrected_array = contrast_results.throughput_corrected_contrast
 
             # NOTES: The raw contrast calculation like should be migrated to a table
             # or dataclass result structure rather than floating variables, its a result.
@@ -1131,7 +1282,6 @@ def run_raw_contrast(
             # plt.close(fig)
 
             # Exporting Data
-
             if output_filetype.lower() == "ecsv":
                 # Save outputs as astropy ECSV text tables
                 columns = [seps[0]]
@@ -1164,3 +1314,64 @@ def run_raw_contrast(
                 raise ValueError(
                     'File save format not supported, options are "npy" or "ecsv".'
                 )
+
+
+def write_contrast_result(
+    result: ContrastResult, klmodes, fitsfile: str | Path, output_filetype: str = "npy"
+):
+    "Exporting the contrast result to file"
+    fitsfile = Path(fitsfile)
+    output_stem = fitsfile.with_suffix("")
+    filetype = output_filetype.lower()
+
+    if filetype == "npy":
+        np.save(f"{output_stem}_seps.npy", result.separations_pix)
+        np.save(f"{output_stem}_cons.npy", result.raw_contrast)
+        if result.has_throughput_correction:
+            np.save(
+                f"{output_stem}_cons_mask.npy", result.throughput_corrected_contrast
+            )
+    if filetype == "ecsv":
+        columns = [result.separations_pix]
+        names = ["separation"]
+
+        for index, klmode in enumerate(klmodes):
+            columns.append(result.raw_contrast[index])
+            names.append(f"contrast, N_kl={klmode}")
+
+            if result.has_throughput_correction:
+                columns.append(result.throughput_corrected_contrast[index])
+                names.append(f"contrast+mask, N_kl={klmode}")
+
+        table = Table(columns, names=names)
+
+        table["separation"].unit = u.arcsec
+
+        output_path = Path(f"{output_stem}_contrast.ecsv")
+
+        table.write(
+            output_path,
+            overwrite=True,
+        )
+
+        # # Save outputs as astropy ECSV text tables
+        # columns = [seps[0]]
+        # names = ["separation"]
+        # for i, klmode in enumerate(klmodes):
+        #     columns.append(cons[i])
+        #     names.append(f"contrast, N_kl={klmode}")
+        #     if mask is not None:
+        #         columns.append(cons_mask[i])
+        #         names.append(f"contrast+mask, N_kl={klmode}")
+        # results_table = Table(columns, names=names)
+        # results_table["separation"].unit = u.arcsec
+        # # the following needs debugging:
+        # # for kw in ['TELESCOP', 'INSTRUME', 'SUBARRAY', 'FILTER', 'CORONMSK', 'EXP_TYPE', 'FITSFILE']:
+        # #    results_table.meta[kw] = database.red[key][kw][j]
+
+        # output_fn = fitsfile[:-5] + "_contrast.ecsv"
+        # results_table.write(output_fn, overwrite=True)
+        # print(f"Contrast results and plots saved to {output_fn}")
+
+        # for
+    raise ValueError("File save format not support. Options are 'npy' or 'csv'")
