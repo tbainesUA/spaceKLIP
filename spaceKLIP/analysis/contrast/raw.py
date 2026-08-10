@@ -1029,16 +1029,18 @@ def run_raw_contrast(
             resolution = spatial_resolution_pix
 
             # Get the star position.
-            if overwrite_crpix is None:
-                center = (
-                    head_pri["CRPIX1"] - 1.0,
-                    head_pri["CRPIX2"] - 1.0,
-                )  # pix (0-indexed)
-            else:
-                center = (
-                    overwrite_crpix[0] - 1.0,
-                    overwrite_crpix[1] - 1.0,
-                )  # pix (0-indexed)
+            # if overwrite_crpix is None:
+            #     center = (
+            #         head_pri["CRPIX1"] - 1.0,
+            #         head_pri["CRPIX2"] - 1.0,
+            #     )  # pix (0-indexed)
+            # else:
+            #     center = (
+            #         overwrite_crpix[0] - 1.0,
+            #         overwrite_crpix[1] - 1.0,
+            #     )  # pix (0-indexed)
+
+            center = get_image_center(head_pri, overwrite_crpix=overwrite_crpix)
 
             # Mask coronagraph spiders, 4QPM edges, etc.
             debug_bar_mask = True
@@ -1333,6 +1335,17 @@ def run_raw_contrast(
                 klmodes=klmodes,
                 output_filetype=output_filetype,
             )
+
+
+def get_image_center(primary_header, overwrite_crpix=None) -> tuple[float, float]:
+    """Return the zero-indexed image center."""
+    if overwrite_crpix is None:
+        crpix1 = primary_header["CRPIX1"]
+        crpix2 = primary_header["CRPIX2"]
+    else:
+        crpix1, crpix2 = overwrite_crpix
+
+    return crpix1 - 1.0, crpix2 - 1.0
 
 
 def calculate_stellar_peak_flux(
