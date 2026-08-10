@@ -1282,57 +1282,111 @@ def run_raw_contrast(
             # plt.close(fig)
 
             # Exporting Data
-            if output_filetype.lower() == "ecsv":
-                # Save outputs as astropy ECSV text tables
-                columns = [seps[0]]
-                names = ["separation"]
-                for i, klmode in enumerate(klmodes):
-                    columns.append(cons[i])
-                    names.append(f"contrast, N_kl={klmode}")
-                    if mask is not None:
-                        columns.append(cons_mask[i])
-                        names.append(f"contrast+mask, N_kl={klmode}")
-                results_table = Table(columns, names=names)
-                results_table["separation"].unit = u.arcsec
-                # the following needs debugging:
-                # for kw in ['TELESCOP', 'INSTRUME', 'SUBARRAY', 'FILTER', 'CORONMSK', 'EXP_TYPE', 'FITSFILE']:
-                #    results_table.meta[kw] = database.red[key][kw][j]
+            # if output_filetype.lower() == "ecsv":
+            #     # Save outputs as astropy ECSV text tables
+            #     columns = [seps[0]]
+            #     names = ["separation"]
+            #     for i, klmode in enumerate(klmodes):
+            #         columns.append(cons[i])
+            #         names.append(f"contrast, N_kl={klmode}")
+            #         if mask is not None:
+            #             columns.append(cons_mask[i])
+            #             names.append(f"contrast+mask, N_kl={klmode}")
+            #     results_table = Table(columns, names=names)
+            #     results_table["separation"].unit = u.arcsec
+            #     # the following needs debugging:
+            #     # for kw in ['TELESCOP', 'INSTRUME', 'SUBARRAY', 'FILTER', 'CORONMSK', 'EXP_TYPE', 'FITSFILE']:
+            #     #    results_table.meta[kw] = database.red[key][kw][j]
 
-                output_fn = fitsfile[:-5] + "_contrast.ecsv"
-                results_table.write(output_fn, overwrite=True)
-                print(f"Contrast results and plots saved to {output_fn}")
-            elif output_filetype.lower() == "npy":
-                # Save outputs as numpy .npy files
-                np.save(fitsfile[:-5] + "_seps.npy", seps)
-                np.save(fitsfile[:-5] + "_cons.npy", cons)
-                if mask is not None:
-                    np.save(fitsfile[:-5] + "_cons_mask.npy", cons_mask)
-                print(
-                    f"Contrast results and plots saved to {fitsfile[:-5] + '_seps.npy'}, {fitsfile[:-5] + '_cons.npy'}"
-                )
-            else:
-                raise ValueError(
-                    'File save format not supported, options are "npy" or "ecsv".'
-                )
+            #     output_fn = fitsfile[:-5] + "_contrast.ecsv"
+            #     results_table.write(output_fn, overwrite=True)
+            #     print(f"Contrast results and plots saved to {output_fn}")
+            # elif output_filetype.lower() == "npy":
+            #     # Save outputs as numpy .npy files
+            #     np.save(fitsfile[:-5] + "_seps.npy", seps)
+            #     np.save(fitsfile[:-5] + "_cons.npy", cons)
+            #     if mask is not None:
+            #         np.save(fitsfile[:-5] + "_cons_mask.npy", cons_mask)
+            #     print(
+            #         f"Contrast results and plots saved to {fitsfile[:-5] + '_seps.npy'}, {fitsfile[:-5] + '_cons.npy'}"
+            #     )
+            # else:
+            #     raise ValueError(
+            #         'File save format not supported, options are "npy" or "ecsv".'
+            #     )
+
+            # Exporting Data
+            write_contrast_results(
+                result=contrast_results,
+                fitsfile=fitsfile,
+                pixel_scale_arcsec=pxsc_arcsec,
+                klmodes=klmodes,
+                output_filetype=output_filetype,
+            )
 
 
-def write_contrast_result(
-    result: ContrastResult, klmodes, fitsfile: str | Path, output_filetype: str = "npy"
-):
-    "Exporting the contrast result to file"
+def write_contrast_results(
+    result: ContrastResult,
+    fitsfile: str | Path,
+    pixel_scale_arcsec: float,
+    klmodes: list[str] | tuple[str, ...] | list[int] | tuple[int, ...],
+    output_filetype: str = "npy",
+) -> None:
+    """
+    Write raw contrast results to disk.
+
+    Parameters
+    ----------
+    result
+        ContrastResult containing radial separations in pixels,
+        raw contrast curves, and optional throughput-corrected curves.
+
+    fitsfile
+        FITS filename used to construct the output filenames.
+
+    pixel_scale_arcsec
+        Pixel scale in arcseconds per pixel.
+
+    klmodes
+        KL modes corresponding to the first axis of the contrast arrays.
+
+    output_filetype
+        Output format. Supported options are ``"npy"`` and ``"ecsv"``.
+
+    Returns
+    -------
+    None
+    """
     fitsfile = Path(fitsfile)
     output_stem = fitsfile.with_suffix("")
+
+    separations_arcsec = result.separations_pix * pixel_scale_arcsec
+
     filetype = output_filetype.lower()
 
     if filetype == "npy":
-        np.save(f"{output_stem}_seps.npy", result.separations_pix)
+        # Preserve the legacy shape: one separation array per KL mode.
+        separations = np.tile(separations_arcsec, (result.raw_contrast.shape[0], 1))
+
+        np.save(f"{output_stem}_seps.npy", separations)
+
         np.save(f"{output_stem}_cons.npy", result.raw_contrast)
+
         if result.has_throughput_correction:
             np.save(
                 f"{output_stem}_cons_mask.npy", result.throughput_corrected_contrast
             )
+
+        print(
+            "Contrast results and plots saved to "
+            f"{output_stem}_seps.npy, "
+            f"{output_stem}_cons.npy"
+        )
+
+        return
+
     if filetype == "ecsv":
-        columns = [result.separations_pix]
+        columns = [separations_arcsec]
         names = ["separation"]
 
         for index, klmode in enumerate(klmodes):
@@ -1343,35 +1397,19 @@ def write_contrast_result(
                 columns.append(result.throughput_corrected_contrast[index])
                 names.append(f"contrast+mask, N_kl={klmode}")
 
-        table = Table(columns, names=names)
+        results_table = Table(columns, names=names)
 
-        table["separation"].unit = u.arcsec
+        results_table["separation"].unit = u.arcsec
 
-        output_path = Path(f"{output_stem}_contrast.ecsv")
+        output_file = Path(f"{output_stem}_contrast.ecsv")
 
-        table.write(
-            output_path,
+        results_table.write(
+            output_file,
             overwrite=True,
         )
 
-        # # Save outputs as astropy ECSV text tables
-        # columns = [seps[0]]
-        # names = ["separation"]
-        # for i, klmode in enumerate(klmodes):
-        #     columns.append(cons[i])
-        #     names.append(f"contrast, N_kl={klmode}")
-        #     if mask is not None:
-        #         columns.append(cons_mask[i])
-        #         names.append(f"contrast+mask, N_kl={klmode}")
-        # results_table = Table(columns, names=names)
-        # results_table["separation"].unit = u.arcsec
-        # # the following needs debugging:
-        # # for kw in ['TELESCOP', 'INSTRUME', 'SUBARRAY', 'FILTER', 'CORONMSK', 'EXP_TYPE', 'FITSFILE']:
-        # #    results_table.meta[kw] = database.red[key][kw][j]
+        print(f"Contrast results and plots saved to {output_file}")
 
-        # output_fn = fitsfile[:-5] + "_contrast.ecsv"
-        # results_table.write(output_fn, overwrite=True)
-        # print(f"Contrast results and plots saved to {output_fn}")
+        return
 
-        # for
-    raise ValueError("File save format not support. Options are 'npy' or 'csv'")
+    raise ValueError('File save format not supported, options are "npy" or "ecsv".')
