@@ -1025,6 +1025,13 @@ def run_raw_contrast(
     )
 
     # Loop through concatenations.
+    # The looping signature here can be updated to be more clearer
+    # Example:
+    #
+    # for key, observation in database.obs.items():
+    #     for obs in observation:
+    #
+    # looking of the keys and table and then iterate per row in the table
     for i, key in enumerate(database.red.keys()):
         log.info("--> Concatenation " + key)
         # Loop through FITS files.
