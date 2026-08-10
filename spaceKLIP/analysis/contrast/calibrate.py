@@ -1,19 +1,26 @@
 from __future__ import division
 
+import copy
 import logging
 
 # =============================================================================
 # IMPORTS
 # =============================================================================
 import os
+import sys
+from io import StringIO
 
+import astropy.io.fits as fits
 import matplotlib.pyplot as plt
 import numpy as np
+import pyklip.fakes as fakes
 from astropy.table import Table
 from cycler import cycler
+from pyklip import parallelized
 from pyklip.instruments.JWST import JWSTData
 from scipy.interpolate import interp1d
 from stpsf.constants import JWST_CIRCUMSCRIBED_DIAMETER
+from tqdm.auto import trange
 
 from spaceKLIP import utils as ut
 from spaceKLIP.plotting import load_plt_style
@@ -24,6 +31,24 @@ from spaceKLIP.utils import pop_pxar_kw
 
 log = logging.getLogger(__name__)
 log.setLevel(logging.INFO)
+
+
+def validate_companions(companions):
+    """Validation check to ensure that a list of companions (objects) have
+    3 elements (ra, dec, size lambda/D units) want a list of lists"""
+    if companions is None:
+        return None
+
+    if not companions:
+        return []
+
+    if not isinstance(companions[0], (list, tuple)):
+        companions = [companions]
+
+    if any(len(c) != 3 for c in companions):
+        raise ValueError("Each companion must contain exactly 3 elements")
+
+    return companions
 
 
 def run_calibrate_contrast(
@@ -84,6 +109,8 @@ def run_calibrate_contrast(
     None.
     """
 
+    print(type(database))
+
     # Check input.
     companions = validate_companions(companions)
 
@@ -116,6 +143,7 @@ def run_calibrate_contrast(
         for j in range(nfitsfiles):
             # Read FITS file and PSF mask.
             fitsfile = database.red[key]["FITSFILE"][j]
+
             data, head_pri, head_sci, is2d = ut.read_red(fitsfile)
             maskfile = database.red[key]["MASKFILE"][j]
             mask = ut.read_msk(maskfile)
@@ -142,8 +170,10 @@ def run_calibrate_contrast(
 
                 # rawcon_data = Table.read(contrast_path, format='ascii.ecsv')
 
+            print("HERE")
+
             # Read Stage 2 files and make pyKLIP dataset
-            filepaths, psflib_filepaths = get_pyklip_filepaths(database.database, key)
+            filepaths, psflib_filepaths = get_pyklip_filepaths(database, key)
             pop_pxar_kw(np.append(filepaths, psflib_filepaths))
             pyklip_dataset = JWSTData(filepaths, psflib_filepaths)
 
@@ -276,7 +306,7 @@ def run_calibrate_contrast(
                 "klip"  # Currently not logged, may need changing in future.
             )
             _, _, maxnumbasis = get_pyklip_filepaths(
-                database.database, key, return_maxbasis=True
+                database, key, return_maxbasis=True
             )  # ensure maxnumbasis is same as for rawcon / klipsub reduction
             klip_args["maxnumbasis"] = maxnumbasis
             inj_subdir = (
@@ -544,3 +574,294 @@ def run_calibrate_contrast(
                 plot_style=plot_style,
             )
             plt.close(fig)
+
+
+def inject_and_recover(
+    raw_dataset,
+    injection_psf,
+    injection_seps,
+    injection_pas,
+    injection_spacing,
+    injection_fluxes,
+    klip_args,
+    retrieve_fwhm,
+    true_companions=None,
+):
+    """
+    Function to inject synthetic PSFs into a pyKLIP dataset, then perform
+    KLIP subtraction, then calculate the flux losses from the KLIP process.
+
+    Parameters
+    ----------
+    raw_dataset : pyKLIP dataset
+        A pyKLIP dataset which companions will be injected into and KLIP
+        will be performed on.
+    injection_psf : 2D-array
+        The PSF of the companion to be injected.
+    injection_seps : 1D-array
+        List of separations to inject companions at (pixels).
+    injection_pas : 1D-array
+        List of position angles to inject companions at (degrees).
+    injection_spacing : int, None
+        Spacing between companions injected in a single image. If companions
+        are too close then it can pollute the recovered flux. Set to 'None'
+        to inject only one companion at a time (pixels).
+    injection_fluxes : 1D-array
+        Same size as injection_seps, units should correspond to the image
+        units. This is the *peak* flux of the injection.
+    klip_args : dict
+        Arguments to be passed into the KLIP subtraction process
+    retrieve_fwhm : float
+        Full-Width Half-Maximum value to estimate the 2D gaussian fit when
+        retrieving the companion fluxes.
+    true_companions : list of list of three float, optional
+        List of real companions to be masked before computing the raw contrast.
+        For each companion, there should be a three element list containing
+        [RA offset (pixels), Dec offset (pixels), mask radius (pixels)].
+        The default is None.
+
+    Returns
+    -------
+    all_seps : np.array
+        Array containing the separations of all injected
+        companions across all images.
+    all_pas : np.array
+        Array containing the position angles of all injected
+        companions across all images.
+    all_inj_fluxes : np.array
+        Array containing the injected peak fluxes of all injected
+        companions across all images.
+    all_retr_fluxes : np.array
+        Array containing the retrieved peak fluxes of all injected
+        companions across all images.
+    """
+
+    # Initialise some arrays and quantities
+    Nsep = len(injection_seps)
+    Npa = len(injection_pas)
+    list_of_injected = []
+    all_injected = False
+    all_seps = []
+    all_pas = []
+    all_inj_fluxes = []
+    all_retr_fluxes = []
+
+    # Ensure provided PSF is normalised to a peak intensity of 1
+    injection_psf_norm = injection_psf / np.max(injection_psf)
+
+    # Don't want to inject near any known companions, eliminate any
+    # of these positions straight away.
+    if true_companions is not None:
+        for tcomp in true_companions:
+            tcomp_ra, tcomp_de, tcomp_rad = tcomp
+            for i in range(Nsep):
+                for j in range(Npa):
+                    pos_id = i * Npa + j
+                    # Convert position to x-y (RA-DEC) offset in pixels
+                    inj_ra = injection_seps[i] * np.sin(
+                        np.deg2rad(injection_pas[j])
+                    )  # pixels
+                    inj_de = injection_seps[i] * np.cos(
+                        np.deg2rad(injection_pas[j])
+                    )  # pixels
+                    # Calculate distance to companion
+                    dist = np.sqrt((tcomp_ra - inj_ra) ** 2 + (tcomp_de - inj_de) ** 2)
+                    # Check if too close, if so, lie to the code and say its already injected
+                    if dist < tcomp_rad:
+                        list_of_injected += [pos_id]
+    if len(list_of_injected) != 0:
+        log.info(
+            "--> {}/{} source positions not suitable for injection.".format(
+                len(list_of_injected), Nsep * Npa
+            )
+        )
+    else:
+        log.info(
+            "--> All {} source positions suitable for injection.".format(Nsep * Npa)
+        )
+
+    # Want to keep going until a companion has been injected and recovered
+    # at each given separation and position angle.
+    counter = 1
+    remaining_to_inject = (Nsep * Npa) - len(list_of_injected)
+    with trange(remaining_to_inject, position=0, leave=True) as t:
+        while all_injected == False:
+            # Make a copy of the dataset
+            dataset = copy.deepcopy(raw_dataset)
+            # Define array to keep track of currently injected positions
+            current_injected = []
+            # Loop over separations
+            for i in range(Nsep):
+                new_sep = injection_seps[i]
+                new_flux = injection_fluxes[i]
+                # Loop over position angles
+                for j in range(Npa):
+                    new_pa = injection_pas[j]
+
+                    # Get specific id for this position
+                    pos_id = i * Npa + j
+                    if pos_id in list_of_injected:
+                        # Already injected at this position, skip
+                        continue
+
+                    # Need to check if this position is too close to already
+                    # injected positions. By default, assume we want to inject.
+                    inject_flag = True
+                    for inj_id in current_injected:
+                        # If we don't want to inject more than one companion
+                        # per image, then flag to not inject.
+                        if injection_spacing == None:
+                            inject_flag = False
+                            break
+
+                        # Get separation and PA for injected position
+                        inj_j = inj_id % Npa
+                        inj_i = (inj_id - inj_j) // Npa
+                        inj_sep = injection_seps[inj_i]
+                        inj_pa = injection_pas[inj_j]
+                        inj_flux = injection_fluxes[inj_i]
+
+                        # If something was injected close to the coronagraph
+                        # don't inject anything else in this image.
+                        if inj_sep < 5:
+                            inject_flag = False
+                            break
+
+                        # Calculate distance between this injected position
+                        # and the new position we'd also like to inject at.
+                        # If object is too close to something that's already
+                        # injected, we don't want to inject.
+                        dist = np.sqrt(
+                            new_sep**2
+                            + inj_sep**2
+                            - 2
+                            * new_sep
+                            * inj_sep
+                            * np.cos(np.deg2rad(inj_pa - new_pa))
+                        )
+                        if dist < injection_spacing:
+                            inject_flag = False
+                            break
+
+                        # If the difference in fluxes is too large, don't inject
+                        # as this can really affect things.
+                        flux_factor = max(inj_flux, new_flux) / min(inj_flux, new_flux)
+                        if flux_factor > 10:
+                            inject_flag = False
+                            break
+
+                    # If this position survived the filtering, inject into images
+                    if inject_flag == True:
+                        # Mark as injected in this dataset and overall.
+                        current_injected += [pos_id]
+                        list_of_injected += [pos_id]
+
+                        # Injected PSF needs to be a 3D array that matches dataset
+                        inj_psf_3d = np.array(
+                            [
+                                injection_psf_norm * new_flux
+                                for k in range(dataset.input.shape[0])
+                            ]
+                        )
+
+                        # Inject the PSF
+                        fakes.inject_planet(
+                            frames=dataset.input,
+                            centers=dataset.centers,
+                            inputflux=inj_psf_3d,
+                            astr_hdrs=dataset.wcs,
+                            radius=new_sep,
+                            pa=new_pa,
+                            stampsize=65,
+                        )
+
+            # Figure out how many sources were injected
+            Ninjected = len(current_injected)
+            t.update(Ninjected)
+
+            # Reroute KLIP printing for our own progress bar
+            original_stdout = sys.stdout
+            original_stderr = sys.stderr
+            sys.stdout = StringIO()
+            sys.stderr = StringIO()
+
+            # Still in the while loop, need to run KLIP on the dataset we
+            # have injected companions into.
+            fileprefix = "INJ_ITER{}_{}COMP".format(counter, Ninjected)
+            parallelized.klip_dataset(
+                dataset=dataset,
+                psf_library=dataset.psflib,
+                fileprefix=fileprefix,
+                **klip_args,
+            )
+
+            # Restore printing
+            sys.stdout = original_stdout
+            sys.stderr = original_stderr
+
+            # Now need to recover the flux by fitting a 2D Gaussian, mainly interested in the peak
+            # flux so this is an okay approximation. Could improve in the future.
+            klipped_file = klip_args["outputdir"] + fileprefix + "-KLmodes-all.fits"
+            with fits.open(klipped_file) as hdul:
+                klipped_data = hdul[0].data
+                frame_ids = range(klipped_data.shape[0])
+                centers = [
+                    [hdul[0].header["PSFCENTX"], hdul[0].header["PSFCENTY"]]
+                    for c in frame_ids
+                ]
+                # Get fluxes for all companions that were injected, for all KL modes used.
+                for inj_id in current_injected:
+                    inj_j = inj_id % Npa
+                    inj_i = (inj_id - inj_j) // Npa
+                    inj_sep = injection_seps[inj_i]
+                    inj_pa = injection_pas[inj_j]
+                    inj_flux = injection_fluxes[inj_i]
+
+                    # Need to loop over each KL mode individually due to pyKLIP subtleties,
+                    # basically the same as what pyKLIP would be doing anyway.
+                    retrieved_fluxes = []
+                    for img_i in range(klipped_data.shape[0]):
+                        retrieved_flux = fakes.retrieve_planet_flux(
+                            frames=klipped_data[img_i],
+                            centers=centers[img_i],
+                            astr_hdrs=dataset.output_wcs[0],
+                            sep=inj_sep,
+                            pa=inj_pa,
+                            searchrad=5,
+                            guessfwhm=retrieve_fwhm,
+                            guesspeak=inj_flux,
+                            refinefit=True,
+                        )
+                        retrieved_fluxes.append(retrieved_flux)
+                    retrieved_fluxes = np.array(
+                        retrieved_fluxes
+                    )  # Convert to numpy array
+
+                    # Flux should never be negative, if it is, assume ~=zero flux retrieved
+                    neg_mask = np.where(retrieved_fluxes < 0)
+                    retrieved_fluxes[neg_mask] = 1e-10
+
+                    # Need to save things to some arrays
+                    all_seps += [inj_sep]
+                    all_pas += [inj_pa]
+                    all_inj_fluxes += [inj_flux]
+                    all_retr_fluxes += [retrieved_fluxes]
+
+            # If a companion has been injected and retrieved at every input position then
+            # flag to exit the loop. If not increment the counter and continue.
+            if len(list_of_injected) == Nsep * Npa:
+                all_injected = True
+            else:
+                counter += 1
+
+    # Return as numpy arrays
+    all_seps = np.array(all_seps)
+    all_pas = np.array(all_pas)
+    all_inj_fluxes = np.array(all_inj_fluxes)
+    all_retr_fluxes = np.squeeze(all_retr_fluxes)
+
+    # Ensure dimensions are correct for all_retr_fluxes if # of different KL modes == 1
+    if all_retr_fluxes.ndim == 1:
+        all_retr_fluxes = all_retr_fluxes[:, np.newaxis]
+
+    return all_seps, all_pas, all_inj_fluxes, all_retr_fluxes
