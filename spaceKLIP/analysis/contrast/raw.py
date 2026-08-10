@@ -919,13 +919,13 @@ def run_raw_contrast(
             c_wavelength = database.red[key]["CWAVEL"][j]
 
             # Get stellar magnitudes and filter zero points.
-            mstar, fzero = get_stellar_magnitudes(
-                str(star_path),
-                spectral_type,
-                instrument,
-                output_dir=str(output_dir),
-                **kwargs,
-            )  # vegamag, Jy
+            # mstar, fzero = get_stellar_magnitudes(
+            #     str(star_path),
+            #     spectral_type,
+            #     instrument,
+            #     output_dir=str(output_dir),
+            #     **kwargs,
+            # )  # vegamag, Jy
 
             # Read FITS file and PSF mask.
             fitsfile = database.red[key]["FITSFILE"][j]
@@ -979,10 +979,20 @@ def run_raw_contrast(
             # one in order to obtain the theoretical peak count of the
             # star.
             filt = database.red[key]["FILTER"][j]
-            offsetpsf = get_offsetpsf(database.obs[key])
-            fstar = (
-                fzero[filt] / 10.0 ** (mstar[filt] / 2.5) / 1e6 * np.nanmax(offsetpsf)
-            )  # MJy
+            # offsetpsf = get_offsetpsf(database.obs[key])
+            # fstar = (
+            #     fzero[filt] / 10.0 ** (mstar[filt] / 2.5) / 1e6 * np.nanmax(offsetpsf)
+            # )  # MJy
+            log.info("Implementing extracted stellar flux calculation")
+            fstar = get_stellar_peak_flux(
+                starfile=star_path,
+                spectral_type=spectral_type,
+                instrument=instrument,
+                filter_name=filt,
+                observations=database.obs[key],
+                output_dir=output_dir,
+                **kwargs,
+            )
 
             # Get PSF subtraction strategy used, for use in plot labels below.
             psfsub_strategy = (
@@ -1323,6 +1333,59 @@ def run_raw_contrast(
                 klmodes=klmodes,
                 output_filetype=output_filetype,
             )
+
+
+def calculate_stellar_peak_flux(
+    stellar_magnitude: float,
+    zero_point_flux_jy: float,
+    psf_peak: float,
+) -> float:
+    """
+    Calculate the stellar peak flux used for contrast normalization.
+
+    Parameters
+    ----------
+    stellar_magnitude
+        Stellar magnitude in the relevant filter.
+
+    zero_point_flux_jy
+        Photometric zero-point flux in Jy.
+
+    psf_peak
+        Peak value of the normalized unocculted model PSF.
+
+    Returns
+    -------
+    float
+        Stellar peak flux in MJy.
+    """
+    stellar_flux_jy = zero_point_flux_jy / 10.0 ** (stellar_magnitude / 2.5)
+
+    stellar_flux_mjy = stellar_flux_jy / 1e6
+
+    return stellar_flux_mjy * psf_peak
+
+
+def get_stellar_peak_flux(
+    starfile, spectral_type, instrument, filter_name, observations, output_dir, **kwargs
+) -> float:
+    """Determine the peak stellar flux used to normalize contrast measurements"""
+
+    mstar, fzero = get_stellar_magnitudes(
+        str(starfile),
+        spectral_type,
+        instrument,
+        output_dir=str(output_dir),
+        **kwargs,
+    )
+
+    offset_psf = get_offsetpsf(obs=observations)
+
+    return calculate_stellar_peak_flux(
+        stellar_magnitude=mstar[filter_name],
+        zero_point_flux_jy=fzero[filter_name],
+        psf_peak=np.nanmax(offset_psf),
+    )
 
 
 def write_contrast_results(
