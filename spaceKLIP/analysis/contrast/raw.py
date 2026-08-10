@@ -12,6 +12,9 @@ from typing import List, Optional, Tuple
 
 import astropy.units as u
 import numpy as np
+
+# -----
+from astropy.io import fits
 from astropy.table import Table
 from numpy.typing import NDArray
 from pyklip import klip
@@ -806,6 +809,42 @@ def calculate_spatial_resolution_pix(
     return float(spatial_resolution_pix)
 
 
+# -----
+# Data Loading
+
+
+@dataclass
+class ReducedData:
+    data: NDArray
+    primary_header: fits.Header
+    science_header: fits.Header
+    is_2d: bool
+    transmission_mask: NDArray | None
+
+
+def load_reduced_data(fitsfile: str | Path, maskfile: str | Path) -> ReducedData:
+    fitsfile = Path(fitsfile)
+
+    data, primary_header, science_header, is_2d = ut.read_red(str(fitsfile))
+
+    transmission_mask = None
+
+    if maskfile is not None:
+        maskfile = Path(maskfile)
+        transmission_mask = ut.read_msk(str(maskfile))
+
+    if transmission_mask is None:
+        log.warning(f"No coronagraph transmission mask was loaded for {fitsfile.name}")
+
+    return ReducedData(
+        data=data,
+        primary_header=primary_header,
+        science_header=science_header,
+        is_2d=is_2d,
+        transmission_mask=transmission_mask,
+    )
+
+
 # =============================================================================
 # MAIN
 # =============================================================================
@@ -827,6 +866,85 @@ def validate_companions(companions):
         raise ValueError("Each companion must contain exactly 3 elements")
 
     return companions
+
+
+def create_output_directory(
+    base_directory: str | Path,
+    subdirectory: str | Path | None = None,
+) -> Path:
+    """
+    Create and return an output directory.
+
+    Parameters
+    ----------
+    base_directory
+        Base output directory.
+
+    subdirectory
+        Optional directory beneath ``base_directory``.
+
+    Returns
+    -------
+    pathlib.Path
+        Created output directory.
+    """
+    output_directory = Path(base_directory)
+
+    if subdirectory is not None:
+        output_directory /= subdirectory
+
+    output_directory.mkdir(parents=True, exist_ok=True)
+
+    return output_directory
+
+
+def stage_stellar_calibration_file(
+    starfile: str | Path,
+    output_directory: str | Path,
+    spectral_type: str,
+) -> Path:
+    """
+    Stage the stellar calibration input used for raw-contrast analysis.
+
+    Parameters
+    ----------
+    starfile
+        Stellar photometry or spectrum file.
+
+    output_directory
+        Raw-contrast output directory.
+
+    spectral_type
+        Stellar spectral type used when interpreting VOTable photometry.
+
+    Returns
+    -------
+    pathlib.Path
+        Path of the staged stellar calibration file.
+    """
+    starfile = Path(starfile)
+    output_directory = Path(output_directory)
+
+    staged_starfile = output_directory / starfile.name
+
+    if starfile.suffix.lower() == ".vot":
+        spectral_type_label = f"Spectral Type: {spectral_type}"
+    else:
+        spectral_type_label = "Spectral Type: N/A"
+
+    calibration_info = f"#{starfile.name} /// {spectral_type_label}\n"
+
+    info_file = output_directory / "contrast_curve_info.txt"
+
+    info_file.write_text(calibration_info, encoding="utf-8")
+
+    log.info("Copying starfile %s to %s", starfile, staged_starfile)
+
+    write_starfile(str(starfile), str(staged_starfile))
+
+    log.info("Syncing starfile assets: %s to %s", str(starfile), str(staged_starfile))
+
+    return staged_starfile
 
 
 def run_raw_contrast(
@@ -881,25 +999,29 @@ def run_raw_contrast(
     companions = validate_companions(companions)
 
     # Set output directory.
-    star_path = Path(starfile)
-    output_dir = Path(database.output_dir) / subdir
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = create_output_directory(database.output_dir, subdir)
+    # output_dir = Path(database.output_dir) / subdir
+    # output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Build clean serialization files cleanly using standard pathlib
-    new_starfile_path = output_dir / star_path.name
-    spectype_str = (
-        f"Spectral Type: {spectral_type}"
-        if star_path.suffix == ".vot"
-        else "Spectral Type: N/A"
+    # star_path = Path(starfile)
+    # # Build clean serialization files cleanly using standard pathlib
+    # new_starfile_path = output_dir / star_path.name
+    # spectype_str = (
+    #     f"Spectral Type: {spectral_type}"
+    #     if star_path.suffix == ".vot"
+    #     else "Spectral Type: N/A"
+    # )
+
+    # contrast_curve_info_path = output_dir / "contrast_curve_info.txt"
+    # contrast_curve_info_path.write_text(
+    #     f"#{star_path.name} /// {spectype_str}\n", encoding="utf-8"
+    # )
+
+    # write_starfile(str(star_path), str(new_starfile_path))
+
+    star_path = stage_stellar_calibration_file(
+        starfile, output_directory=output_dir, spectral_type=spectral_type
     )
-
-    contrast_curve_info_path = output_dir / "contrast_curve_info.txt"
-    contrast_curve_info_path.write_text(
-        f"#{star_path.name} /// {spectype_str}\n", encoding="utf-8"
-    )
-
-    log.info("Syncing starfile assets: %s to %s", star_path, new_starfile_path)
-    write_starfile(str(star_path), str(new_starfile_path))
 
     # Loop through concatenations.
     for i, key in enumerate(database.red.keys()):
@@ -928,14 +1050,26 @@ def run_raw_contrast(
             # )  # vegamag, Jy
 
             # Read FITS file and PSF mask.
+            # fitsfile = database.red[key]["FITSFILE"][j]
+            # data, head_pri, head_sci, is2d = ut.read_red(fitsfile)
+            # maskfile = database.red[key]["MASKFILE"][j]
+            # mask = ut.read_msk(maskfile)
+            # if mask is None:
+            #     log.warning(
+            #         "No mask file provided; MASKFILE is None. This may cause problems!!"
+            #     )
+
             fitsfile = database.red[key]["FITSFILE"][j]
-            data, head_pri, head_sci, is2d = ut.read_red(fitsfile)
+
             maskfile = database.red[key]["MASKFILE"][j]
-            mask = ut.read_msk(maskfile)
-            if mask is None:
-                log.warning(
-                    "No mask file provided; MASKFILE is None. This may cause problems!!"
-                )
+
+            reduced_data = load_reduced_data(fitsfile, maskfile=maskfile)
+
+            data = reduced_data.data
+            head_pri = reduced_data.primary_header
+            head_sci = reduced_data.science_header
+            is2d = reduced_data.is_2d
+            mask = reduced_data.transmission_mask
 
             # Compute the pixel area in steradian.
             # 1. Resolve pixel scaling and solid angles uniformly
@@ -992,13 +1126,6 @@ def run_raw_contrast(
                 observations=database.obs[key],
                 output_dir=output_dir,
                 **kwargs,
-            )
-
-            # Get PSF subtraction strategy used, for use in plot labels below.
-            psfsub_strategy = (
-                f"{head_pri['MODE']} with {head_pri['ANNULI']} annuli."
-                if head_pri["ANNULI"] > 1
-                else head_pri["MODE"]
             )
 
             # Set the inner and outer working angle and compute the
@@ -1141,6 +1268,12 @@ def run_raw_contrast(
             #     # plot_style=plot_style,
             # )
 
+            # Get PSF subtraction strategy used, for use in plot labels below.
+            psfsub_strategy = (
+                f"{head_pri['MODE']} with {head_pri['ANNULI']} annuli."
+                if head_pri["ANNULI"] > 1
+                else head_pri["MODE"]
+            )
             plot_masked_data(
                 data=data,
                 center=center,
@@ -1335,6 +1468,14 @@ def run_raw_contrast(
                 klmodes=klmodes,
                 output_filetype=output_filetype,
             )
+
+
+def get_psf_strategy(primary_header) -> str:
+    return (
+        f"{primary_header['MODE']} with {primary_header['ANNULI']} annuli."
+        if primary_header["ANNULI"] > 1
+        else primary_header["MODE"]
+    )
 
 
 def get_image_center(primary_header, overwrite_crpix=None) -> tuple[float, float]:
