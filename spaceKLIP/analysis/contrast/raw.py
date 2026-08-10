@@ -815,6 +815,8 @@ def calculate_spatial_resolution_pix(
 
 @dataclass
 class ReducedData:
+    """Reduced SpaceKLIP image product and associated metadata."""
+
     data: NDArray
     primary_header: fits.Header
     science_header: fits.Header
@@ -823,6 +825,23 @@ class ReducedData:
 
 
 def load_reduced_data(fitsfile: str | Path, maskfile: str | Path) -> ReducedData:
+    """
+    Load a reduced SpaceKLIP product and optional transmission mask.
+
+    Parameters
+    ----------
+    fitsfile
+        Reduced FITS product.
+
+    maskfile
+        Optional coronagraph transmission-mask file.
+
+    Returns
+    -------
+    ReducedData
+        Loaded image data, FITS headers, dimensionality flag, and
+        optional coronagraph transmission mask.
+    """
     fitsfile = Path(fitsfile)
 
     data, primary_header, science_header, is_2d = ut.read_red(str(fitsfile))
@@ -1000,24 +1019,6 @@ def run_raw_contrast(
 
     # Set output directory.
     output_dir = create_output_directory(database.output_dir, subdir)
-    # output_dir = Path(database.output_dir) / subdir
-    # output_dir.mkdir(parents=True, exist_ok=True)
-
-    # star_path = Path(starfile)
-    # # Build clean serialization files cleanly using standard pathlib
-    # new_starfile_path = output_dir / star_path.name
-    # spectype_str = (
-    #     f"Spectral Type: {spectral_type}"
-    #     if star_path.suffix == ".vot"
-    #     else "Spectral Type: N/A"
-    # )
-
-    # contrast_curve_info_path = output_dir / "contrast_curve_info.txt"
-    # contrast_curve_info_path.write_text(
-    #     f"#{star_path.name} /// {spectype_str}\n", encoding="utf-8"
-    # )
-
-    # write_starfile(str(star_path), str(new_starfile_path))
 
     star_path = stage_stellar_calibration_file(
         starfile, output_directory=output_dir, spectral_type=spectral_type
@@ -1026,10 +1027,8 @@ def run_raw_contrast(
     # Loop through concatenations.
     for i, key in enumerate(database.red.keys()):
         log.info("--> Concatenation " + key)
-
         # Loop through FITS files.
-        nfitsfiles = len(database.red[key])
-        for j in range(nfitsfiles):
+        for j in range(len(database.red[key])):
             log.info("Analyzing file " + database.red[key]["FITSFILE"][j])
 
             # Fetch data
@@ -1039,25 +1038,6 @@ def run_raw_contrast(
             exp_type = database.red[key]["EXP_TYPE"][j]
             pixscale = database.red[key]["PIXSCALE"][j]
             c_wavelength = database.red[key]["CWAVEL"][j]
-
-            # Get stellar magnitudes and filter zero points.
-            # mstar, fzero = get_stellar_magnitudes(
-            #     str(star_path),
-            #     spectral_type,
-            #     instrument,
-            #     output_dir=str(output_dir),
-            #     **kwargs,
-            # )  # vegamag, Jy
-
-            # Read FITS file and PSF mask.
-            # fitsfile = database.red[key]["FITSFILE"][j]
-            # data, head_pri, head_sci, is2d = ut.read_red(fitsfile)
-            # maskfile = database.red[key]["MASKFILE"][j]
-            # mask = ut.read_msk(maskfile)
-            # if mask is None:
-            #     log.warning(
-            #         "No mask file provided; MASKFILE is None. This may cause problems!!"
-            #     )
 
             fitsfile = database.red[key]["FITSFILE"][j]
 
@@ -1078,6 +1058,7 @@ def run_raw_contrast(
 
             # Establish a consistent, standardized tracking variable
             pxar_telemetry = database.red[key]["PIXAR_SR"][j]
+
             pixel_area_sr = (
                 pxar_telemetry
                 if not np.isnan(pxar_telemetry)
@@ -1112,12 +1093,8 @@ def run_raw_contrast(
             # unocculted model PSF whose integrated flux is normalized to
             # one in order to obtain the theoretical peak count of the
             # star.
-            filt = database.red[key]["FILTER"][j]
-            # offsetpsf = get_offsetpsf(database.obs[key])
-            # fstar = (
-            #     fzero[filt] / 10.0 ** (mstar[filt] / 2.5) / 1e6 * np.nanmax(offsetpsf)
-            # )  # MJy
             log.info("Implementing extracted stellar flux calculation")
+            filt = database.red[key]["FILTER"][j]
             fstar = get_stellar_peak_flux(
                 starfile=star_path,
                 spectral_type=spectral_type,
@@ -1140,7 +1117,7 @@ def run_raw_contrast(
             blur_fwhm = database.obs[key]["BLURFWHM"][j]
 
             # 3. Call the standardized resolution tracking function
-            spatial_resolution_pix = calculate_spatial_resolution_pix(
+            resolution = calculate_spatial_resolution_pix(
                 wavelength_um=cwave_um,
                 pixel_scale_rad=pxsc_rad,  # Directly matching your linear baseline scale variable
                 telescope_name=telescop,
@@ -1148,32 +1125,18 @@ def run_raw_contrast(
                 blur_fwhm_pix=blur_fwhm,
             )
 
-            print(
-                f"Standardized Resolution tracking element: {spatial_resolution_pix:.4f} pixels"
-            )
+            print(f"Standardized Resolution tracking element: {resolution:.4f} pixels")
 
             # keep original config
-            resolution = spatial_resolution_pix
+            # resolution = resolution
 
             # Get the star position.
-            # if overwrite_crpix is None:
-            #     center = (
-            #         head_pri["CRPIX1"] - 1.0,
-            #         head_pri["CRPIX2"] - 1.0,
-            #     )  # pix (0-indexed)
-            # else:
-            #     center = (
-            #         overwrite_crpix[0] - 1.0,
-            #         overwrite_crpix[1] - 1.0,
-            #     )  # pix (0-indexed)
-
             center = get_image_center(head_pri, overwrite_crpix=overwrite_crpix)
 
             # Mask coronagraph spiders, 4QPM edges, etc.
-            debug_bar_mask = True
-            print(center)
-            print(" --------- I am here -------")
-            print("Before mask data shape:", data.shape)
+            # print(center)
+            # print(" --------- I am here -------")
+            # print("Before mask data shape:", data.shape)
             data = apply_instrument_mask(
                 data,
                 center=center,
@@ -1220,19 +1183,13 @@ def run_raw_contrast(
                 coronagraph_transmission_mask=mask,
             )
 
-            # (
-            #     radial_separations_pix,
-            #     raw_contrast_curves,
-            #     throughput_corrected_array,
-            # ) = contrast_results
+            # NOTES: The raw contrast calculation like should be migrated to a table
+            # or dataclass result structure rather than floating variables, its a result.
+            # can keep things more orgnanized.
 
             radial_separations_pix = contrast_results.separations_pix
             raw_contrast_curves = contrast_results.raw_contrast
             throughput_corrected_array = contrast_results.throughput_corrected_contrast
-
-            # NOTES: The raw contrast calculation like should be migrated to a table
-            # or dataclass result structure rather than floating variables, its a result.
-            # can keep things more orgnanized.
 
             # assuming pixel scale is the same between all data.
             radial_separations_pix *= database.red[key]["PIXSCALE"][0]
@@ -1255,19 +1212,6 @@ def run_raw_contrast(
             klmodes = database.red[key]["KLMODES"][j].split(",")
             fitsfile = os.path.join(output_dir, os.path.basename(fitsfile))
 
-            # plot_masked_data(
-            #     data=data,
-            #     center=center,
-            #     pixel_scale=pxsc_arcsec,
-            #     klmodes=klmodes,
-            #     filter_name=filt,
-            #     psfsub_strategy=psfsub_strategy,
-            #     fitsfile=fitsfile,
-            #     bunit=database.red[key]["BUNIT"][j],
-            #     save_figure=save_figures,
-            #     # plot_style=plot_style,
-            # )
-
             # Get PSF subtraction strategy used, for use in plot labels below.
             psfsub_strategy = (
                 f"{head_pri['MODE']} with {head_pri['ANNULI']} annuli."
@@ -1285,23 +1229,6 @@ def run_raw_contrast(
                 bunit=database.red[key]["BUNIT"][j],
             )
 
-            # fig, ax, artists = plot_masked_data(
-            #     data=data,
-            #     center=center,
-            #     pixel_scale=pxsc_arcsec,
-            #     klmodes=klmodes,
-            #     filter_name=filt,
-            #     psfsub_strategy=psfsub_strategy,
-            #     fitsfile=fitsfile,
-            #     bunit=database.red[key]["BUNIT"][j],
-            #     figure_mode="diagnostic",
-            #     scale="symlog",
-            #     percentile=99.8,
-            #     show_filename=True,
-            #     save_figure=True,
-            #     output_formats=("pdf",),
-            # )
-
             plot_raw_contrast(
                 separations=seps,
                 contrasts=cons,
@@ -1316,150 +1243,6 @@ def run_raw_contrast(
                 plot_style=plot_style,
             )
 
-            # klmodes = database.red[key]["KLMODES"][j].split(",")
-            # fitsfile = os.path.join(output_dir, os.path.split(fitsfile)[1])
-
-            # load_plt_style(plot_style)
-            # fig = plt.figure(figsize=(6.4, 4.8))
-            # ax = plt.gca()
-            # xx = np.arange(data.shape[2]) - center[0]  # pix
-            # yy = np.arange(data.shape[1]) - center[1]  # pix
-            # extent = (
-            #     -(xx[0] - 0.5) * pxsc_arcsec,
-            #     -(xx[-1] + 0.5) * pxsc_arcsec,
-            #     (yy[0] - 0.5) * pxsc_arcsec,
-            #     (yy[-1] + 0.5) * pxsc_arcsec,
-            # )
-            # vmax = np.nanmax(data[-1])
-            # ax.imshow(
-            #     data[-1],
-            #     origin="lower",
-            #     cmap="inferno",
-            #     norm=matplotlib.colors.SymLogNorm(
-            #         vmin=-vmax, vmax=vmax, linthresh=vmax / 100
-            #     ),
-            #     extent=extent,
-            # )
-            # ax.set_xlabel(r"$\Delta$RA [arcsec]")
-            # ax.set_ylabel(r"$\Delta$Dec [arcsec]")
-            # ax.set_title(f"Masked data in {filt}, {psfsub_strategy} ({klmodes[-1]} KL)")
-            # for r in [5, 10]:
-            #     ax.add_patch(
-            #         matplotlib.patches.Circle(
-            #             (0, 0),
-            #             r,
-            #             ls="--",
-            #             facecolor="none",
-            #             edgecolor="cyan",
-            #             clip_on=True,
-            #         )
-            #     )
-            #     ax.text(r, 0, f" {r}''", color="cyan")
-            # import textwrap
-
-            # ax.text(
-            #     0.01,
-            #     0.99,
-            #     textwrap.fill(os.path.basename(fitsfile), width=40),
-            #     transform=ax.transAxes,
-            #     color="black",
-            #     verticalalignment="top",
-            #     fontsize=9,
-            # )
-            # # plt.colorbar(
-            # #     mappable=ax.images[0], label=database.red[key]["BUNIT"][j]
-            # # )
-            # plt.tight_layout()
-            # if save_figures:
-            #     output_file = fitsfile[:-5] + "_masked.pdf"
-            #     plt.savefig(output_file)
-            #     log.info(f" Plot saved in {output_file}")
-            # plt.show()
-            # plt.close(fig)
-
-            # # PLOTTING THE Raw Contrast Curves
-
-            # # Plot raw contrast.
-            # klmodes = database.red[key]["KLMODES"][j].split(",")
-            # fitsfile = os.path.join(output_dir, os.path.split(fitsfile)[1])
-            # colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
-            # mod = len(colors)
-            # load_plt_style(plot_style)
-            # fig = plt.figure(figsize=(6.4, 4.8))
-            # ax = plt.gca()
-            # for k in range(data.shape[0]):
-            #     if mask is None:
-            #         ax.plot(
-            #             seps[k],
-            #             cons[k],
-            #             color=colors[k % mod],
-            #             label=klmodes[k] + " KL",
-            #         )
-            #     else:
-            #         ax.plot(seps[k], cons[k], color=colors[k % mod], alpha=0.3, ls="--")
-            #         ax.plot(
-            #             seps[k],
-            #             cons_mask[k],
-            #             color=colors[k % mod],
-            #             label=klmodes[k] + " KL",
-            #         )
-            # ax.set_yscale("log")
-            # ax.set_ylim([None, 1])
-            # if plot_xlim is not None:
-            #     ax.set_xlim(plot_xlim)
-            # ax.set_xlabel("Separation [arcsec]")
-            # ax.set_ylabel(r"5-$\sigma$ contrast")
-            # ax.legend(
-            #     loc="upper right",
-            #     ncols=3,
-            #     title=None
-            #     if mask is None
-            #     else "Dashed lines exclude coronagraph mask throughput",
-            #     title_fontsize=10,
-            # )
-            # ax.set_title(f"Raw contrast in {filt}, {psfsub_strategy}")
-            # plt.tight_layout()
-            # if save_figures:
-            #     output_file = fitsfile[:-5] + "_rawcon.pdf"
-            #     plt.savefig(output_file)
-            #     log.info(f" Plot saved in {output_file}")
-            # plt.show()
-            # plt.close(fig)
-
-            # Exporting Data
-            # if output_filetype.lower() == "ecsv":
-            #     # Save outputs as astropy ECSV text tables
-            #     columns = [seps[0]]
-            #     names = ["separation"]
-            #     for i, klmode in enumerate(klmodes):
-            #         columns.append(cons[i])
-            #         names.append(f"contrast, N_kl={klmode}")
-            #         if mask is not None:
-            #             columns.append(cons_mask[i])
-            #             names.append(f"contrast+mask, N_kl={klmode}")
-            #     results_table = Table(columns, names=names)
-            #     results_table["separation"].unit = u.arcsec
-            #     # the following needs debugging:
-            #     # for kw in ['TELESCOP', 'INSTRUME', 'SUBARRAY', 'FILTER', 'CORONMSK', 'EXP_TYPE', 'FITSFILE']:
-            #     #    results_table.meta[kw] = database.red[key][kw][j]
-
-            #     output_fn = fitsfile[:-5] + "_contrast.ecsv"
-            #     results_table.write(output_fn, overwrite=True)
-            #     print(f"Contrast results and plots saved to {output_fn}")
-            # elif output_filetype.lower() == "npy":
-            #     # Save outputs as numpy .npy files
-            #     np.save(fitsfile[:-5] + "_seps.npy", seps)
-            #     np.save(fitsfile[:-5] + "_cons.npy", cons)
-            #     if mask is not None:
-            #         np.save(fitsfile[:-5] + "_cons_mask.npy", cons_mask)
-            #     print(
-            #         f"Contrast results and plots saved to {fitsfile[:-5] + '_seps.npy'}, {fitsfile[:-5] + '_cons.npy'}"
-            #     )
-            # else:
-            #     raise ValueError(
-            #         'File save format not supported, options are "npy" or "ecsv".'
-            #     )
-
             # Exporting Data
             write_contrast_results(
                 result=contrast_results,
@@ -1468,14 +1251,6 @@ def run_raw_contrast(
                 klmodes=klmodes,
                 output_filetype=output_filetype,
             )
-
-
-def get_psf_strategy(primary_header) -> str:
-    return (
-        f"{primary_header['MODE']} with {primary_header['ANNULI']} annuli."
-        if primary_header["ANNULI"] > 1
-        else primary_header["MODE"]
-    )
 
 
 def get_image_center(primary_header, overwrite_crpix=None) -> tuple[float, float]:
