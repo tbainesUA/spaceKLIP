@@ -74,12 +74,7 @@ def test_raw_contrast_normalizes_data_before_measuring_contrast(tmp_path, monkey
     monkeypatch.setattr(
         analysistools.ut,
         "read_red",
-        lambda filename: (
-            data.copy(),
-            primary_header,
-            science_header,
-            False,
-        ),
+        lambda filename: (data.copy(), primary_header, science_header, False),
     )
 
     # No coronagraph throughput correction for this test.
@@ -107,25 +102,12 @@ def test_raw_contrast_normalizes_data_before_measuring_contrast(tmp_path, monkey
     )
 
     # Integrated PSF is irrelevant here. raw_contrast() only uses max().
-    offset_psf = np.array(
-        [
-            [0.1, 0.2],
-            [0.3, 0.5],
-        ]
-    )
+    offset_psf = np.array([[0.1, 0.2], [0.3, 0.5]])
 
-    monkeypatch.setattr(
-        analysistools,
-        "get_offsetpsf",
-        lambda obs: offset_psf,
-    )
+    monkeypatch.setattr(analysistools, "get_offsetpsf", lambda obs: offset_psf)
 
     # Avoid testing file-copy behavior in this test.
-    monkeypatch.setattr(
-        analysistools,
-        "write_starfile",
-        lambda *args, **kwargs: None,
-    )
+    monkeypatch.setattr(analysistools, "write_starfile", lambda *args, **kwargs: None)
 
     # Record exactly what raw_contrast() gives to pyKLIP.
     calls = []
