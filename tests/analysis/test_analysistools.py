@@ -130,14 +130,7 @@ def test_raw_contrast_normalizes_data_before_measuring_contrast(tmp_path, monkey
     # Record exactly what raw_contrast() gives to pyKLIP.
     calls = []
 
-    def fake_meas_contrast(
-        dat,
-        iwa,
-        owa,
-        resolution,
-        center,
-        low_pass_filter,
-    ):
+    def fake_meas_contrast(dat, iwa, owa, resolution, center, low_pass_filter):
         calls.append(
             {
                 "dat": dat.copy(),
@@ -155,24 +148,12 @@ def test_raw_contrast_normalizes_data_before_measuring_contrast(tmp_path, monkey
 
         return sep, contrast
 
-    monkeypatch.setattr(
-        analysistools.klip,
-        "meas_contrast",
-        fake_meas_contrast,
-    )
+    monkeypatch.setattr(analysistools.klip, "meas_contrast", fake_meas_contrast)
 
     # Plotting is not part of this characterization test.
-    monkeypatch.setattr(
-        analysistools,
-        "load_plt_style",
-        lambda *args, **kwargs: None,
-    )
+    monkeypatch.setattr(analysistools, "load_plt_style", lambda *args, **kwargs: None)
 
-    monkeypatch.setattr(
-        analysistools.plt,
-        "show",
-        lambda: None,
-    )
+    monkeypatch.setattr(analysistools.plt, "show", lambda: None)
 
     # Avoid touching disk for the .npy outputs while allowing the method
     # to complete normally.
@@ -181,20 +162,14 @@ def test_raw_contrast_normalizes_data_before_measuring_contrast(tmp_path, monkey
     def fake_save(filename, array):
         saved_arrays[str(filename)] = np.asarray(array).copy()
 
-    monkeypatch.setattr(
-        analysistools.np,
-        "save",
-        fake_save,
-    )
+    monkeypatch.setattr(analysistools.np, "save", fake_save)
 
     # ------------------------------------------------------------------
     # Act
     # ------------------------------------------------------------------
 
     tools.raw_contrast(
-        starfile="fake_star.txt",
-        output_filetype="npy",
-        save_figures=False,
+        starfile="fake_star.txt", output_filetype="npy", save_figures=False
     )
 
     # ------------------------------------------------------------------
