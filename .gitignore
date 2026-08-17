@@ -254,3 +254,7 @@ code_tmp/
 misc_calspec
 spaceKLIP/io.py
 
+
+
+# Code is making what looks like copies of crds folders??
+!/.gitignore 

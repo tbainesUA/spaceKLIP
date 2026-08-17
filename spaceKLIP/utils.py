@@ -1,35 +1,33 @@
 from __future__ import division
 
+import io
+import logging
+
 # =============================================================================
 # IMPORTS
 # =============================================================================
-
 # general imports
 import os
-import io
-import stpipe
-import importlib
-import logging
+
+import astropy.io.fits as pyfits
 import numpy as np
 
 # astropy imports
 import pysiaf
-import astropy.io.fits as pyfits
-from astroquery.svo_fps import SvoFps
 
 # scipy imports
 import scipy.ndimage.interpolation as sinterp
-from scipy.integrate import simpson
+import stpipe
+import stpsf as webbpsf
+from astroquery.svo_fps import SvoFps
 from scipy.ndimage import fourier_shift, gaussian_filter
 from scipy.ndimage import shift as spline_shift
+from stdatamodels.jwst.datamodels.dqflags import dqflags_to_mnemonics, pixel
 
 # webbpsf_ext imports
 from webbpsf_ext import robust
-from webbpsf_ext.bandpasses import nircam_filter, nircam_com_th
-from webbpsf_ext.maths import jl_poly_fit, jl_poly
-
-from stdatamodels.jwst.datamodels.dqflags import pixel, dqflags_to_mnemonics
-import stpsf as webbpsf
+from webbpsf_ext.bandpasses import nircam_com_th, nircam_filter
+from webbpsf_ext.maths import jl_poly, jl_poly_fit
 
 # Set up log.
 log = logging.getLogger(__name__)
