@@ -233,3 +233,7 @@ spaceKLIP/_version.py
 /spaceKLIP/resources/PCEs/figures/
 /spaceKLIP/resources/PCEs/nircam_throughputs/
 /spaceKLIP/resources/PCEs/pce_correction_factors.pkl
+
+
+# Code is making what looks like copies of crds folders??
+!/.gitignore 
