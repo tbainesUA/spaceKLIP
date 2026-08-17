@@ -4,10 +4,18 @@
 # TEST 3: Does raw_contrast() mask known companions from the science data before passing it to pyKLIP for contrast
 #         measurement?
 
+
+# New unit test
+# lower-level computation
+# → did compute_contrast_curves package pyKLIP's outputs correctly
+#    into ContrastResult?
+
 import numpy as np
 import pytest
 from astropy.table import Table
 
+import spaceKLIP.analysis.contrast.plotting as plotting
+import spaceKLIP.analysis.contrast.raw as raw
 import spaceKLIP.analysistools as analysistools
 
 
@@ -49,18 +57,14 @@ class FakeDatabase:
         }
 
 
-def test_raw_contrast_normalizes_data_before_measuring_contrast(tmp_path, monkeypatch):
+def test_raw_contrast_normalizes_data_before_measuring_contrast(
+    tmp_path,
+    monkeypatch,
+):
     """
-    Characterize the numerical normalization performed by raw_contrast().
-
-    The image passed to klip.meas_contrast() should be
-
-        data * pixel_area_sr / stellar_flux_peak
-
-    where
-
-        stellar_flux_peak =
-            fzero / 10**(mstar / 2.5) / 1e6 * max(offset_psf).
+    Given known inputs, raw_contrast() should construct the expected
+    normalized science image and measurement parameters before calling
+    pyKLIP.
     """
 
     # ------------------------------------------------------------------
@@ -70,34 +74,25 @@ def test_raw_contrast_normalizes_data_before_measuring_contrast(tmp_path, monkey
     database = FakeDatabase(tmp_path)
     tools = analysistools.AnalysisTools(database)
 
-    # One KL mode and a deliberately small image.
     data = np.full((1, 6, 6), 10.0)
 
     primary_header = {"CRPIX1": 3.0, "CRPIX2": 4.0, "MODE": "ADI", "ANNULI": 1}
 
     science_header = {}
 
+    # Patch these at their NEW lookup locations.
     monkeypatch.setattr(
-        analysistools.ut,
+        raw.ut,
         "read_red",
         lambda filename: (data.copy(), primary_header, science_header, False),
     )
 
-    # No coronagraph throughput correction for this test.
-    monkeypatch.setattr(analysistools.ut, "read_msk", lambda filename: None)
+    monkeypatch.setattr(raw.ut, "read_msk", lambda filename: None)
 
-    # This result is currently unused by raw_contrast(), but the function
-    # is still called and therefore must be stubbed.
-    monkeypatch.setattr(
-        analysistools.ut, "get_tp_comsubst", lambda *args, **kwargs: None
-    )
+    monkeypatch.setattr(raw.ut, "get_tp_comsubst", lambda *args, **kwargs: None)
 
-    # Choose values that make the expected stellar normalization obvious.
-    #
-    # mstar = 0 mag
-    # fzero = 100 Jy
     monkeypatch.setattr(
-        analysistools,
+        raw,
         "get_stellar_magnitudes",
         lambda *args, **kwargs: (
             {"F444W": 0.0},
@@ -107,21 +102,19 @@ def test_raw_contrast_normalizes_data_before_measuring_contrast(tmp_path, monkey
         ),
     )
 
-    # Integrated PSF is irrelevant here. raw_contrast() only uses max().
     offset_psf = np.array([[0.1, 0.2], [0.3, 0.5]])
 
-    monkeypatch.setattr(analysistools, "get_offsetpsf", lambda obs: offset_psf)
+    monkeypatch.setattr(raw, "get_offsetpsf", lambda obs: offset_psf)
 
-    # Avoid testing file-copy behavior in this test.
-    monkeypatch.setattr(analysistools, "write_starfile", lambda *args, **kwargs: None)
+    monkeypatch.setattr(raw, "write_starfile", lambda *args, **kwargs: None)
 
-    # Record exactly what raw_contrast() gives to pyKLIP.
+    # Record the inputs passed to pyKLIP.
     calls = []
 
     def fake_meas_contrast(dat, iwa, owa, resolution, center, low_pass_filter):
         calls.append(
             {
-                "dat": dat.copy(),
+                "dat": np.asarray(dat).copy(),
                 "iwa": iwa,
                 "owa": owa,
                 "resolution": resolution,
@@ -130,27 +123,21 @@ def test_raw_contrast_normalizes_data_before_measuring_contrast(tmp_path, monkey
             }
         )
 
-        # Return deterministic fake pyKLIP results.
-        sep = np.array([1.0, 2.0])
-        contrast = np.array([1e-4, 2e-4])
+        return (
+            np.array([1.0, 2.0]),
+            np.array([1e-4, 2e-4]),
+        )
 
-        return sep, contrast
+    monkeypatch.setattr(raw.klip, "meas_contrast", fake_meas_contrast)
 
-    monkeypatch.setattr(analysistools.klip, "meas_contrast", fake_meas_contrast)
+    # Patch whatever output writer/orchestrator is called downstream,
+    # only so the workflow can finish.
+    monkeypatch.setattr(raw, "write_contrast_results", lambda *args, **kwargs: None)
 
-    # Plotting is not part of this characterization test.
-    monkeypatch.setattr(analysistools, "load_plt_style", lambda *args, **kwargs: None)
+    # PLotting
+    # monkeypatch.setattr(plotting, "plot_masked_data", lambda *args, **kwargs: None)
 
-    monkeypatch.setattr(analysistools.plt, "show", lambda: None)
-
-    # Avoid touching disk for the .npy outputs while allowing the method
-    # to complete normally.
-    saved_arrays = {}
-
-    def fake_save(filename, array):
-        saved_arrays[str(filename)] = np.asarray(array).copy()
-
-    monkeypatch.setattr(analysistools.np, "save", fake_save)
+    monkeypatch.setattr(plotting.plt, "show", lambda: None)
 
     # ------------------------------------------------------------------
     # Act
@@ -168,58 +155,106 @@ def test_raw_contrast_normalizes_data_before_measuring_contrast(tmp_path, monkey
 
     call = calls[0]
 
-    # Stellar peak normalization:
-    #
-    # fstar = 100 Jy / 10**(0 / 2.5) / 1e6 * 0.5
-    #       = 5e-5 MJy
     expected_fstar = 100.0 / 1e6 * 0.5
 
-    # raw_contrast passes:
-    #
-    # data * PIXAR_SR / fstar
     expected_normalized_data = (
         data[0] * database.red["concat1"]["PIXAR_SR"][0] / expected_fstar
     )
 
     np.testing.assert_allclose(call["dat"], expected_normalized_data)
 
-    # Hard-coded current behavior.
     assert call["iwa"] == 1
-
-    # data.shape[1] // 2 = 6 // 2 = 3
     assert call["owa"] == 3
 
-    # FITS CRPIX coordinates are converted from 1-indexed to 0-indexed.
+    # FITS coordinates -> Python 0-indexed coordinates.
     assert call["center"] == (2.0, 3.0)
 
     assert call["low_pass_filter"] is False
 
-    # Current JWST non-NRC_CORON path uses the circumscibed diameter.
     pxscale_arcsec = database.red["concat1"]["PIXSCALE"][0]
+
     pxscale_rad = pxscale_arcsec / 3600.0 / 180.0 * np.pi
 
     expected_resolution = (
         1e-6
         * database.red["concat1"]["CWAVEL"][0]
-        / analysistools.JWST_CIRCUMSCRIBED_DIAMETER
+        / raw.JWST_CIRCUMSCRIBED_DIAMETER
         / pxscale_rad
     )
 
     assert call["resolution"] == pytest.approx(expected_resolution)
 
-    # pyKLIP returns separations in pixels. raw_contrast() should save them
-    # in arcseconds by multiplying by PIXSCALE.
-    expected_separation_arcsec = (
-        np.array([1.0, 2.0]) * database.red["concat1"]["PIXSCALE"][0]
+
+# def test_compute_contrast_curves_returns_contrast_result():
+#     result = compute_contrast_curves(...)
+
+#     assert isinstance(result, ContrastResult)
+
+#     np.testing.assert_allclose(
+#         result.separations_pix,
+#         expected_separations,
+#     )
+
+#     np.testing.assert_allclose(
+#         result.raw_contrast,
+#         expected_contrast,
+#     )
+
+#     assert result.throughput_corrected_contrast is None
+
+
+def test_compute_contrast_curves_returns_expected_result(monkeypatch):
+    """
+    The extracted contrast computation should return a ContrastResult
+    containing the separations and raw contrast returned by pyKLIP.
+    """
+
+    data = np.full((1, 6, 6), 10.0)
+
+    expected_sep = np.array([1.0, 2.0])
+    expected_contrast = np.array([1e-4, 2e-4])
+
+    def fake_meas_contrast(
+        dat,
+        iwa,
+        owa,
+        resolution,
+        center,
+        low_pass_filter,
+    ):
+        return expected_sep, expected_contrast
+
+    monkeypatch.setattr(
+        raw.klip,
+        "meas_contrast",
+        fake_meas_contrast,
     )
 
-    seps_output = next(
-        value
-        for filename, value in saved_arrays.items()
-        if filename.endswith("_seps.npy")
+    result = raw.compute_contrast_curves(
+        data_cube=data,
+        pixel_area_sr=2.0,
+        stellar_flux_peak=5e-5,
+        spatial_resolution_pix=2.0,
+        center_pix=(2.0, 3.0),
+        inner_working_angle_pix=1,
+        outer_working_angle_pix=3,
+        coronagraph_transmission_mask=None,
     )
 
-    np.testing.assert_allclose(seps_output[0], expected_separation_arcsec)
+    assert isinstance(result, raw.ContrastResult)
+
+    np.testing.assert_allclose(
+        result.separations_pix,
+        expected_sep,
+    )
+
+    np.testing.assert_allclose(
+        result.raw_contrast,
+        expected_contrast[np.newaxis, :],
+    )
+
+    assert result.throughput_corrected_contrast is None
+    assert result.has_throughput_correction is False
 
 
 def test_raw_contrast_applies_coronagraph_throughput_correction(
