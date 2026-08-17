@@ -1307,7 +1307,7 @@ def get_stellar_peak_flux(
 ) -> float:
     """Determine the peak stellar flux used to normalize contrast measurements"""
 
-    mstar, fzero = get_stellar_magnitudes(
+    mstar, fzero, *_ = get_stellar_magnitudes(
         str(starfile),
         spectral_type,
         instrument,
