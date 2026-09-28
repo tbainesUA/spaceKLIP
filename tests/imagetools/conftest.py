@@ -130,8 +130,12 @@ def mock_image_io(monkeypatch, mock_observation, tmp_path):
 
         return str(tmp_path / "output_calints.fits")
 
-    def mock_write_msk(maskfile, mask, fitsfile):
-        written["mask"] = mask.copy()
+    def mock_write_msk(maskfile, mask, fitsfile, suffix=None):
+        if suffix == "_nanmask.fits":
+            written["nanmask"] = None if mask is None else mask.copy()
+            return str(tmp_path / "output_nanmask.fits")
+
+        written["mask"] = None if mask is None else mask.copy()
         return str(tmp_path / "output_mask.fits")
 
     monkeypatch.setattr("spaceKLIP.imagetools.ut.read_obs", mock_read_obs)
