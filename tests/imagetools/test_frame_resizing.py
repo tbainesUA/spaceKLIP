@@ -1,5 +1,5 @@
 """
-Characterization tests for ImageTools.crop_frames().
+Characterization tests for ImageTools.crop_frames() and pad_frames().
 
 These tests answer:
 
