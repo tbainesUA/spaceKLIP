@@ -212,7 +212,6 @@ def make_mock_observation():
 
     def _make(
         data,
-        *,
         erro=None,
         pxdq=None,
         head_pri=None,
@@ -230,10 +229,7 @@ def make_mock_observation():
             erro = np.ones_like(data)
 
         if pxdq is None:
-            pxdq = np.zeros(
-                data.shape,
-                dtype=np.uint32,
-            )
+            pxdq = np.zeros(data.shape, dtype=np.uint32)
 
         return {
             "data": data,
@@ -280,9 +276,7 @@ def image_database(tmp_path):
     class MockDatabase:
         def __init__(self):
             self.output_dir = str(tmp_path)
-            self.obs = {
-                "concat1": obs,
-            }
+            self.obs = {"concat1": obs}
 
         def update_obs(
             self,
@@ -302,6 +296,57 @@ def image_database(tmp_path):
 
                 if column in self.obs[key].colnames:
                     self.obs[key][column][index] = value
+
+    return MockDatabase()
+
+
+@pytest.fixture
+def background_database(tmp_path):
+    """
+    Minimal SCI + SCI_BG database for standard background-subtraction tests.
+    """
+
+    science_file = tmp_path / "science_calints.fits"
+    background_file = tmp_path / "science_background_calints.fits"
+    science_mask = tmp_path / "science_mask.fits"
+    background_mask = tmp_path / "background_mask.fits"
+
+    obs = Table(
+        {
+            "FITSFILE": [
+                str(science_file),
+                str(background_file),
+            ],
+            "MASKFILE": [
+                str(science_mask),
+                str(background_mask),
+            ],
+            "TYPE": [
+                "SCI",
+                "SCI_BG",
+            ],
+        }
+    )
+
+    class MockDatabase:
+        def __init__(self):
+            self.output_dir = str(tmp_path)
+            self.obs = {
+                "concat1": obs,
+            }
+
+        def update_obs(
+            self,
+            key,
+            index,
+            fitsfile,
+            maskfile=None,
+            **kwargs,
+        ):
+            self.obs[key]["FITSFILE"][index] = fitsfile
+
+            if maskfile is not None:
+                self.obs[key]["MASKFILE"][index] = maskfile
 
     return MockDatabase()
 
