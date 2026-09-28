@@ -237,3 +237,5 @@ spaceKLIP/_version.py
 
 # Code is making what looks like copies of crds folders??
 !/.gitignore 
+
+/ /
