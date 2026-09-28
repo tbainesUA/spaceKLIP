@@ -53,6 +53,7 @@ def image_database(tmp_path):
             "MASKFILE": [str(maskfile)],
             "NANMASKFILE": [str(nanmaskfile)],
             "NINTS": [4],
+            "EFFINTTM": [10.0],
             "TYPE": ["SCI"],
             "CRPIX1": [3.0],
             "CRPIX2": [3.0],
