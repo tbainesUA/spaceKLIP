@@ -7,9 +7,18 @@ These tests answer:
 2. Does asymmetric [left, right, bottom, top] cropping behave correctly?
 3. Are detector-coordinate metadata shifted consistently with the crop?
 4. Is invalid npix input rejected?
+
+
+Known behaviors / follow-up issues
+----------------------------------
+- crop_frames(npix=0) produces empty spatial dimensions because
+  Python interprets -0 as 0 in the slicing stop index.
+- Filtering out an observation with `types` may reference
+  crop_shiftx/crop_shifty before assignment.
 """
 
 import numpy as np
+import pytest
 
 from spaceKLIP.imagetools import ImageTools
 
@@ -35,26 +44,11 @@ def test_crop_frames_crops_all_spatial_arrays(
     expected_mask = mock_observation["mask"][1:-1, 1:-1]
     expected_nanmask = mock_observation["nanmask"][1:-1, 1:-1]
 
-    np.testing.assert_array_equal(
-        mock_image_io["data"],
-        expected_data,
-    )
-    np.testing.assert_array_equal(
-        mock_image_io["erro"],
-        expected_erro,
-    )
-    np.testing.assert_array_equal(
-        mock_image_io["pxdq"],
-        expected_pxdq,
-    )
-    np.testing.assert_array_equal(
-        mock_image_io["mask"],
-        expected_mask,
-    )
-    np.testing.assert_array_equal(
-        mock_image_io["nanmask"],
-        expected_nanmask,
-    )
+    np.testing.assert_array_equal(mock_image_io["data"], expected_data)
+    np.testing.assert_array_equal(mock_image_io["erro"], expected_erro)
+    np.testing.assert_array_equal(mock_image_io["pxdq"], expected_pxdq)
+    np.testing.assert_array_equal(mock_image_io["mask"], expected_mask)
+    np.testing.assert_array_equal(mock_image_io["nanmask"], expected_nanmask)
 
 
 def test_crop_frames_supports_asymmetric_cropping(
@@ -107,3 +101,17 @@ def test_crop_frames_updates_spatial_coordinates(
 
     assert head_sci["CROP_SHIFTX"] == 1
     assert head_sci["CROP_SHIFTY"] == 2
+
+
+def test_crop_frames_rejects_invalid_crop_length(
+    image_database,
+):
+    """npix sequences must specify left, right, bottom, and top."""
+
+    tools = ImageTools(image_database)
+
+    with pytest.raises(
+        UserWarning,
+        match="Parameter npix must either be an int or a list of four int",
+    ):
+        tools.crop_frames(npix=[1, 2])
