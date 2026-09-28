@@ -139,9 +139,19 @@ def mock_image_io(monkeypatch, mock_observation, tmp_path):
         written["mask"] = None if mask is None else mask.copy()
         return str(tmp_path / "output_mask.fits")
 
+    def mock_get_dqmask(pxdq, flag, return_bool=False):
+        assert flag == "DO_NOT_USE"
+
+        mask = (pxdq & 1) != 0
+
+        if return_bool:
+            return mask
+
+        return mask.astype(pxdq.dtype)
+
     monkeypatch.setattr("spaceKLIP.imagetools.ut.read_obs", mock_read_obs)
     monkeypatch.setattr("spaceKLIP.imagetools.ut.read_msk", mock_read_msk)
     monkeypatch.setattr("spaceKLIP.imagetools.ut.write_obs", mock_write_obs)
     monkeypatch.setattr("spaceKLIP.imagetools.ut.write_msk", mock_write_msk)
-
+    monkeypatch.setattr("spaceKLIP.imagetools.ut.get_dqmask", mock_get_dqmask)
     return written
