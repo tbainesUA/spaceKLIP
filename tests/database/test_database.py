@@ -8,6 +8,19 @@ from astropy.table import Table
 from spaceKLIP.database import Database
 
 
+def _copy_exposure(source_path, filename):
+    """Copy an exposure and its companion PSF mask, if present."""
+    destination = str(Path(source_path).with_name(filename))
+    shutil.copyfile(source_path, destination)
+
+    source_mask = Path(source_path.replace(".fits", "_psfmask.fits"))
+    if source_mask.exists():
+        destination_mask = destination.replace(".fits", "_psfmask.fits")
+        shutil.copyfile(source_mask, destination_mask)
+
+    return destination
+
+
 def test_read_jwst_s012_data_rejects_empty_datapaths(tmp_path):
     """Reject empty input before adding observations to the database."""
     database = Database(output_dir=tmp_path)
@@ -310,31 +323,39 @@ def test_read_jwst_s012_data_corrects_roll_angle(
     assert observations["ROLL_REF"][0] == pytest.approx(expected_roll)
 
 
-def test_read_jwst_s012_data_associates_miri_science_background(
-    tmp_path, miri_s012_file
+@pytest.mark.parametrize(
+    "fixture_name, expected_key",
+    [
+        (
+            "miri_s012_file",
+            "JWST_MIRI_MIRIMAGE_F1065C_NONE_4QPM_MASK1065",
+        ),
+        (
+            "nircam_s012_file",
+            "JWST_NIRCAM_NRCA5_F335M_MASKRND_MASK335R_SUB320",
+        ),
+    ],
+    ids=["miri", "nircam"],
+)
+def test_read_jwst_s012_data_associates_science_background(
+    request, tmp_path, fixture_name, expected_key
 ):
-    """Retain a matching MIRI background as SCI_BG.
+    """Classify a matching background as SCI_BG for either instrument.
 
     Copy a science exposure and give it a background target name.
-    Keep the instrument configuration, integration count, and
-    integration time identical to the science exposure.
-
-    Verify that both files share one concatenation and that the
-    background is classified as SCI_BG without explicit bgpaths.
+    Preserve matching instrument configuration, NINTS, and EFFINTTM.
+    Verify automatic classification without explicit bgpaths.
     """
-    science_path = miri_s012_file
-    background_path = str(Path(science_path).with_name("miri_background_rateints.fits"))
-    shutil.copyfile(science_path, background_path)
+    science_path = request.getfixturevalue(fixture_name)
+    background_path = _copy_exposure(science_path, "background_rateints.fits")
 
     with fits.open(background_path, mode="update") as hdul:
         hdul[0].header["TARGPROP"] = "BACKGROUND_TARGET"
 
     database = Database(output_dir=tmp_path)
     database.verbose = False
-
     database.read_jwst_s012_data([science_path, background_path])
 
-    expected_key = "JWST_MIRI_MIRIMAGE_F1065C_NONE_4QPM_MASK1065"
     assert list(database.obs) == [expected_key]
 
     observations = database.obs[expected_key]
@@ -351,6 +372,11 @@ def test_read_jwst_s012_data_associates_miri_science_background(
 
 
 @pytest.mark.parametrize(
+    "fixture_name",
+    ["miri_s012_file", "nircam_s012_file"],
+    ids=["miri", "nircam"],
+)
+@pytest.mark.parametrize(
     "keyword, incompatible_value",
     [
         ("NINTS", 3),
@@ -358,21 +384,17 @@ def test_read_jwst_s012_data_associates_miri_science_background(
     ],
     ids=["integration-count-mismatch", "integration-time-mismatch"],
 )
-def test_read_jwst_s012_data_rejects_unmatched_miri_background(
-    tmp_path, miri_s012_file, keyword, incompatible_value
+def test_read_jwst_s012_data_rejects_unmatched_background(
+    request, tmp_path, fixture_name, keyword, incompatible_value
 ):
-    """Reject a background incompatible with the science exposure.
+    """Reject incompatible backgrounds for either instrument.
 
-    Copy a MIRI science exposure and identify it as background.
     Change either NINTS or EFFINTTM while preserving the other.
     With no reference exposure available, verify that association
-    raises the current UserWarning exception.
+    raises UserWarning and identifies the background file.
     """
-    science_path = miri_s012_file
-    background_path = str(
-        Path(science_path).with_name("unmatched_background_rateints.fits")
-    )
-    shutil.copyfile(science_path, background_path)
+    science_path = request.getfixturevalue(fixture_name)
+    background_path = _copy_exposure(science_path, "unmatched_background_rateints.fits")
 
     with fits.open(background_path, mode="update") as hdul:
         hdul[0].header["TARGPROP"] = "BACKGROUND_TARGET"
@@ -388,3 +410,60 @@ def test_read_jwst_s012_data_rejects_unmatched_miri_background(
         database.read_jwst_s012_data([science_path, background_path])
 
     assert background_path in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    "fixture_name, expected_key",
+    [
+        (
+            "miri_s012_file",
+            "JWST_MIRI_MIRIMAGE_F1065C_NONE_4QPM_MASK1065",
+        ),
+        (
+            "nircam_s012_file",
+            "JWST_NIRCAM_NRCA5_F335M_MASKRND_MASK335R_SUB320",
+        ),
+    ],
+    ids=["miri", "nircam"],
+)
+def test_read_jwst_s012_data_reassigns_background_to_reference(
+    request, tmp_path, fixture_name, expected_key
+):
+    """Reassign SCI_BG to REF_BG when exposure settings match REF.
+
+    Give the reference and background EFFINTTM=20 seconds while
+    the science retains 10 seconds. Keep background IS_PSF=False.
+    Use distinct target names so exposure matching determines
+    reassignment rather than target-name reassociation.
+    """
+    science_path = request.getfixturevalue(fixture_name)
+    reference_path = _copy_exposure(science_path, "reference_rateints.fits")
+    background_path = _copy_exposure(science_path, "background_rateints.fits")
+
+    with fits.open(reference_path, mode="update") as hdul:
+        hdul[0].header["IS_PSF"] = "True"
+        hdul[0].header["TARGPROP"] = "REFERENCE_TARGET"
+        hdul[0].header["EFFINTTM"] = 20.0
+
+    with fits.open(background_path, mode="update") as hdul:
+        hdul[0].header["TARGPROP"] = "BACKGROUND_TARGET"
+        hdul[0].header["EFFINTTM"] = 20.0
+
+    database = Database(output_dir=tmp_path)
+    database.verbose = False
+    database.read_jwst_s012_data([science_path, reference_path, background_path])
+
+    assert list(database.obs) == [expected_key]
+
+    observations = database.obs[expected_key]
+    assert len(observations) == 3
+
+    rows_by_path = {row["FITSFILE"]: row for row in observations}
+    assert set(rows_by_path) == {
+        science_path,
+        reference_path,
+        background_path,
+    }
+    assert rows_by_path[science_path]["TYPE"] == "SCI"
+    assert rows_by_path[reference_path]["TYPE"] == "REF"
+    assert rows_by_path[background_path]["TYPE"] == "REF_BG"
