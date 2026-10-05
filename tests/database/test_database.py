@@ -182,3 +182,93 @@ def test_read_jwst_s012_data_classifies_science_and_reference(
         "SCIENCE_TARGET",
         "REFERENCE_TARGET",
     ]
+
+
+@pytest.mark.parametrize(
+    "fixture_name, expected_key",
+    [
+        (
+            "miri_s012_file",
+            "JWST_MIRI_MIRIMAGE_F1065C_NONE_4QPM_MASK1065",
+        ),
+        (
+            "nircam_s012_file",
+            "JWST_NIRCAM_NRCA5_F335M_MASKRND_MASK335R_SUB320",
+        ),
+    ],
+    ids=["miri", "nircam"],
+)
+def test_read_jwst_s012_data_psflibpaths_overrides_is_psf(
+    request, tmp_path, fixture_name, expected_key
+):
+    """Explicit PSF-library membership overrides IS_PSF=False.
+
+    Copy a science exposure without changing its header and supply
+    the copy only through psflibpaths. Verify that both exposures
+    share one concatenation and the copy is classified as REF.
+
+    Preserve any local PSF mask to avoid a reference-file lookup.
+    """
+    science_path = request.getfixturevalue(fixture_name)
+    reference_path = str(
+        Path(science_path).with_name("explicit_reference_rateints.fits")
+    )
+    shutil.copyfile(science_path, reference_path)
+
+    science_mask = Path(science_path.replace(".fits", "_psfmask.fits"))
+    if science_mask.exists():
+        reference_mask = reference_path.replace(".fits", "_psfmask.fits")
+        shutil.copyfile(science_mask, reference_mask)
+
+    database = Database(output_dir=tmp_path)
+    database.verbose = False
+
+    database.read_jwst_s012_data(
+        datapaths=[science_path],
+        psflibpaths=[reference_path],
+    )
+
+    assert list(database.obs) == [expected_key]
+
+    observations = database.obs[expected_key]
+    assert list(observations["FITSFILE"]) == [
+        science_path,
+        reference_path,
+    ]
+    assert list(observations["TYPE"]) == ["SCI", "REF"]
+
+
+@pytest.mark.parametrize(
+    "fixture_name",
+    ["miri_s012_file", "nircam_s012_file"],
+    ids=["miri", "nircam"],
+)
+def test_read_jwst_s012_data_defaults_centers_to_crpix(request, tmp_path, fixture_name):
+    """Default missing mask and star centers to FITS CRPIX values.
+
+    Both instrument fixtures provide CRPIX1/2 but omit center
+    keywords. Verify that mask and NaN-mask centers inherit CRPIX,
+    and star centers inherit the resulting mask centers.
+    """
+    path = request.getfixturevalue(fixture_name)
+
+    database = Database(output_dir=tmp_path)
+    database.verbose = False
+    database.read_jwst_s012_data([path])
+
+    assert len(database.obs) == 1
+    observations = next(iter(database.obs.values()))
+    assert len(observations) == 1
+    row = observations[0]
+
+    for column in (
+        "CRPIX1",
+        "CRPIX2",
+        "MASKCENX",
+        "MASKCENY",
+        "NANMASKCENX",
+        "NANMASKCENY",
+        "STARCENX",
+        "STARCENY",
+    ):
+        assert row[column] == pytest.approx(2.5), column
