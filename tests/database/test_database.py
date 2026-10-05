@@ -310,4 +310,81 @@ def test_read_jwst_s012_data_corrects_roll_angle(
     assert observations["ROLL_REF"][0] == pytest.approx(expected_roll)
 
 
-    
+def test_read_jwst_s012_data_associates_miri_science_background(
+    tmp_path, miri_s012_file
+):
+    """Retain a matching MIRI background as SCI_BG.
+
+    Copy a science exposure and give it a background target name.
+    Keep the instrument configuration, integration count, and
+    integration time identical to the science exposure.
+
+    Verify that both files share one concatenation and that the
+    background is classified as SCI_BG without explicit bgpaths.
+    """
+    science_path = miri_s012_file
+    background_path = str(Path(science_path).with_name("miri_background_rateints.fits"))
+    shutil.copyfile(science_path, background_path)
+
+    with fits.open(background_path, mode="update") as hdul:
+        hdul[0].header["TARGPROP"] = "BACKGROUND_TARGET"
+
+    database = Database(output_dir=tmp_path)
+    database.verbose = False
+
+    database.read_jwst_s012_data([science_path, background_path])
+
+    expected_key = "JWST_MIRI_MIRIMAGE_F1065C_NONE_4QPM_MASK1065"
+    assert list(database.obs) == [expected_key]
+
+    observations = database.obs[expected_key]
+    assert len(observations) == 2
+    assert list(observations["FITSFILE"]) == [
+        science_path,
+        background_path,
+    ]
+    assert list(observations["TYPE"]) == ["SCI", "SCI_BG"]
+    assert list(observations["TARGPROP"]) == [
+        "SCIENCE_TARGET",
+        "BACKGROUND_TARGET",
+    ]
+
+
+@pytest.mark.parametrize(
+    "keyword, incompatible_value",
+    [
+        ("NINTS", 3),
+        ("EFFINTTM", 20.0),
+    ],
+    ids=["integration-count-mismatch", "integration-time-mismatch"],
+)
+def test_read_jwst_s012_data_rejects_unmatched_miri_background(
+    tmp_path, miri_s012_file, keyword, incompatible_value
+):
+    """Reject a background incompatible with the science exposure.
+
+    Copy a MIRI science exposure and identify it as background.
+    Change either NINTS or EFFINTTM while preserving the other.
+    With no reference exposure available, verify that association
+    raises the current UserWarning exception.
+    """
+    science_path = miri_s012_file
+    background_path = str(
+        Path(science_path).with_name("unmatched_background_rateints.fits")
+    )
+    shutil.copyfile(science_path, background_path)
+
+    with fits.open(background_path, mode="update") as hdul:
+        hdul[0].header["TARGPROP"] = "BACKGROUND_TARGET"
+        hdul[0].header[keyword] = incompatible_value
+
+    database = Database(output_dir=tmp_path)
+    database.verbose = False
+
+    with pytest.raises(
+        UserWarning,
+        match="could not be matched with PSF",
+    ) as exc_info:
+        database.read_jwst_s012_data([science_path, background_path])
+
+    assert background_path in str(exc_info.value)
