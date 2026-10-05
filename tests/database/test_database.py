@@ -272,3 +272,42 @@ def test_read_jwst_s012_data_defaults_centers_to_crpix(request, tmp_path, fixtur
         "STARCENY",
     ):
         assert row[column] == pytest.approx(2.5), column
+
+
+@pytest.mark.parametrize(
+    "fixture_name",
+    ["miri_s012_file", "nircam_s012_file"],
+    ids=["miri", "nircam"],
+)
+@pytest.mark.parametrize(
+    "parity, expected_roll",
+    [(-1, 35.0), (1, 25.0)],
+    ids=["negative-parity", "positive-parity"],
+)
+def test_read_jwst_s012_data_corrects_roll_angle(
+    request, tmp_path, fixture_name, parity, expected_roll
+):
+    """Apply the aperture-angle and parity correction to ROLL_REF.
+
+    Set nonzero SCI-header angles and exercise both parity signs
+    for MIRI and NIRCam. Verify that the stored roll is 35 degrees
+    for negative parity and 25 degrees for positive parity.
+    """
+    path = request.getfixturevalue(fixture_name)
+
+    with fits.open(path, mode="update") as hdul:
+        hdul["SCI"].header["ROLL_REF"] = 30.0
+        hdul["SCI"].header["V3I_YANG"] = 5.0
+        hdul["SCI"].header["VPARITY"] = parity
+
+    database = Database(output_dir=tmp_path)
+    database.verbose = False
+    database.read_jwst_s012_data([path])
+
+    assert len(database.obs) == 1
+    observations = next(iter(database.obs.values()))
+    assert len(observations) == 1
+    assert observations["ROLL_REF"][0] == pytest.approx(expected_roll)
+
+
+    
