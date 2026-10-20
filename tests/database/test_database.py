@@ -1,11 +1,13 @@
 import shutil
 from pathlib import Path
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
 from astropy.io import fits
 from astropy.table import Table
 
+import spaceKLIP.database as database_module
 from spaceKLIP.database import Database
 
 
@@ -1280,3 +1282,320 @@ def test_update_obs_updates_pixel_area_when_available(
         rel=1e-12,
         abs=0.0,
     )
+
+
+# Create database user api function
+
+
+def test_create_database_discovers_files_and_calls_s012_reader(tmp_path, monkeypatch):
+    """Discover each observation and forward options to the default reader.
+
+    Keep the real Database constructor but mock file discovery and
+    ingestion. Verify flattened, joined paths, forwarded discovery
+    filters and reader options, and the returned database settings.
+    """
+    input_dir = tmp_path / "inputs"
+    input_dir.mkdir()
+    output_dir = tmp_path / "outputs"
+
+    discover = Mock(
+        side_effect=[
+            ["first_rateints.fits"],
+            ["second_rateints.fits"],
+        ]
+    )
+    read_s012 = Mock()
+
+    monkeypatch.setattr(database_module, "get_files", discover)
+    monkeypatch.setattr(
+        database_module.Database,
+        "read_jwst_s012_data",
+        read_s012,
+    )
+
+    psflibpaths = [str(input_dir / "reference_rateints.fits")]
+    bgpaths = [str(input_dir / "second_rateints.fits")]
+
+    database = database_module.create_database(
+        output_dir=str(output_dir),
+        input_dir=str(input_dir),
+        pid=1234,
+        obsids=[1, 2],
+        psflibpaths=psflibpaths,
+        bgpaths=bgpaths,
+        assoc_using_targname=False,
+        cr_from_siaf=True,
+        verbose=False,
+        filt="F1065C",
+        file_type="rateints.fits",
+    )
+
+    assert discover.call_args_list == [
+        (
+            (str(input_dir),),
+            {
+                "pid": 1234,
+                "obsid": 1,
+                "filt": "F1065C",
+                "file_type": "rateints.fits",
+            },
+        ),
+        (
+            (str(input_dir),),
+            {
+                "pid": 1234,
+                "obsid": 2,
+                "filt": "F1065C",
+                "file_type": "rateints.fits",
+            },
+        ),
+    ]
+
+    read_s012.assert_called_once_with(
+        datapaths=[
+            str(input_dir / "first_rateints.fits"),
+            str(input_dir / "second_rateints.fits"),
+        ],
+        psflibpaths=psflibpaths,
+        bgpaths=bgpaths,
+        cr_from_siaf=True,
+        assoc_using_targname=False,
+    )
+
+    assert isinstance(database, database_module.Database)
+    assert database.output_dir == str(output_dir)
+    assert database.verbose is False
+    assert output_dir.is_dir()
+
+
+@pytest.mark.parametrize(
+    "readlevel, expected_reader",
+    [
+        # IDs identify the input's type and value in test output.
+        pytest.param("012", "read_jwst_s012_data", id="str-012"),
+        pytest.param(0, "read_jwst_s012_data", id="int-0"),
+        pytest.param(1, "read_jwst_s012_data", id="int-1"),
+        pytest.param(2, "read_jwst_s012_data", id="int-2"),
+        pytest.param("0", "read_jwst_s012_data", id="str-0"),
+        pytest.param("1", "read_jwst_s012_data", id="str-1"),
+        pytest.param("2", "read_jwst_s012_data", id="str-2"),
+        pytest.param(3, "read_jwst_s3_data", id="int-3"),
+        pytest.param("3", "read_jwst_s3_data", id="str-3"),
+        pytest.param(4, "read_jwst_s4_data", id="int-4"),
+        pytest.param("4", "read_jwst_s4_data", id="str-4"),
+    ],
+)
+def test_create_database_selects_reader(
+    tmp_path, monkeypatch, readlevel, expected_reader
+):
+    """Dispatch each supported readlevel to exactly one reader.
+
+    Exercise integer and string forms separately because the public
+    API accepts both. Case IDs such as 'int-0' and 'str-0' identify
+    the input type and value in PyTest output; they do not affect
+    test execution.
+
+    Mock discovery and ingestion to isolate reader selection,
+    including routing to the deferred stage-4 reader.
+    """
+    input_dir = tmp_path / "inputs"
+    input_dir.mkdir()
+
+    monkeypatch.setattr(database_module, "get_files", Mock(return_value=[]))
+
+    readers = {}
+    for name in (
+        "read_jwst_s012_data",
+        "read_jwst_s3_data",
+        "read_jwst_s4_data",
+    ):
+        readers[name] = Mock()
+        monkeypatch.setattr(database_module.Database, name, readers[name])
+
+    database = database_module.create_database(
+        output_dir=str(tmp_path / "outputs"),
+        input_dir=str(input_dir),
+        readlevel=readlevel,
+        cr_from_siaf=True,
+        verbose=False,
+    )
+
+    expected_kwargs = {"datapaths": []}
+    if expected_reader == "read_jwst_s012_data":
+        expected_kwargs.update(
+            {
+                "psflibpaths": None,
+                "bgpaths": None,
+                "cr_from_siaf": True,
+                "assoc_using_targname": True,
+            }
+        )
+    elif expected_reader == "read_jwst_s3_data":
+        expected_kwargs["cr_from_siaf"] = True
+
+    for name, reader in readers.items():
+        if name == expected_reader:
+            reader.assert_called_once_with(**expected_kwargs)
+        else:
+            reader.assert_not_called()
+
+    assert isinstance(database, database_module.Database)
+
+
+def test_create_database_includes_sorted_klip_products(tmp_path, monkeypatch):
+    """Combine discovered files with sorted stage-3 KLIP products.
+
+    Preserve get_files ordering, then append matching KLIP paths
+    in alphabetical order. Exclude files with other endings.
+    """
+    input_dir = tmp_path / "inputs"
+    input_dir.mkdir()
+
+    # Create in reverse order so the expected result requires sorting.
+    for filename in (
+        "z_KLmodes-all.fits",
+        "a_KLmodes-all.fits",
+        "ignored_KLmodes.fits",
+    ):
+        (input_dir / filename).touch()
+
+    discover = Mock(return_value=["science_i2d.fits"])
+    read_s3 = Mock()
+
+    monkeypatch.setattr(database_module, "get_files", discover)
+    monkeypatch.setattr(
+        database_module.Database,
+        "read_jwst_s3_data",
+        read_s3,
+    )
+
+    database = database_module.create_database(
+        output_dir=str(tmp_path / "outputs"),
+        input_dir=str(input_dir),
+        readlevel=3,
+        cr_from_siaf=True,
+        verbose=False,
+    )
+
+    discover.assert_called_once_with(
+        str(input_dir),
+        pid=None,
+        obsid=None,
+    )
+    read_s3.assert_called_once_with(
+        datapaths=[
+            str(input_dir / "science_i2d.fits"),
+            str(input_dir / "a_KLmodes-all.fits"),
+            str(input_dir / "z_KLmodes-all.fits"),
+        ],
+        cr_from_siaf=True,
+    )
+    assert isinstance(database, database_module.Database)
+
+
+def test_create_database_resolves_input_directory_from_pid(tmp_path, monkeypatch):
+    """Resolve a five-digit program directory from JWSTDOWNLOAD_OUTDIR.
+
+    Omit input_dir and supply a scalar observation ID. Verify
+    discovery receives the resolved directory and observation ID,
+    and the reader receives the fully joined file path.
+    """
+    download_dir = tmp_path / "downloads"
+    program_dir = download_dir / "01234"
+    program_dir.mkdir(parents=True)
+
+    monkeypatch.setenv("JWSTDOWNLOAD_OUTDIR", str(download_dir))
+
+    discover = Mock(return_value=["science_rateints.fits"])
+    read_s012 = Mock()
+
+    monkeypatch.setattr(database_module, "get_files", discover)
+    monkeypatch.setattr(
+        database_module.Database,
+        "read_jwst_s012_data",
+        read_s012,
+    )
+
+    database = database_module.create_database(
+        output_dir=str(tmp_path / "outputs"),
+        pid=1234,
+        obsids=7,
+        verbose=False,
+    )
+
+    discover.assert_called_once_with(
+        str(program_dir),
+        pid=1234,
+        obsid=7,
+    )
+    read_s012.assert_called_once_with(
+        datapaths=[str(program_dir / "science_rateints.fits")],
+        psflibpaths=None,
+        bgpaths=None,
+        cr_from_siaf=False,
+        assoc_using_targname=True,
+    )
+    assert isinstance(database, database_module.Database)
+
+
+@pytest.mark.parametrize(
+    "scenario, expected_message",
+    [
+        pytest.param(
+            "missing-input",
+            "Must provide either a pid or an input_dir",
+            id="missing-input-location",
+        ),
+        pytest.param(
+            "invalid-readlevel",
+            "Invalid/unknown value for readlevel parameter",
+            id="unsupported-readlevel",
+        ),
+    ],
+)
+def test_create_database_rejects_invalid_inputs(
+    tmp_path, monkeypatch, scenario, expected_message
+):
+    """Reject missing input location and an unsupported read level.
+
+    Mock discovery and readers to isolate factory validation.
+    Verify that neither invalid request invokes an ingestion reader.
+    """
+    discover = Mock(return_value=[])
+    monkeypatch.setattr(database_module, "get_files", discover)
+
+    readers = []
+    for name in (
+        "read_jwst_s012_data",
+        "read_jwst_s3_data",
+        "read_jwst_s4_data",
+    ):
+        reader = Mock()
+        monkeypatch.setattr(database_module.Database, name, reader)
+        readers.append(reader)
+
+    kwargs = {
+        "output_dir": str(tmp_path / "outputs"),
+        "verbose": False,
+    }
+
+    if scenario == "invalid-readlevel":
+        input_dir = tmp_path / "inputs"
+        input_dir.mkdir()
+        kwargs.update(
+            {
+                "input_dir": str(input_dir),
+                "readlevel": 5,
+            }
+        )
+
+    with pytest.raises(ValueError) as exc_info:
+        database_module.create_database(**kwargs)
+
+    assert str(exc_info.value) == expected_message
+
+    for reader in readers:
+        reader.assert_not_called()
+
+    if scenario == "missing-input":
+        discover.assert_not_called()
