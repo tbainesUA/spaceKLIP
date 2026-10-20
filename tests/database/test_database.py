@@ -909,8 +909,136 @@ def test_read_jwst_s012_data_replaces_only_matching_configuration(
     assert unrelated_table.colnames == unrelated_before.colnames
 
     for column in unrelated_before.colnames:
-        np.testing.assert_equal(
-            np.asarray(unrelated_table[column]),
-            np.asarray(unrelated_before[column]),
-            err_msg=f"Unrelated column changed: {column}",
-        )
+        for row_index in range(len(unrelated_before)):
+            np.testing.assert_equal(
+                unrelated_table[column][row_index],
+                unrelated_before[column][row_index],
+                err_msg=(f"Unrelated column changed: {column}, row: {row_index}"),
+            )
+
+
+def test_read_jwst_s3_data_reads_coron3_product(tmp_path, coron3_file):
+    """Read CORON3 metadata into red and load observation context.
+
+    Verify fixed CORON3 reduction settings, explicit KL-mode
+    serialization, SCI-header image metadata, and companion-table
+    loading for both instruments.
+    """
+    path, key, source_path = coron3_file
+
+    database = Database(output_dir=tmp_path)
+    database.verbose = False
+    database.read_jwst_s3_data([path])
+
+    assert list(database.red) == [key]
+    reductions = database.red[key]
+    assert isinstance(reductions, Table)
+    assert len(reductions) == 1
+
+    row = reductions[0]
+    assert row["FITSFILE"] == path
+    assert row["TYPE"] == "CORON3"
+    assert row["DATAMODL"] == "STAGE3"
+    assert row["MODE"] == "RDI"
+    assert row["ANNULI"] == 1
+    assert row["SUBSECTS"] == 1
+    assert row["KLMODES"] == "7"
+    assert row["BUNIT"] == "MJy/sr"
+    assert row["STARCENX"] == pytest.approx(1.25)
+    assert row["STARCENY"] == pytest.approx(2.75)
+
+    assert list(database.obs) == [key]
+    assert list(database.obs[key]["FITSFILE"]) == [source_path]
+    assert list(database.obs[key]["MASKFILE"]) == ["NONE"]
+    assert database.obs[key]["FITSFILE"].dtype == np.dtype("object")
+    assert database.obs[key]["MASKFILE"].dtype == np.dtype("object")
+
+
+def test_read_jwst_s3_data_reads_pyklip_product(tmp_path, pyklip_file):
+    """Read PYKLIP settings and image metadata from the primary HDU.
+
+    Verify supplied reduction settings and serialization of three
+    consecutive KL-mode keywords into a comma-separated string.
+    The input has no SCI extension.
+    """
+    path, key, source_path = pyklip_file
+
+    database = Database(output_dir=tmp_path)
+    database.verbose = False
+    database.read_jwst_s3_data([path])
+
+    assert list(database.red) == [key]
+    reductions = database.red[key]
+    assert len(reductions) == 1
+
+    row = reductions[0]
+    assert row["FITSFILE"] == path
+    assert row["TYPE"] == "PYKLIP"
+    assert row["DATAMODL"] == "STAGE3"
+    assert row["MODE"] == "ADI+RDI"
+    assert row["ANNULI"] == 3
+    assert row["SUBSECTS"] == 4
+    assert row["KLMODES"] == "1,5,10"
+    assert row["BUNIT"] == "MJy/sr"
+    assert row["STARCENX"] == pytest.approx(1.5)
+    assert row["STARCENY"] == pytest.approx(2.5)
+
+    assert list(database.obs) == [key]
+    assert list(database.obs[key]["FITSFILE"]) == [source_path]
+
+
+def test_read_jwst_s3_data_defaults_missing_coron3_klmode(tmp_path, coron3_file):
+    """Default CORON3 KLMODES to '50' when KLMODE0 is absent."""
+    path, key, _ = coron3_file
+
+    with fits.open(path, mode="update") as hdul:
+        del hdul[0].header["KLMODE0"]
+
+    database = Database(output_dir=tmp_path)
+    database.verbose = False
+    database.read_jwst_s3_data([path])
+
+    assert list(database.red) == [key]
+    reductions = database.red[key]
+    assert len(reductions) == 1
+    assert reductions["TYPE"][0] == "CORON3"
+    assert reductions["KLMODES"][0] == "50"
+
+
+def test_read_jwst_s3_data_appends_and_preserves_observations(tmp_path, coron3_file):
+    """Append a matching reduction and preserve existing obs context.
+
+    Read one CORON3 product, then a second product with the same
+    configuration. Remove the companion observation file before
+    the second read to verify that existing obs context is reused.
+    """
+    first_path, key, _ = coron3_file
+    second_path = _copy_exposure(first_path, "second_i2d.fits")
+
+    with fits.open(second_path, mode="update") as hdul:
+        hdul[0].header["KLMODE0"] = 12
+
+    database = Database(output_dir=tmp_path)
+    database.verbose = False
+    database.read_jwst_s3_data([first_path])
+
+    assert list(database.red[key]["FITSFILE"]) == [first_path]
+    original_observations = database.obs[key]
+
+    companion_path = Path(first_path).parent / f"{key}.dat"
+    companion_path.unlink()
+
+    database.read_jwst_s3_data([second_path])
+
+    assert list(database.red) == [key]
+    reductions = database.red[key]
+    assert len(reductions) == 2
+    assert list(reductions["FITSFILE"]) == [
+        first_path,
+        second_path,
+    ]
+    assert list(reductions["KLMODES"]) == ["7", "12"]
+    assert list(reductions["TYPE"]) == ["CORON3", "CORON3"]
+
+    assert list(database.obs) == [key]
+    assert database.obs[key] is original_observations
