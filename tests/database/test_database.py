@@ -1042,3 +1042,241 @@ def test_read_jwst_s3_data_appends_and_preserves_observations(tmp_path, coron3_f
 
     assert list(database.obs) == [key]
     assert database.obs[key] is original_observations
+
+
+def test_read_jwst_s3_data_rejects_missing_observation_context(tmp_path, coron3_file):
+    """Raise when neither existing obs context nor its companion exists."""
+    path, key, _ = coron3_file
+    companion_path = Path(path).parent / f"{key}.dat"
+    companion_path.unlink()
+
+    database = Database(output_dir=tmp_path)
+    database.verbose = False
+
+    with pytest.raises(
+        UserWarning,
+        match="Observations database for concatenation",
+    ) as exc_info:
+        database.read_jwst_s3_data([path])
+
+    assert key in str(exc_info.value)
+    assert key not in database.obs
+
+
+# read_jwst_s4_data was determined low priority so coverage is deferred
+
+
+def test_update_obs_updates_required_fields_only(tmp_path, miri_s012_file):
+    """Update the selected row's path, stage, and brightness unit.
+
+    Supply no optional updates. Verify all other metadata and
+    the neighboring row remain unchanged, even when the new FITS
+    header contains different NINTS and EFFINTTM values.
+
+
+    This checks the full preservation contract without separate assertions for every
+    optional column. The cell-by-cell comparison also handles the array-valued columns
+    that caused the earlier comparison failure.
+
+    The deliberately different FITS-header NINTS and EFFINTTM values verify that these
+    fields are not automatically refreshed when their optional arguments are omitted.
+
+    """
+    database = Database(output_dir=tmp_path)
+    database.verbose = False
+    database.read_jwst_s012_data([miri_s012_file])
+
+    key = next(iter(database.obs))
+    observations = database.obs[key]
+
+    # Add a second row so we can verify index selection.
+    observations.add_row(observations[0])
+    before = observations.copy(copy_data=True)
+
+    updated_path = _copy_exposure(miri_s012_file, "updated_calints.fits")
+    with fits.open(updated_path, mode="update") as hdul:
+        hdul["SCI"].header["BUNIT"] = "MJy/sr"
+        hdul[0].header["NINTS"] = 9
+        hdul[0].header["EFFINTTM"] = 99.0
+
+    database.update_obs(
+        key=key,
+        index=1,
+        fitsfile=updated_path,
+    )
+
+    assert list(database.obs) == [key]
+    actual = database.obs[key]
+    assert len(actual) == 2
+
+    expected = before.copy(copy_data=True)
+    expected["FITSFILE"][1] = updated_path
+    expected["DATAMODL"][1] = "STAGE2"
+    expected["BUNIT"][1] = "MJy/sr"
+
+    assert actual.colnames == expected.colnames
+
+    for column in expected.colnames:
+        for row_index in range(len(expected)):
+            np.testing.assert_equal(
+                actual[column][row_index],
+                expected[column][row_index],
+                err_msg=(f"Unexpected update: {column}, row {row_index}"),
+            )
+
+
+def test_update_obs_applies_optional_metadata(tmp_path, miri_s012_file):
+    """Store supplied scalar, path, and array metadata in the target row.
+
+    Use distinct values to detect swapped column assignments.
+    Read from an unchanged FITS file so optional arguments, rather
+    than FITS-header values, determine the updated metadata.
+    """
+    database = Database(output_dir=tmp_path)
+    database.verbose = False
+    database.read_jwst_s012_data([miri_s012_file])
+    key = next(iter(database.obs))
+
+    # Start with a different value so the update is observable.
+    # See fixture.
+    database.obs[key]["NINTS"][0] = 1
+
+    updates = {
+        "maskfile": str(tmp_path / "new_psfmask.fits"),
+        "nanmaskfile": str(tmp_path / "new_nanmask.fits"),
+        "nints": 2,
+        "effinttm": 25.0,
+        "xoffset": 0.1,
+        "yoffset": -0.2,
+        "crpix1": 3.1,
+        "crpix2": 3.2,
+        "maskcenx": 4.1,
+        "maskceny": 4.2,
+        "nanmaskcenx": 5.1,
+        "nanmaskceny": 5.2,
+        "starcenx": 6.1,
+        "starceny": 6.2,
+        "crop_shiftx": -1.0,
+        "crop_shifty": 2.0,
+        "align_shift": np.array([[0.1, 0.2], [0.3, 0.4]]),
+        "center_shift": np.array([[1.1, 1.2], [1.3, 1.4]]),
+        "align_mask": np.array([2.1, 2.2]),
+        "center_mask": np.array([3.1, 3.2]),
+        "blurfwhm": 1.5,
+    }
+
+    database.update_obs(
+        key=key,
+        index=0,
+        fitsfile=miri_s012_file,
+        **updates,
+    )
+
+    row = database.obs[key][0]
+    for argument, expected_value in updates.items():
+        column = argument.upper()
+        np.testing.assert_equal(
+            row[column],
+            expected_value,
+            err_msg=f"Optional update failed: {argument}",
+        )
+
+
+def test_update_obs_applies_zero_and_preserves_none(tmp_path, miri_s012_file):
+    """Apply explicit zeros while preserving fields passed as None.
+
+    Start with nonzero values so ignored zero updates are detected.
+    Also verify that updating CRPIX does not automatically change
+    a mask center whose argument is None.
+    """
+    database = Database(output_dir=tmp_path)
+    database.verbose = False
+    database.read_jwst_s012_data([miri_s012_file])
+    key = next(iter(database.obs))
+    observations = database.obs[key]
+
+    initial_values = {
+        "XOFFSET": 1.5,
+        "YOFFSET": -2.5,
+        "CRPIX1": 3.5,
+        "CRPIX2": 4.5,
+        "MASKCENX": 5.5,
+        "BLURFWHM": 1.5,
+    }
+    for column, value in initial_values.items():
+        observations[column][0] = value
+
+    database.update_obs(
+        key=key,
+        index=0,
+        fitsfile=miri_s012_file,
+        xoffset=0.0,
+        yoffset=None,
+        crpix1=0.0,
+        crpix2=None,
+        maskcenx=None,
+        blurfwhm=0.0,
+    )
+
+    row = database.obs[key][0]
+    expected_values = {
+        "XOFFSET": 0.0,
+        "YOFFSET": -2.5,
+        "CRPIX1": 0.0,
+        "CRPIX2": 4.5,
+        "MASKCENX": 5.5,
+        "BLURFWHM": 0.0,
+    }
+    for column, expected_value in expected_values.items():
+        assert row[column] == pytest.approx(expected_value), column
+
+
+@pytest.mark.parametrize(
+    "header_pixel_area, expected_pixel_area",
+    [
+        (2.5e-13, 2.5e-13),
+        (None, 1.0e-13),
+    ],
+    ids=["keyword-present", "keyword-missing"],
+)
+def test_update_obs_updates_pixel_area_when_available(
+    tmp_path,
+    miri_s012_file,
+    header_pixel_area,
+    expected_pixel_area,
+):
+    """Refresh PIXAR_SR when available; preserve it when missing.
+
+    Start with a known database value. Request a pixel-area refresh
+    from the new FITS file and verify either replacement or silent
+    preservation when the SCI header lacks PIXAR_SR.
+    """
+    database = Database(output_dir=tmp_path)
+    database.verbose = False
+    database.read_jwst_s012_data([miri_s012_file])
+    key = next(iter(database.obs))
+    database.obs[key]["PIXAR_SR"][0] = 1.0e-13
+
+    updated_path = _copy_exposure(miri_s012_file, "updated_calints.fits")
+
+    with fits.open(updated_path, mode="update") as hdul:
+        header = hdul["SCI"].header
+        if header_pixel_area is None:
+            header.remove("PIXAR_SR", ignore_missing=True)
+        else:
+            header["PIXAR_SR"] = header_pixel_area
+
+    database.update_obs(
+        key=key,
+        index=0,
+        fitsfile=updated_path,
+        update_pxar=True,
+    )
+
+    row = database.obs[key][0]
+    assert row["FITSFILE"] == updated_path
+    assert row["PIXAR_SR"] == pytest.approx(
+        expected_pixel_area,
+        rel=1e-12,
+        abs=0.0,
+    )
