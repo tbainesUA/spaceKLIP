@@ -455,14 +455,31 @@ def mock_image_io(
 
         return str(tmp_path / "output_mask.fits")
 
+    # def mock_get_dqmask(
+    #     pxdq,
+    #     flag,
+    #     return_bool=False,
+    # ):
+    #     assert flag == "DO_NOT_USE"
+
+    #     result = (pxdq & 1) != 0
+
+    #     if return_bool:
+    #         return result
+
+    #     return result.astype(pxdq.dtype)
+
     def mock_get_dqmask(
         pxdq,
         flag,
         return_bool=False,
     ):
-        assert flag == "DO_NOT_USE"
+        flags = {
+            "DO_NOT_USE": 1,
+            "NON_SCIENCE": 512,
+        }
 
-        result = (pxdq & 1) != 0
+        result = (pxdq & flags[flag]) != 0
 
         if return_bool:
             return result
