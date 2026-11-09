@@ -270,8 +270,346 @@ def test_find_bad_pixels_skips_unselected_types(
         mock_image_io["pxdq"], np.zeros_like(data, dtype=np.uint32)
     )
 
+
 # ===================================
 # Individual Pixel detection methods
 # ===================================
 
 
+def test_find_bad_pixels_sigclip_detects_positive_outlier():
+    """
+    Verify that local sigma clipping identifies an isolated bright pixel.
+
+    The test creates a smooth synthetic image containing one unusually
+    bright pixel. The algorithm should identify that pixel as bad while
+    leaving the remaining pixels unflagged.
+
+    It also verifies that the DQ array is updated in place and that
+    the original science data is not modified.
+
+    In simple terms:
+        Imagine a picture where nearly every pixel has a similar
+        brightness except for one that is much brighter than its
+        neighbors. We check that the algorithm finds that unusual
+        pixel without changing the picture or marking normal pixels
+        as bad.
+
+    Note:
+        Negative-outlier detection is effectively disabled using
+        neg_sigma=100 because this test specifically evaluates positive
+        outlier detection.
+
+        The default negative threshold (neg_sigma=1) can flag normal
+        low-valued pixels in a smoothly varying background. Testing
+        negative-outlier behavior separately may be warranted.
+    """
+
+    ny, nx = 101, 101
+
+    y, x = np.indices((ny, nx))
+
+    image = 10.0 + 0.01 * x + 0.02 * y
+
+    data = image[np.newaxis, ...].copy()
+    data[0, 50, 50] = 100.0
+
+    original_data = data.copy()
+
+    erro = np.full_like(data, 0.1)
+    pxdq = np.zeros(data.shape, dtype=np.uint32)
+    non_science = np.zeros(data.shape, dtype=bool)
+
+    ImageTools.find_bad_pixels_sigclip(
+        None,
+        data,
+        erro,
+        pxdq,
+        non_science,
+        sigclip_kwargs={
+            "mode": "local",
+            "sigma": 5.0,
+            "neg_sigma": 100.0,
+        },
+    )
+
+    # expected_dq = np.zeros_like(pxdq)
+    # expected_dq[0, 10, 10] = 1
+
+    expected_dq = np.zeros_like(pxdq)
+    expected_dq[0, 50, 50] = 1
+
+    np.testing.assert_array_equal(pxdq, expected_dq)
+    np.testing.assert_array_equal(data, original_data)
+
+
+@pytest.mark.parametrize(
+    "custom_input, expected_positions",
+    [
+        pytest.param(
+            "2d_mask",
+            [(0, 1, 2), (1, 1, 2)],
+            id="2d-mask",
+        ),
+        pytest.param(
+            "3d_mask",
+            [(0, 1, 2)],
+            id="3d-mask",
+        ),
+        pytest.param(
+            "2d_coordinates",
+            [(0, 1, 2), (1, 1, 2)],
+            id="2d-coordinates",
+        ),
+        pytest.param(
+            "3d_coordinates",
+            [(1, 1, 2)],
+            id="3d-coordinates",
+        ),
+    ],
+)
+def test_find_bad_pixels_custom_applies_supplied_flags(
+    custom_input,
+    expected_positions,
+):
+    """
+    Verify that custom bad-pixel inputs flag the requested pixels.
+
+    The custom method accepts either a 2D/3D bad-pixel mask or a list
+    of pixel coordinates. A 2D input applies to every integration,
+    while a 3D input can select individual integrations.
+
+    This test checks all four supported representations, verifies
+    that existing binary DQ flags are retained, and confirms that
+    unrelated pixels remain unflagged.
+
+    In simple terms:
+        We give the software a list or map showing which pixels are
+        broken. We check that it marks exactly those pixels, keeps
+        any existing warnings, and doesn't mark other pixels.
+
+    Note:
+        The current implementation interprets coordinate inputs as
+        [x, y] or [integration, x, y], even though the method
+        documentation describes them as [y, x] and [key, y, x].
+
+        This test follows the implemented convention to characterize
+        existing behavior. The discrepancy should be clarified before
+        changing the public interface.
+    """
+    data = np.full((2, 5, 5), 10.0)
+    erro = np.ones_like(data)
+
+    pxdq = np.zeros(data.shape, dtype=np.uint32)
+
+    # Existing bad pixel that should remain flagged.
+    pxdq[0, 0, 0] = 1
+
+    if custom_input == "2d_mask":
+        custom = np.zeros((5, 5), dtype=np.uint8)
+        custom[1, 2] = 1
+
+    elif custom_input == "3d_mask":
+        custom = np.zeros(data.shape, dtype=np.uint8)
+        custom[0, 1, 2] = 1
+
+    elif custom_input == "2d_coordinates":
+        custom = [[2, 1]]  # [x, y]
+
+    elif custom_input == "3d_coordinates":
+        custom = [[1, 2, 1]]  # [integration, x, y]
+
+    ImageTools.find_bad_pixels_custom(
+        None,
+        data,
+        erro,
+        pxdq,
+        key="concat1",
+        custom_kwargs={"concat1": custom},
+    )
+
+    expected_dq = np.zeros_like(pxdq)
+    expected_dq[0, 0, 0] = 1
+
+    for integration, y, x in expected_positions:
+        expected_dq[integration, y, x] = 1
+
+    np.testing.assert_array_equal(pxdq, expected_dq)
+
+
+def test_find_bad_pixels_timeints_detects_temporal_outlier():
+    """
+    Verify that temporal clipping detects a transient bad pixel.
+
+    This test creates a synthetic image cube containing 21 integrations
+    with small temporal variations. One pixel is made unusually bright
+    in a single integration.
+
+    The algorithm should identify that measurement as bad without
+    flagging the same detector pixel in other integrations or marking
+    unrelated pixels.
+
+    The test also verifies that the input science data remains unchanged
+    and that the supplied DQ array is updated in place.
+
+    In simple terms:
+        Imagine taking 21 pictures of the same scene. One pixel looks
+        normal in almost every picture but suddenly becomes much brighter
+        in one picture.
+
+        We check that the software identifies that one unusual
+        measurement without marking the pixel as broken in every picture.
+    """
+    rng = np.random.default_rng(42)
+
+    data = rng.normal(
+        loc=10.0,
+        scale=0.1,
+        size=(21, 10, 10),
+    )
+
+    # Inject one transient bad pixel.
+    data[10, 5, 5] = 100.0
+
+    original_data = data.copy()
+
+    erro = np.full_like(data, 0.1)
+    pxdq = np.zeros(data.shape, dtype=np.uint32)
+    non_science = np.zeros(data.shape, dtype=bool)
+
+    ImageTools.find_bad_pixels_timeints(
+        None,
+        data,
+        erro,
+        pxdq,
+        non_science,
+        timeints_kwargs={
+            "mode": "per_pixel",
+            "sigma": 10.0,
+        },
+    )
+
+    expected_dq = np.zeros_like(pxdq)
+    expected_dq[10, 5, 5] = 1
+
+    np.testing.assert_array_equal(pxdq, expected_dq)
+    np.testing.assert_array_equal(data, original_data)
+
+
+def test_find_bad_pixels_timeints_group_pixels_detects_outlier():
+    """
+    Verify that flux-grouped temporal detection identifies an outlier.
+
+    The test creates two populations of detector pixels with different
+    flux levels and small temporal variations. A single anomalous
+    measurement is injected into one of the brighter pixels.
+
+    The algorithm should detect the anomalous measurement using
+    flux-group statistics while leaving normal measurements unflagged.
+
+    In simple terms:
+        Imagine grouping pixels according to their typical brightness.
+        Instead of judging each pixel independently, we compare its
+        behavior against other pixels with similar brightness.
+
+        We check that an unusually bright measurement is identified
+        without marking the other measurements as bad.
+    """
+    rng = np.random.default_rng(42)
+
+    nint, ny, nx = 21, 10, 10
+
+    # Two distinct flux populations.
+    data = np.empty((nint, ny, nx), dtype=float)
+
+    data[:, :, :5] = rng.normal(
+        loc=10.0,
+        scale=0.1,
+        size=(nint, ny, 5),
+    )
+
+    data[:, :, 5:] = rng.normal(
+        loc=100.0,
+        scale=0.5,
+        size=(nint, ny, 5),
+    )
+
+    # Inject one transient anomaly into the bright population.
+    data[10, 5, 7] = 150.0
+
+    original_data = data.copy()
+
+    erro = np.ones_like(data)
+    pxdq = np.zeros(data.shape, dtype=np.uint32)
+    non_science = np.zeros(data.shape, dtype=bool)
+
+    ImageTools.find_bad_pixels_timeints(
+        None,
+        data,
+        erro,
+        pxdq,
+        non_science,
+        timeints_kwargs={
+            "mode": "group_pixels",
+            "sigma": 10.0,
+            "n_groups": 2,
+            "plot_diagnostics": False,
+        },
+    )
+
+    expected_dq = np.zeros_like(pxdq)
+    expected_dq[10, 5, 7] = 1
+
+    np.testing.assert_array_equal(pxdq, expected_dq)
+    np.testing.assert_array_equal(data, original_data)
+
+
+def test_find_bad_pixels_gradient_detects_isolated_outlier():
+    """
+    Verify that gradient detection identifies an isolated bright pixel.
+
+    The test creates two synthetic images with a uniform background.
+    A single bright pixel is injected into the first integration,
+    while the second integration remains unchanged.
+
+    The algorithm should flag only the injected pixel in the first
+    integration, leaving the other pixels unflagged.
+
+    The test also verifies that the original science data remains
+    unchanged and that the DQ array is updated in place.
+
+    In simple terms:
+        Imagine two pictures of a smooth, evenly illuminated surface.
+        One picture contains a single unusually bright pixel.
+
+        We check that the algorithm identifies that pixel without
+        marking the same location in the other picture or changing
+        either original image.
+    """
+    data = np.full((2, 21, 21), 10.0)
+
+    # Inject one isolated bright pixel into the first integration.
+    data[0, 10, 10] = 100.0
+
+    original_data = data.copy()
+
+    erro = np.ones_like(data)
+    pxdq = np.zeros(data.shape, dtype=np.uint32)
+
+    ImageTools.find_bad_pixels_gradient(
+        None,
+        data,
+        erro,
+        pxdq,
+        key="concat1",
+        gradient_kwargs={
+            "sigma": 0.5,
+            "threshold": 0.05,
+            "negative": False,
+        },
+    )
+
+    expected_dq = np.zeros_like(pxdq)
+    expected_dq[0, 10, 10] = 1
+
+    np.testing.assert_array_equal(pxdq, expected_dq)
+    np.testing.assert_array_equal(data, original_data)
