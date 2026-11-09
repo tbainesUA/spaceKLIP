@@ -371,8 +371,13 @@ def mock_image_io(
     complete write history.
     """
 
+    # written = {}
+    # observations = {}
+    # writes = []
+
     written = {}
     observations = {}
+    masks = {}
     writes = []
 
     def get_observation(fitsfile):
@@ -404,11 +409,23 @@ def mock_image_io(
             copy_optional(obs["maskoffs"]),
         )
 
-    def mock_read_msk(maskfile):
-        if "nanmask" in str(maskfile):
-            return mock_observation["nanmask"].copy()
+    # def mock_read_msk(maskfile):
+    #     if "nanmask" in str(maskfile):
+    #         return mock_observation["nanmask"].copy()
 
-        return mock_observation["mask"].copy()
+    #     return mock_observation["mask"].copy()
+
+    def mock_read_msk(maskfile):
+        maskfile = str(maskfile)
+
+        if maskfile in masks:
+            mask = masks[maskfile]
+            return None if mask is None else mask.copy()
+
+        if "nanmask" in maskfile:
+            return copy_optional(mock_observation["nanmask"])
+
+        return copy_optional(mock_observation["mask"])
 
     def mock_write_obs(
         fitsfile,
@@ -498,6 +515,7 @@ def mock_image_io(
 
     # New capabilities while retaining the old fixture interface.
     written["observations"] = observations
+    written["masks"] = masks
     written["writes"] = writes
 
     return written
